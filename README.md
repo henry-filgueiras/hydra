@@ -20,7 +20,9 @@ In other words:
 
 ## Visual Hydra Performance Story
 
-![Hydra Performance Story](assets/hydra_perf_story.svg)
+<p align="center">
+  <img src="assets/hydra_perf_story.svg" alt="Hydra performance story" width="100%">
+</p>
 
 ## ✨ Design Goals
 
