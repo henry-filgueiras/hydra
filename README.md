@@ -154,6 +154,30 @@ Large head layout:
 
 ---
 
+## 📊 Performance Snapshot
+
+Benchmarks run with Google Benchmark on a single core (Apple M2, clang-18 `-O2`).
+Numbers are wall-time per operation; lower is better.
+This is a living benchmark diary — figures will shift as kernels mature.
+
+| Operation      | Hydra        | Reference                      | Δ vs reference |
+| -------------- | ------------ | ------------------------------ | -------------- |
+| small add      | 3.03 ns      | `uint64_t` 2.47 ns             | +22.4%         |
+| small mul      | 4.02 ns      | `uint64_t` 3.44 ns             | +16.8%         |
+| medium add     | 6.49 ns      | Boost.Multiprecision 9.27 ns   | −30.0%         |
+| medium mul     | 21.53 ns     | Boost.Multiprecision 27.07 ns  | −20.4%         |
+| large add 256  | 2.69 µs      | Boost.Multiprecision 23.89 ns  | ⚠️ see note    |
+
+The small-path overhead (~20%) reflects the one-time kind-check dispatch that sits in front of native arithmetic; that cost is expected to shrink as the compiler gets more visibility into the inline representation.
+The medium-path results are the early encouraging signal: both add and multiply already beat Boost.Multiprecision by a meaningful margin, which validates the tiered design even at this prototype stage.
+
+> **⚠️ Large-add regression — under active investigation.**
+> The 256-bit addition path is currently ~112× slower than Boost.Multiprecision.
+> This is a known, severe regression believed to originate in the large-head construction or normalization path rather than the arithmetic kernel itself.
+> No performance claims are made for the large path until the root cause is identified and fixed.
+
+---
+
 ## 🚧 Status
 
 Early design / prototype phase.
