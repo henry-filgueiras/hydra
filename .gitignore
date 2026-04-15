@@ -1,2 +1,7 @@
 *~
+
+# CMake build directories (any name ending in -build, or the common defaults)
 build/
+build-*/
+cmake-build*/
+out/

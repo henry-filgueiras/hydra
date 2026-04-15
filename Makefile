@@ -15,7 +15,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-$(BUILD_DIR)/%.o: %.cpp bigint.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.cpp hydra.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR):
@@ -25,9 +25,9 @@ run: $(TARGET)
 	./$(TARGET)
 
 test: | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) bigint_test.cpp bigint.cpp \
-		-o $(BUILD_DIR)/bigint_test
-	./$(BUILD_DIR)/bigint_test
+	$(CXX) $(CXXFLAGS) hydra_test.cpp hydra.cpp \
+		-o $(BUILD_DIR)/hydra_test
+	./$(BUILD_DIR)/hydra_test
 
 clean:
 	rm -rf $(BUILD_DIR)
