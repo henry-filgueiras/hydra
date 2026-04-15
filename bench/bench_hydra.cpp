@@ -635,6 +635,41 @@ static void BM_boost_large_mul(benchmark::State& state) {
 BENCHMARK(BM_boost_large_mul)->Name("boost/large_mul")
     ->Arg(128)->Arg(256)->Arg(512);
 
+// ── Boost chained large add — mirrors chain/large_add accumulation semantics ─
+//
+// The Hydra benchmark uses make_large(n, seed) which creates n limbs of 64 bits
+// each.  We mirror this by constructing cpp_int values of the same total bit
+// width (n * 64) and using the same seed-derived pattern.
+
+static bmp::cpp_int make_boost_large(uint32_t n_limbs, uint64_t seed = 0xBEEF'CAFEull) {
+    // Mirror make_large(): XorShift64 PRNG fills n limbs, each forced non-zero,
+    // MSL has bit 63 set.
+    XorShift64 rng{seed};
+    bmp::cpp_int val = 0;
+    for (uint32_t i = 0; i < n_limbs; ++i) {
+        uint64_t limb = rng.next() | 1u;
+        if (i == n_limbs - 1) limb |= (1ull << 63);
+        val |= (bmp::cpp_int(limb) << (i * 64));
+    }
+    return val;
+}
+
+static void BM_boost_chain_large_add(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    bmp::cpp_int acc  = make_boost_large(n, 0x1111'1111ull);
+    bmp::cpp_int step = make_boost_large(n, 0x2222'2222ull);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(acc);
+        acc += step; acc += step; acc += step; acc += step; acc += step;
+        acc += step; acc += step; acc += step; acc += step; acc += step;
+        benchmark::DoNotOptimize(acc);
+        benchmark::ClobberMemory();
+    }
+    state.counters["ops_per_iter"] = 10;
+}
+BENCHMARK(BM_boost_chain_large_add)->Name("boost/chain_large_add")
+    ->Arg(8)->Arg(16)->Arg(64);
+
 // ── Hydra mirror benchmarks for apples-to-apples comparison ─────────────────
 
 static void BM_hydra_large_add_for_boost_cmp(benchmark::State& state) {

@@ -85,6 +85,9 @@ BOOST_PAIRS: list[tuple[str, str, str]] = [
     ("hydra/large_mul_cmp/128",   "boost/large_mul/128",   "large mul 128-bit"),
     ("hydra/large_mul_cmp/256",   "boost/large_mul/256",   "large mul 256-bit"),
     ("hydra/large_mul_cmp/512",   "boost/large_mul/512",   "large mul 512-bit"),
+    ("chain/large_add/8",         "boost/chain_large_add/8",  "chain large add 8-limb"),
+    ("chain/large_add/16",        "boost/chain_large_add/16", "chain large add 16-limb"),
+    ("chain/large_add/64",        "boost/chain_large_add/64", "chain large add 64-limb"),
 ]
 
 # Standalone display groups — no reference, shown as cost tables.

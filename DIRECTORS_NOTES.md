@@ -342,3 +342,49 @@ All passed under both `-O0` and `-O2`.
 | `hydra_test.cpp` | 16 correctness tests replacing empty stub |
 | `bench/bench_hydra.cpp` | `chain/large_add` benchmark (8/16/64 limbs) |
 
+---
+
+## 2026-04-15 — Boost chain_large_add benchmark & profiling script (Claude Opus 4.6)
+
+### What was added
+
+Boost.Multiprecision comparison benchmark for chained in-place accumulation,
+mirroring the existing `chain/large_add` Hydra benchmark.
+
+### New benchmark: `boost/chain_large_add`
+
+Uses `boost::multiprecision::cpp_int` with `operator+=` in the same 10×
+accumulation pattern as the Hydra benchmark.  A helper `make_boost_large(n, seed)`
+constructs a `cpp_int` of exactly `n` 64-bit limbs using the same XorShift64
+PRNG and seeding as `make_large()`, ensuring the initial values have the same
+bit width and magnitude distribution.
+
+Parameterised identically: `->Arg(8)->Arg(16)->Arg(64)`.
+
+### New comparison pairs in compare.py
+
+Three pairs added to `BOOST_PAIRS`:
+
+- `chain/large_add/8`  vs `boost/chain_large_add/8`
+- `chain/large_add/16` vs `boost/chain_large_add/16`
+- `chain/large_add/64` vs `boost/chain_large_add/64`
+
+### New script: `scripts/profile_chain_large_add.sh`
+
+xctrace profiling script for the chained accumulation scenario.  Mirrors
+`profile_large_add.sh` but targets `chain/large_add` and `boost/chain_large_add`.
+
+Features:
+- Records 4 traces: Time Profiler + Allocations for both Hydra and Boost
+- Uses `--time-limit 5s` and `xctrace record`
+- Outputs to timestamped `traces/YYYYMMDD_HHMMSS/` folder
+- Configurable via env vars: `LIMBS` (default 16), `TIME_LIMIT`, `MIN_TIME`, `BENCH`
+
+### Files changed / added
+
+| File | Change |
+|------|--------|
+| `bench/bench_hydra.cpp` | `boost/chain_large_add` benchmark + `make_boost_large()` helper |
+| `bench/compare.py` | 3 chain large-add comparison pairs in `BOOST_PAIRS` |
+| `scripts/profile_chain_large_add.sh` | New profiling script |
+
