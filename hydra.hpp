@@ -700,7 +700,41 @@ struct Hydra {
     }
 
     // Compound assignment
-    Hydra& operator+=(const Hydra& o) { return *this = *this + o; }
+    //
+    // operator+= has a fast path for Large += (anything) when the existing
+    // LargeRep has enough capacity.  This avoids:
+    //   • LargeRep::create  — no new allocation
+    //   • operator=(&&)     — no move-assign / old-rep destruction
+    //   • an entire Hydra temporary
+    //
+    // Safety argument for in-place add_limbs:
+    //   add_limbs processes limbs in ascending index order (i = 0, 1, 2 …).
+    //   Each iteration reads a[i] (and b[i]) before writing out[i].
+    //   When out aliases a (i.e. this->limbs()), each limb is consumed
+    //   before it is overwritten.  The internal na<nb swap only reorders
+    //   the a/b pointers, not out, so the aliasing property is preserved.
+    //   Self-addition (a += a) is also safe: both reads in
+    //   s = a[i] + b[i] + carry happen before the write to out[i].
+    //
+    Hydra& operator+=(const Hydra& rhs) {
+        // ── fast path: this is Large and capacity is sufficient ───
+        if (is_large()) {
+            auto lv = limb_view();          // snapshot *before* mutation
+            auto rv = rhs.limb_view();
+            uint32_t max_limbs = std::max(lv.count, rv.count) + 1;
+
+            if (payload.large->capacity >= max_limbs) {
+                payload.large->used = detail::add_limbs(
+                    lv.ptr, lv.count, rv.ptr, rv.count,
+                    payload.large->limbs());
+                normalize();
+                return *this;
+            }
+        }
+        // ── fallback: allocate via operator+ then move-assign ────
+        return *this = *this + rhs;
+    }
+
     Hydra& operator-=(const Hydra& o) { return *this = *this - o; }
     Hydra& operator*=(const Hydra& o) { return *this = *this * o; }
 

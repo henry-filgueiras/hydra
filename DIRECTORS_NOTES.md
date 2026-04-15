@@ -264,3 +264,81 @@ The stack path (≤ 4 limbs) is unchanged.
 
 All passed.
 
+---
+
+## 2026-04-15 — In-place `operator+=` with capacity reuse (Claude Opus 4.6)
+
+### Profiler finding
+
+After the scratch-buffer elimination, Time Profiler showed:
+
+- `hydra::detail::add_limbs(...)` as primary hotspot (~57%)
+- `hydra::Hydra::operator=(const Hydra&)` still visible
+- `hydra::LargeRep::create(...)` still visible
+
+The `operator+=(const Hydra&)` implementation was `*this = *this + rhs`,
+which even with move semantics still required:
+
+1. `LargeRep::create` — new allocation for the temporary result
+2. `operator=(Hydra&&)` — move-assign, destroying the old `LargeRep`
+3. Destructor of the temporary (no-op after move, but still a branch)
+
+In chained arithmetic (`acc += step` in a loop), this produced one
+alloc + one dealloc per operation even when the accumulator already had
+enough room.
+
+### Fix
+
+`operator+=` now has a fast path when `this->is_large()` and the
+existing `LargeRep::capacity >= max(lhs_limbs, rhs_limbs) + 1`:
+
+- Captures both `limb_view`s (pointer + count) before mutation
+- Calls `add_limbs` directly into `payload.large->limbs()`
+- Updates `payload.large->used` with the returned count
+- Calls `normalize()` for demotion invariants
+
+If capacity is insufficient, falls back to the original
+`*this = *this + rhs` (allocating) path.
+
+### In-place aliasing safety argument
+
+`add_limbs` processes limbs in ascending index order (`i = 0, 1, 2…`).
+Each iteration reads `a[i]` (and `b[i]`) before writing `out[i]`.
+When `out` aliases the left operand's buffer, each limb is consumed
+before overwrite.  The internal `na < nb` swap reorders `a`/`b` pointers
+only — `out` is never swapped — so the aliasing invariant holds
+regardless of which operand is longer.  Self-addition (`a += a`) is safe
+because both reads occur before the write in `s = a[i] + b[i] + carry`.
+
+### Expected benchmark impact
+
+- **`chain/large_add/*`** (new benchmark): major speedup — zero
+  allocations in steady state
+- **`chain/factorial/*`**: no direct effect (uses `*=`, not `+=`), but
+  the same pattern can be applied to `operator*=` in a future pass
+- **Small / Medium paths**: unchanged (fast path only triggers for Large)
+
+### Correctness verification
+
+16 ASan+UBSan test cases in `hydra_test.cpp` covering:
+
+- Large += Large basic correctness
+- Carry propagation through all limbs
+- Self-addition (`a += a`)
+- Asymmetric sizes (16-limb += 4-limb and vice versa)
+- Chained accumulation (a += b three times)
+- Capacity-insufficient fallback path
+- Normalization / demotion after in-place add (Large → Small)
+- Commutativity and associativity
+- Medium and Small path non-regression
+
+All passed under both `-O0` and `-O2`.
+
+### New files / changes
+
+| File | Change |
+|------|--------|
+| `hydra.hpp` | `operator+=` fast path (capacity reuse) |
+| `hydra_test.cpp` | 16 correctness tests replacing empty stub |
+| `bench/bench_hydra.cpp` | `chain/large_add` benchmark (8/16/64 limbs) |
+

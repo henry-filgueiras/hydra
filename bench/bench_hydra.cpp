@@ -520,6 +520,25 @@ static void BM_chain_factorial(benchmark::State& state) {
 BENCHMARK(BM_chain_factorial)->Name("chain/factorial")
     ->Arg(10)->Arg(20)->Arg(30)->Arg(50);
 
+// Chained large additions: exercises the in-place operator+= fast path
+// when the accumulator is Large and has sufficient capacity.
+// Parameterised by limb count; step is a same-sized Large value.
+static void BM_chain_large_add(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    Hydra acc  = make_large(n, 0x1111'1111ull);
+    Hydra step = make_large(n, 0x2222'2222ull);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(acc);
+        acc += step; acc += step; acc += step; acc += step; acc += step;
+        acc += step; acc += step; acc += step; acc += step; acc += step;
+        benchmark::DoNotOptimize(acc);
+        benchmark::ClobberMemory();
+    }
+    state.counters["ops_per_iter"] = 10;
+}
+BENCHMARK(BM_chain_large_add)->Name("chain/large_add")
+    ->Arg(8)->Arg(16)->Arg(64);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // § 8  Boost.Multiprecision comparison  (opt-in: -DHYDRA_BENCH_BOOST=ON)
 //
