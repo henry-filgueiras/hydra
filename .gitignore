@@ -5,3 +5,7 @@ build/
 build-*/
 cmake-build*/
 out/
+
+# Python
+__pycache__/
+*.pyc

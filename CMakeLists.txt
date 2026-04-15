@@ -122,16 +122,79 @@ if(HYDRA_BENCH_BOOST)
 endif()
 
 # ─────────────────────────────────────────────────────────
+# Python interpreter (for comparison script)
+# ─────────────────────────────────────────────────────────
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+    message(STATUS "  Python3       : ${Python3_EXECUTABLE} (${Python3_VERSION})")
+else()
+    message(STATUS "  Python3       : not found — bench_compare target unavailable")
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Convenience targets
 # ─────────────────────────────────────────────────────────
 
-# `cmake --build build --target bench`  — build and run the benchmark
+# bench — run benchmarks (raw output to terminal)
 add_custom_target(bench
-    COMMAND hydra_bench
+    COMMAND $<TARGET_FILE:hydra_bench>
     DEPENDS hydra_bench
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "Running Hydra benchmarks…"
 )
+
+# bench_json — export results to JSON
+set(HYDRA_BENCH_JSON "${CMAKE_BINARY_DIR}/bench_results.json")
+add_custom_target(bench_json
+    COMMAND $<TARGET_FILE:hydra_bench>
+            --benchmark_format=json
+            --benchmark_out=${HYDRA_BENCH_JSON}
+            --benchmark_repetitions=3
+            --benchmark_min_time=0.2s
+    DEPENDS hydra_bench
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Running benchmarks → ${HYDRA_BENCH_JSON}"
+    BYPRODUCTS "${HYDRA_BENCH_JSON}"
+)
+
+# bench_compare — JSON export + comparison report (requires Python3)
+if(Python3_FOUND)
+    add_custom_target(bench_compare
+        COMMAND $<TARGET_FILE:hydra_bench>
+                --benchmark_format=json
+                --benchmark_out=${HYDRA_BENCH_JSON}
+                --benchmark_repetitions=3
+                --benchmark_report_aggregates_only=true
+                --benchmark_min_time=0.2s
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/bench/compare.py
+                ${HYDRA_BENCH_JSON}
+        DEPENDS hydra_bench
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Running benchmarks and comparison report…"
+        BYPRODUCTS "${HYDRA_BENCH_JSON}"
+    )
+
+    # bench_compare_md — as above but emit Markdown to bench_report.md
+    set(HYDRA_BENCH_MD "${CMAKE_BINARY_DIR}/bench_report.md")
+    add_custom_target(bench_compare_md
+        COMMAND $<TARGET_FILE:hydra_bench>
+                --benchmark_format=json
+                --benchmark_out=${HYDRA_BENCH_JSON}
+                --benchmark_repetitions=3
+                --benchmark_report_aggregates_only=true
+                --benchmark_min_time=0.2s
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/bench/compare.py
+                ${HYDRA_BENCH_JSON}
+                --markdown
+                --output ${HYDRA_BENCH_MD}
+        DEPENDS hydra_bench
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Running benchmarks → Markdown report ${HYDRA_BENCH_MD}"
+        BYPRODUCTS "${HYDRA_BENCH_JSON}" "${HYDRA_BENCH_MD}"
+    )
+endif()
 
 # ─────────────────────────────────────────────────────────
 # Summary
@@ -141,5 +204,8 @@ message(STATUS "── Hydra build configuration ──────────�
 message(STATUS "  Build type   : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Compiler     : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  C++ standard : ${CMAKE_CXX_STANDARD}")
+message(STATUS "  Boost bench  : ${HYDRA_BENCH_BOOST}")
+message(STATUS "")
+message(STATUS "  Targets      : hydra_bench  bench  bench_json  bench_compare  bench_compare_md")
 message(STATUS "────────────────────────────────────────────────────")
 message(STATUS "")
