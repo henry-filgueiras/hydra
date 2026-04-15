@@ -227,10 +227,15 @@ static void BM_widening_mul_128(benchmark::State& state) {
         benchmark::DoNotOptimize(b);
         Hydra c = a * b;
         benchmark::DoNotOptimize(c);
-        // Evolve using low limb of 128-bit product.
+        // Fold: a = b, b = high limb of product | 1.
+        // Using ptr[1] (the high 64-bit limb) mirrors Boost's "(c >> 64) | 1",
+        // keeping b near UINT64_MAX so every subsequent multiply still widens.
+        // ptr[0] (the low limb) would collapse b to ~8 after the first iteration,
+        // turning this into a small×large benchmark rather than widening.
         if (c.is_medium()) {
             auto lv = c.limb_view();
-            b = Hydra{lv.ptr[0] | 1u};
+            a = b;
+            b = Hydra{lv.ptr[1] | 1u};
         }
         benchmark::ClobberMemory();
     }
@@ -599,18 +604,41 @@ static void BM_boost_widening_mul(benchmark::State& state) {
 }
 BENCHMARK(BM_boost_widening_mul)->Name("boost/widening_mul");
 
-static void BM_boost_large_add(benchmark::State& state) {
-    const int n_bits = static_cast<int>(state.range(0));
-    // Build a value of approximately n_bits using bit-shifting.
-    bmp::cpp_int a = (bmp::cpp_int(1) << n_bits) - 1;
-    bmp::cpp_int b = (bmp::cpp_int(1) << (n_bits / 2)) + 0xDEADBEEFull;
+// Mirrors hydra/widening_add: both operands start near UINT64_MAX so every
+// addition widens to 128 bits.  Fold: keep b near UINT64_MAX by extracting
+// the low 64 bits of the 128-bit result and OR-ing with base — identical to
+// Hydra's "(lv.ptr[0] | base)" fold.  a stays fixed throughout, matching
+// Hydra's benchmark structure.
+static void BM_boost_widening_add(benchmark::State& state) {
+    const uint64_t base = std::numeric_limits<uint64_t>::max() - 0xFFFFull;
+    bmp::cpp_int a{base}, b{bmp::cpp_int(base) + 1};
     for (auto _ : state) {
         benchmark::DoNotOptimize(a);
         benchmark::DoNotOptimize(b);
         bmp::cpp_int c = a + b;
         benchmark::DoNotOptimize(c);
-        a = b;
-        b = c >> 1;
+        b = (c & bmp::cpp_int(std::numeric_limits<uint64_t>::max()))
+            | bmp::cpp_int(base);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_boost_widening_add)->Name("boost/widening_add");
+
+static void BM_boost_large_add(benchmark::State& state) {
+    const int n_bits = static_cast<int>(state.range(0));
+    // Fixed operands: a is full-width, b is half-width.
+    // No fold-back: DoNotOptimize on both operands prevents the compiler from
+    // constant-folding the addition.  A rolling fold (e.g. b = c >> 1) is not
+    // used because it is impossible to write an equivalent stabilising fold in
+    // Hydra (which has no bit-shift operator), making the two sides structurally
+    // asymmetric.  Fixed operands are the only provably equivalent approach.
+    bmp::cpp_int a = (bmp::cpp_int(1) << n_bits) - 1;
+    bmp::cpp_int b = (bmp::cpp_int(1) << (n_bits / 2)) + 0xDEAD'BEEFull;
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        benchmark::DoNotOptimize(b);
+        bmp::cpp_int c = a + b;
+        benchmark::DoNotOptimize(c);
         benchmark::ClobberMemory();
     }
 }
@@ -619,6 +647,8 @@ BENCHMARK(BM_boost_large_add)->Name("boost/large_add")
 
 static void BM_boost_large_mul(benchmark::State& state) {
     const int n_bits = static_cast<int>(state.range(0));
+    // Fixed operands — see BM_boost_large_add for rationale.
+    // a is full-width, b is half-width (n_bits × n_bits/2 multiplication).
     bmp::cpp_int a = (bmp::cpp_int(1) << n_bits) - 1;
     bmp::cpp_int b = (bmp::cpp_int(1) << (n_bits / 2)) + 0xBEEFull;
     for (auto _ : state) {
@@ -626,9 +656,6 @@ static void BM_boost_large_mul(benchmark::State& state) {
         benchmark::DoNotOptimize(b);
         bmp::cpp_int c = a * b;
         benchmark::DoNotOptimize(c);
-        a = b;
-        b = c >> n_bits;   // keep roughly n_bits wide
-        if (b == 0) b = (bmp::cpp_int(1) << (n_bits / 2)) + 1;
         benchmark::ClobberMemory();
     }
 }
@@ -674,6 +701,10 @@ BENCHMARK(BM_boost_chain_large_add)->Name("boost/chain_large_add")
 
 static void BM_hydra_large_add_for_boost_cmp(benchmark::State& state) {
     const auto n = static_cast<uint32_t>(state.range(0) / 64);
+    // Fixed operands: a is full-width (n limbs), b is half-width (n/2 limbs).
+    // Matches BM_boost_large_add's operand-size ratio.  No fold-back for the
+    // same reason documented there: Hydra has no bit-shift so there is no
+    // stabilising roll-forward that is equivalent to Boost's "b = c >> 1".
     Hydra a = make_large(std::max(n, 2u));
     Hydra b = make_large(std::max(n / 2, 2u), 0xBEEF'CAFEull);
     for (auto _ : state) {
@@ -681,8 +712,6 @@ static void BM_hydra_large_add_for_boost_cmp(benchmark::State& state) {
         benchmark::DoNotOptimize(b);
         Hydra c = a + b;
         benchmark::DoNotOptimize(c);
-        a = b;
-        b = c.is_large() ? c : make_large(std::max(n / 2, 2u));
         benchmark::ClobberMemory();
     }
 }
@@ -691,6 +720,12 @@ BENCHMARK(BM_hydra_large_add_for_boost_cmp)->Name("hydra/large_add_cmp")
 
 static void BM_hydra_large_mul_for_boost_cmp(benchmark::State& state) {
     const auto n = static_cast<uint32_t>(state.range(0) / 64);
+    // Fixed operands — see BM_hydra_large_add_for_boost_cmp for rationale.
+    // a is full-width (n limbs), b is half-width (n/2 limbs).
+    // Previous code had a dead branch: both arms of the ternary called
+    // make_large(n/2) unconditionally, meaning b never depended on c and a
+    // fresh allocation was charged to Hydra every iteration while Boost's
+    // "b = c >> n_bits" fold was allocation-free.
     Hydra a = make_large(std::max(n, 2u));
     Hydra b = make_large(std::max(n / 2, 2u), 0xBEEF'CAFEull);
     for (auto _ : state) {
@@ -698,10 +733,6 @@ static void BM_hydra_large_mul_for_boost_cmp(benchmark::State& state) {
         benchmark::DoNotOptimize(b);
         Hydra c = a * b;
         benchmark::DoNotOptimize(c);
-        a = b;
-        // Extract upper half for next b, keep size stable.
-        b = c.is_large() ? make_large(std::max(n / 2, 2u))
-                         : make_large(std::max(n / 2, 2u));
         benchmark::ClobberMemory();
     }
 }

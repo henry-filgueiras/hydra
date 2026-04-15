@@ -388,3 +388,65 @@ Features:
 | `bench/compare.py` | 3 chain large-add comparison pairs in `BOOST_PAIRS` |
 | `scripts/profile_chain_large_add.sh` | New profiling script |
 
+---
+
+## 2026-04-15 — Benchmark comparison audit & fixes (Claude Opus 4.6)
+
+Systematic audit of every `hydra/*` vs `boost/*` paired benchmark revealed four
+bugs that caused the comparison to measure different operations on the two sides.
+
+### Bug 1 — `boost/widening_add` did not exist
+
+`compare.py` registered `("hydra/widening_add", "boost/widening_add", ...)` but
+no such Boost benchmark was defined.  Added `BM_boost_widening_add` mirroring
+Hydra's exact fold: `a` stays fixed near UINT64_MAX; `b` is refreshed each
+iteration as `(low-64-bits-of-sum | base)`, keeping it near UINT64_MAX so every
+addition widens to 128 bits.
+
+### Bug 2 — `hydra/widening_mul_128` fold collapsed b to a small value
+
+Hydra used `b = Hydra{lv.ptr[0] | 1u}` (the **low** 64-bit limb of the 128-bit
+product).  For inputs near UINT64_MAX the low limb of the product is ~8, so from
+iteration 2 onward Hydra was measuring a tiny×large multiply rather than a
+widening multiply.  Boost used `b = (c >> 64) | 1` (the **high** 64-bit limb),
+which stays near UINT64_MAX.
+
+Fix: change to `lv.ptr[1] | 1u` (the high limb), and also add `a = b` before
+updating b so the Fibonacci-style fold matches Boost's structure exactly.
+
+### Bug 3 — `hydra/large_add_cmp` fold grew b to full-width while Boost kept b at half-width
+
+Hydra's fold was `a = b; b = c.is_large() ? c : make_large(n/2)`.  Since the
+addition result is always Large, `b = c` (full-width) every iteration.  Boost's
+fold was `a = b; b = c >> 1`, which is a **stabilising** fold (the shift keeps b
+bounded at ~n_bits − 1 wide).  Hydra has no bit-shift operator, so there is no
+equivalent stabilising fold, making the two sides permanently structurally
+asymmetric.
+
+Fix: drop the fold-back on **both** sides.  Use fixed operands (a = full-width,
+b = half-width, seeded once before the loop) and rely on `DoNotOptimize` on both
+to prevent constant-folding.  This is the only approach that is simultaneously
+provably equivalent and allocation-free in the timed loop body.
+
+### Bug 4 — `hydra/large_mul_cmp` had a dead branch adding a per-iteration allocation
+
+```cpp
+// broken — both arms identical, b never depends on c
+b = c.is_large() ? make_large(std::max(n / 2, 2u))
+                 : make_large(std::max(n / 2, 2u));
+```
+
+Every iteration allocated a fresh Large value on Hydra's side, while Boost's
+`b = c >> n_bits` fold was pure arithmetic with no allocation.  Also, because
+both arms were the same, the compiler could in principle prove b was independent
+of c and hoist the make_large call out of the loop.
+
+Fix: same fixed-operand approach as large_add (see above).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `bench/bench_hydra.cpp` | All four bug fixes + `BM_boost_widening_add` |
+
+
