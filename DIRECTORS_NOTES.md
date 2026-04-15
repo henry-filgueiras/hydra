@@ -390,6 +390,28 @@ Features:
 
 ---
 
+## 2026-04-15 — README infographic SVG (Claude Opus 4.6)
+
+### New file
+
+| File | Role |
+|------|------|
+| `assets/hydra_perf_story.svg` | Production-ready 16:9 infographic for README embedding |
+
+### Design
+
+Three-panel layout (architecture / profiler story / benchmarks) with a dark
+graphite/neon-blue palette that renders cleanly on both GitHub light and dark
+themes.  Fully standalone SVG — no external assets except an optional Google
+Fonts `@import` for Inter (falls back to system sans-serif).
+
+Embed in README with:
+```markdown
+![Hydra Performance Story](assets/hydra_perf_story.svg)
+```
+
+---
+
 ## 2026-04-15 — Benchmark comparison audit & fixes (Claude Opus 4.6)
 
 Systematic audit of every `hydra/*` vs `boost/*` paired benchmark revealed four

@@ -18,6 +18,10 @@ In other words:
 
 ---
 
+## Visual Hydra Performance Story
+
+![Hydra Performance Story](assets/hydra_perf_story.svg)
+
 ## ✨ Design Goals
 
 Hydra is built around five principles:
