@@ -4,14 +4,14 @@ set -euo pipefail
 # --------------------------------------------------
 # Config
 # --------------------------------------------------
-BENCH="./build/hydra_bench"
+BENCH="./build-rel/hydra_bench"
 
 # Benchmark filters
-HYDRA_FILTER="hydra/large_add_256"
-BOOST_FILTER="boost/large_add_256"
+HYDRA_FILTER="hydra/large_add_cmp/256"
+BOOST_FILTER="boost/large_add/256"
 
 # How long to let benchmark run
-MIN_TIME="2.0"
+MIN_TIME="5s"
 
 # --------------------------------------------------
 # Output folder
@@ -39,12 +39,11 @@ run_trace() {
 
     xctrace record \
         --template "${template}" \
-        --time-limit 5s \
         --output "${outfile}" \
         --launch "${BENCH}" \
         -- \
         --benchmark_filter="${filter}" \
-        --benchmark_min_time=2.0
+        --benchmark_min_time="${MIN_TIME}"
 }
 
 # --------------------------------------------------

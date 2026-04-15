@@ -12,3 +12,5 @@ __pycache__/
 
 # Don't publish ephemeral trace files
 traces/
+
+.DS_Store
