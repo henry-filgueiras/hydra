@@ -9,3 +9,6 @@ out/
 # Python
 __pycache__/
 *.pyc
+
+# Don't publish ephemeral trace files
+traces/
