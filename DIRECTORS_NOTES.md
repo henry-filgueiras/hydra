@@ -219,3 +219,48 @@ Or just use `./bench/run.sh` which handles this correctly.
 
 _Append future entries below this line._
 
+---
+
+## 2026-04-15 — `add_general` scratch-buffer elimination (Claude Sonnet 4.6)
+
+### Profiler finding
+
+Time Profiler identified the dominant stack in `add_general` (heap path) as:
+
+```
+std::vector scratch allocation
+→ Hydra::from_limbs
+  → LargeRep::create
+  → memmove
+```
+
+The arithmetic kernel (`add_limbs`) was **not** the bottleneck. The waste was
+two allocations and a full memcpy of the limb array:
+
+1. `std::vector<uint64_t> out(max_limbs)` — scratch buffer
+2. `from_limbs(out.data(), used)` → `LargeRep::create(count)` — final rep
+3. `std::memcpy(rep->limbs(), limbs, count * sizeof(uint64_t))` — copy scratch → rep
+
+### Fix
+
+Allocate the final `LargeRep` first (wrapped in `LargeGuard` for
+exception-safety), pass `rep->limbs()` directly to `add_limbs`, set
+`rep->used`, then commit to a `Hydra` and call `normalize()`.
+
+The `normalize()` call handles trimming and demotion to Medium/Small if the
+upper limbs are zero — exactly the same correctness behaviour as before.
+Result: **one allocation, zero extra copies** on the heap path.
+
+The stack path (≤ 4 limbs) is unchanged.
+
+### Correctness verification
+
+31 ASan+UBSan test cases were run covering:
+- Large+Large stays Large (carry propagation, 8-limb operands)
+- Large result demotes to Medium via normalize()
+- Large result demotes to Small via normalize()
+- Commutativity and associativity for 5-limb and 6-limb operands
+- Specific limb-value checks at boundaries
+
+All passed.
+

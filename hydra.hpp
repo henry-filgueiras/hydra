@@ -559,10 +559,7 @@ struct Hydra {
         // Maximum result size: max(na, nb) + 1 limbs.
         uint32_t max_limbs = std::max(lv.count, rv.count) + 1;
 
-        // Small enough to stay on the stack for almost all cases.
-        // For very large numbers we'd heap-allocate a buffer here;
-        // for a first pass we use a VLA-equivalent via std::vector.
-        // The common case (≤ 4 limbs) avoids any allocation entirely.
+        // Stack path: result fits in ≤ 4 limbs — no heap involved at all.
         if (max_limbs <= 4) {
             uint64_t out[4];
             uint32_t used = detail::add_limbs(
@@ -570,11 +567,23 @@ struct Hydra {
             return from_limbs(out, used);
         }
 
-        // Heap buffer for large + large.
-        std::vector<uint64_t> out(max_limbs);
-        uint32_t used = detail::add_limbs(
-            lv.ptr, lv.count, rv.ptr, rv.count, out.data());
-        return from_limbs(out.data(), used);
+        // Heap path — write the kernel output *directly* into the final
+        // LargeRep, skipping the intermediate std::vector scratch buffer
+        // and the subsequent memcpy/memmove that from_limbs would perform.
+        //
+        // LargeGuard provides exception-safety: if add_limbs or anything
+        // downstream throws, the rep is freed before propagation.
+        LargeGuard rep{ LargeRep::create(max_limbs) };
+        rep->used = detail::add_limbs(
+            lv.ptr, lv.count, rv.ptr, rv.count, rep->limbs());
+
+        // Commit the rep into a Hydra, then let normalize() handle trimming
+        // and potential demotion to Medium or Small if high limbs are zero.
+        Hydra result;
+        result.meta          = make_large_meta();
+        result.payload.large = rep.release();
+        result.normalize();
+        return result;
     }
 
     // ─────────────────────────────────────────────────────
