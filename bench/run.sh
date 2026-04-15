@@ -62,7 +62,10 @@ fi
 # ── Run benchmarks ────────────────────────────────────────────────────────────
 echo "── Running benchmarks → ${RESULTS_JSON} ────────────────────────────────"
 BENCH_ARGS=(
-    --benchmark_format=json
+    # --benchmark_out_format writes JSON to file; --benchmark_format controls
+    # the *console* format (left as default = human-readable table).
+    # Using --benchmark_format=json here would dump raw JSON to stdout instead.
+    --benchmark_out_format=json
     --benchmark_out="$RESULTS_JSON"
     --benchmark_repetitions=3          # 3 runs; compare.py uses per-run rows
     --benchmark_min_time=0.2s
@@ -74,4 +77,7 @@ echo ""
 
 # ── Compare ───────────────────────────────────────────────────────────────────
 echo "── Comparison report ───────────────────────────────────────────────────"
-python3 "$SCRIPT_DIR/compare.py" "$RESULTS_JSON" "${COMPARE_ARGS[@]}"
+# "${arr[@]+"${arr[@]}"}" expands to nothing when arr is empty, avoiding the
+# "unbound variable" error that set -u triggers on empty arrays in bash ≤ 5.
+python3 "$SCRIPT_DIR/compare.py" "$RESULTS_JSON" \
+    ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"}

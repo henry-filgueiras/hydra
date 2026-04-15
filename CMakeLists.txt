@@ -147,7 +147,7 @@ add_custom_target(bench
 set(HYDRA_BENCH_JSON "${CMAKE_BINARY_DIR}/bench_results.json")
 add_custom_target(bench_json
     COMMAND $<TARGET_FILE:hydra_bench>
-            --benchmark_format=json
+            --benchmark_out_format=json
             --benchmark_out=${HYDRA_BENCH_JSON}
             --benchmark_repetitions=3
             --benchmark_min_time=0.2s
