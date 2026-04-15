@@ -15,6 +15,7 @@ project(
     VERSION 0.1.0
     DESCRIPTION "Tiered multi-representation integer runtime"
     LANGUAGES CXX
+
 )
 
 # ─────────────────────────────────────────────────────────
@@ -95,10 +96,13 @@ target_link_libraries(hydra_bench
 # Benchmarks should always be built in Release mode regardless of the
 # top-level build type.  We set this per-target via compile options.
 target_compile_options(hydra_bench PRIVATE
-    $<$<CONFIG:Debug>:-O3 -DNDEBUG>
-    $<$<CONFIG:RelWithDebInfo>:-O3 -DNDEBUG>
+    $<$<CONFIG:Debug>:-O3 -g -DNDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:-O3 -g -DNDEBUG>
     $<$<CONFIG:Release>:-O3 -march=native>
 )
+
+set_target_properties(hydra_bench PROPERTIES 
+    XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT "dwarf-with-dsym")
 
 # ─────────────────────────────────────────────────────────
 # Optional: Boost.Multiprecision comparison benchmarks
@@ -108,7 +112,7 @@ target_compile_options(hydra_bench PRIVATE
 # Boost.Multiprecision is header-only; we only need include dirs.
 # The option is OFF by default so clean builds don't require Boost.
 # ─────────────────────────────────────────────────────────
-option(HYDRA_BENCH_BOOST "Enable Boost.Multiprecision comparison benchmarks" OFF)
+option(HYDRA_BENCH_BOOST "Enable Boost.Multiprecision comparison benchmarks" ON)
 
 if(HYDRA_BENCH_BOOST)
     find_package(Boost REQUIRED)
