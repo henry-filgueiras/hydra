@@ -472,3 +472,96 @@ Fix: same fixed-operand approach as large_add (see above).
 | `bench/bench_hydra.cpp` | All four bug fixes + `BM_boost_widening_add` |
 
 
+## 2026-04-15 - Design Fork: 32-byte aligned vs 24-byte packed Hydra (ChatGPT and Gemini)
+
+A recurring design question is whether Hydra should remain a **fixed 32-byte object footprint** or offer an optional **24-byte packed representation**.
+
+### Current recommendation (default)
+
+Keep the **32-byte aligned layout as the canonical default**.
+
+Reasons:
+
+* clean cache-line behavior
+
+  * 2 objects per 64-byte line
+* future SIMD friendliness
+
+  * natural fit for 256-bit register-oriented loads
+* simpler field alignment and code generation
+* fewer layout edge-cases
+* easier reasoning about payload invariants
+* benchmark continuity and reproducibility
+
+This is the current benchmarked and publicly communicated artifact.
+
+---
+
+### Exploratory variant path
+
+Potential future design:
+
+```cpp
+template <typename Policy = aligned_32_policy>
+class Hydra;
+```
+
+or
+
+```cpp
+template <std::size_t InlineBytes = 32>
+class Hydra;
+```
+
+Candidate policies:
+
+* `aligned_32_policy`
+
+  * performance-first
+  * benchmark default
+  * SIMD-ready
+  * simpler codegen
+
+* `packed_24_policy`
+
+  * memory-density-first
+  * higher container density
+  * potentially 8-byte savings per object
+  * may improve some memory-bound workloads
+
+This would allow developers to explicitly choose:
+
+> **throughput-optimized**
+> vs
+> **density-optimized**
+
+---
+
+### Important caution
+
+Do **not** introduce policy templating until the current canonical implementation stabilizes.
+
+Premature policy abstraction risks:
+
+* benchmark fragmentation
+* code duplication
+* optimizer divergence
+* more difficult perf attribution
+* documentation complexity
+
+The benchmark narrative is currently built around the 32-byte aligned design.
+
+That story should remain stable until v1 architecture is considered mature.
+
+---
+
+### Suggested roadmap gate
+
+Only explore policy-based layouts after:
+
+* multiplication kernels stabilize
+* shift / division support lands
+* signed representation strategy is chosen
+* benchmark suite remains green and apples-to-apples
+
+Treat this as a **Phase 2 architectural fork**, not an immediate work item.
