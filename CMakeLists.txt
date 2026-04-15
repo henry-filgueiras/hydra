@@ -101,6 +101,27 @@ target_compile_options(hydra_bench PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────
+# Optional: Boost.Multiprecision comparison benchmarks
+#
+#   cmake -B build-rel -DCMAKE_BUILD_TYPE=Release -DHYDRA_BENCH_BOOST=ON
+#
+# Boost.Multiprecision is header-only; we only need include dirs.
+# The option is OFF by default so clean builds don't require Boost.
+# ─────────────────────────────────────────────────────────
+option(HYDRA_BENCH_BOOST "Enable Boost.Multiprecision comparison benchmarks" OFF)
+
+if(HYDRA_BENCH_BOOST)
+    find_package(Boost REQUIRED)
+    if(Boost_FOUND)
+        message(STATUS "  Boost found   : ${Boost_INCLUDE_DIRS}")
+        target_compile_definitions(hydra_bench PRIVATE HYDRA_BENCH_HAS_BOOST)
+        target_include_directories(hydra_bench PRIVATE ${Boost_INCLUDE_DIRS})
+    else()
+        message(WARNING "HYDRA_BENCH_BOOST=ON but Boost not found; skipping.")
+    endif()
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Convenience targets
 # ─────────────────────────────────────────────────────────
 
