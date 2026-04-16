@@ -1398,6 +1398,8 @@ _Established 2026-04-15 — Claude Sonnet 4.6; extended by Claude Opus 4.6_
 | `bench/bench_hydra.cpp`                 | Google Benchmark suite (Hydra + Boost comparison)            |
 | `bench/compare.py`                      | Python comparison script — terminal + Markdown output        |
 | `bench/run.sh`                          | One-shot shell wrapper: build → run → compare                |
+| `bench/bench_pow_mod.cpp`               | Standalone comparative pow_mod benchmark (Hydra + Boost/GMP/OpenSSL) |
+| `bench/pow_mod_report.py`               | Python report generator — Markdown tables + SVG chart from JSON |
 | `scripts/profile_chain_large_add.sh`    | xctrace profiler for chained accumulation (Hydra vs Boost)   |
 | `assets/hydra_perf_story.svg`           | Production-ready 16:9 infographic for README embedding        |
 
@@ -1686,6 +1688,86 @@ landed during Phase 2 (signed arithmetic, native interop, string
 parse/format, Karatsuba production dispatch, number theory primitives).
 Stale roadmap items were replaced with current follow-ups (Toom-Cook,
 arena-backed Karatsuba scratch).
+
+---
+
+### pow_mod Comparative Benchmark Suite
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Standalone benchmark harness measuring `pow_mod(base, exp, mod)` across
+multiple bigint libraries at 256, 512, 1024, 2048, and 4096 bits.
+
+#### Design
+
+Self-contained `bench/bench_pow_mod.cpp` using `<chrono>` timing (no
+Google Benchmark dependency).  Each backend is enabled at compile time
+via preprocessor flags:
+
+| Flag                    | Backend               | Link requirement |
+|-------------------------|-----------------------|------------------|
+| _(always)_              | Hydra `pow_mod`       | none             |
+| `HYDRA_POWMOD_BOOST`    | Boost `powm(cpp_int)` | Boost headers    |
+| `HYDRA_POWMOD_GMP`      | `mpz_powm`            | `-lgmp`          |
+| `HYDRA_POWMOD_OPENSSL`  | `BN_mod_exp`          | `-lcrypto`       |
+
+All four backends receive identical deterministic operands (seeded
+`mt19937_64`, top bit set, modulus odd).  Cross-validation checks that
+all enabled backends produce the same result before any timing begins.
+
+#### Measurement methodology
+
+- 3 warmup calls (cache priming, allocator warm-up)
+- 50 individually-timed calls per width per backend
+- Statistics: median, p95, mean, ops/sec (from median)
+- `asm volatile` barriers on results to defeat DCE
+
+#### Output modes
+
+- `--json` (default) — structured JSON for tooling consumption
+- `--markdown` / `--md` — README-ready Markdown tables
+- `--csv` — flat CSV for spreadsheet import
+
+`bench/pow_mod_report.py` consumes the JSON and produces Markdown
+tables + an SVG log-scale bar chart.
+
+#### Representative Hydra-only numbers (Linux aarch64 sandbox, g++ 11 -O3)
+
+```
+  256-bit:   ~60 µs median    (~17K ops/sec)
+  512-bit:  ~200 µs median    (~5K ops/sec)
+ 1024-bit:  ~960 µs median    (~1K ops/sec)
+ 2048-bit:  ~4.7 ms median    (~210 ops/sec)
+ 4096-bit: ~31.3 ms median    (~32 ops/sec)
+```
+
+Scaling is roughly O(n²·log(n)) as expected: the exponent has n bits
+(so log(n)·n squarings) and each squaring is an n×n multiply (O(n²) at
+these widths, or O(n^1.585) at 2048+ where Karatsuba activates) plus
+an n÷n modular reduction (Knuth D, also O(n²)).
+
+#### Build quick-start
+
+```bash
+# Hydra only:
+g++ -std=c++20 -O3 -march=native -DNDEBUG -I. \
+    bench/bench_pow_mod.cpp -o build-rel/bench_pow_mod
+
+# With all backends (macOS Homebrew):
+g++ -std=c++20 -O3 -march=native -DNDEBUG -I. \
+    -DHYDRA_POWMOD_BOOST -I/opt/homebrew/include \
+    -DHYDRA_POWMOD_GMP -I/opt/homebrew/include -L/opt/homebrew/lib -lgmp \
+    -DHYDRA_POWMOD_OPENSSL -I/opt/homebrew/include -L/opt/homebrew/lib -lcrypto \
+    bench/bench_pow_mod.cpp -o build-rel/bench_pow_mod
+
+# Run + report:
+./build-rel/bench_pow_mod --json 2>/dev/null > results.json
+python3 bench/pow_mod_report.py results.json --output report.md --chart chart.svg
+```
+
+CMake also provides a `bench_pow_mod` target with optional
+`-DHYDRA_POWMOD_GMP=ON` and `-DHYDRA_POWMOD_OPENSSL=ON` flags.
+Boost is automatically enabled when `HYDRA_BENCH_BOOST=ON` (the default).
 
 ---
 

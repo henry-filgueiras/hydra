@@ -126,6 +126,61 @@ if(HYDRA_BENCH_BOOST)
 endif()
 
 # ─────────────────────────────────────────────────────────
+# pow_mod comparative benchmark (standalone, no Google Benchmark dep)
+# ─────────────────────────────────────────────────────────
+add_executable(bench_pow_mod bench/bench_pow_mod.cpp)
+target_link_libraries(bench_pow_mod PRIVATE hydra_core)
+target_compile_options(bench_pow_mod PRIVATE
+    $<$<CONFIG:Debug>:-O3 -g -DNDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:-O3 -g -DNDEBUG>
+    $<$<CONFIG:Release>:-O3 -march=native>
+)
+
+# Optional backends for pow_mod benchmark
+option(HYDRA_POWMOD_GMP     "Enable GMP backend in pow_mod benchmark"     OFF)
+option(HYDRA_POWMOD_OPENSSL "Enable OpenSSL backend in pow_mod benchmark" OFF)
+
+if(HYDRA_BENCH_BOOST AND Boost_FOUND)
+    target_compile_definitions(bench_pow_mod PRIVATE HYDRA_POWMOD_BOOST)
+    target_include_directories(bench_pow_mod PRIVATE ${Boost_INCLUDE_DIRS})
+endif()
+
+if(HYDRA_POWMOD_GMP)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GMP QUIET gmp)
+    endif()
+    if(NOT GMP_FOUND)
+        find_library(GMP_LIBRARY gmp)
+        find_path(GMP_INCLUDE_DIR gmp.h)
+        if(GMP_LIBRARY AND GMP_INCLUDE_DIR)
+            set(GMP_FOUND TRUE)
+            set(GMP_LIBRARIES ${GMP_LIBRARY})
+            set(GMP_INCLUDE_DIRS ${GMP_INCLUDE_DIR})
+        endif()
+    endif()
+    if(GMP_FOUND)
+        target_compile_definitions(bench_pow_mod PRIVATE HYDRA_POWMOD_GMP)
+        target_include_directories(bench_pow_mod PRIVATE ${GMP_INCLUDE_DIRS})
+        target_link_libraries(bench_pow_mod PRIVATE ${GMP_LIBRARIES})
+        message(STATUS "  GMP pow_mod   : enabled")
+    else()
+        message(WARNING "HYDRA_POWMOD_GMP=ON but GMP not found; skipping.")
+    endif()
+endif()
+
+if(HYDRA_POWMOD_OPENSSL)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        target_compile_definitions(bench_pow_mod PRIVATE HYDRA_POWMOD_OPENSSL)
+        target_link_libraries(bench_pow_mod PRIVATE OpenSSL::Crypto)
+        message(STATUS "  OpenSSL pow_mod: enabled")
+    else()
+        message(WARNING "HYDRA_POWMOD_OPENSSL=ON but OpenSSL not found; skipping.")
+    endif()
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Python interpreter (for comparison script)
 # ─────────────────────────────────────────────────────────
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -210,6 +265,6 @@ message(STATUS "  Compiler     : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_V
 message(STATUS "  C++ standard : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Boost bench  : ${HYDRA_BENCH_BOOST}")
 message(STATUS "")
-message(STATUS "  Targets      : hydra_bench  bench  bench_json  bench_compare  bench_compare_md")
+message(STATUS "  Targets      : hydra_bench  bench_pow_mod  bench  bench_json  bench_compare  bench_compare_md")
 message(STATUS "────────────────────────────────────────────────────")
 message(STATUS "")
