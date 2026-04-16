@@ -282,6 +282,74 @@ the multi-limb multiply-subtract step.
 
 ---
 
+### Shift Benchmark Suite + Audit Findings
+
+_Added 2026-04-16 — Claude Opus 4.6_
+
+The shift substrate (Phase 1) landed 2026-04-15 (commit `5646372`). A
+follow-up audit confirmed the implementation meets every design constraint:
+
+- **Tier coverage** — Small fast-path, Medium via 4-limb stack buffer
+  (covers Medium at 3 limbs plus a 4-limb Large bonus), heap path otherwise.
+- **Allocation discipline** — Shift results that fit in ≤ 4 limbs never
+  allocate; heap path writes directly into `LargeRep::limbs()` with no
+  scratch buffer, mirroring the `add_general` pattern.
+- **Normalization** — `from_limbs()` and `normalize()` cover every exit so
+  Large→Medium→Small demotion happens in a single shift when possible
+  (`test_shr_large_demotes_to_small` exercises a 4-limb → Small collapse).
+- **Primitive separation** — `detail::shl_limbs` and `detail::shr_limbs`
+  each split `shift` into `whole = shift/64` and `bits = shift%64` and
+  branch on `bits == 0` to avoid the `64 - bits` UB edge.
+
+#### New benchmark coverage
+
+Added in `bench/bench_hydra.cpp` (§ 7b):
+
+| Name                     | Inputs                              | What it isolates |
+|--------------------------|-------------------------------------|------------------|
+| `shift/left_small`       | `Hydra{u64}`, shift ∈ {1, 63}       | Small fast path |
+| `shift/left_medium`      | 3-limb Medium, shift ∈ {1, 63, 64, 65, 127} | Stack vs heap path |
+| `shift/left_large`       | 8-limb Large, shift ∈ {1, 63, 64, 65, 127}  | Pure heap path |
+| `shift/right_medium`     | 3-limb Medium, shift ∈ {1, 63, 64, 65, 127} | Stitch + demote |
+| `shift/right_large`      | 8-limb Large, shift ∈ {1, 63, 64, 65, 127}  | Multi-limb stitch |
+| `chain/shift_small_10`   | 5× `(<<1, >>1)` loop                 | Steady-state Small |
+| `chain/shift_large_10`   | 5× `(<<1, >>1)` on 4-limb Large      | Steady-state heap |
+
+Shift magnitudes are chosen at the limb-geometry cliffs: `1` (trivial carry),
+`63` (max intra-limb), `64` (pure whole-limb, `bits==0` memcpy path), `65`
+(first shift where both whole and bits are non-zero), `127` (full stitch on
+a 2-limb window). All five branches of `shl_limbs`/`shr_limbs` are covered.
+
+#### Representative numbers (Linux g++ -O3, sandbox, single-core 48 MHz VM)
+
+These absolute times are not portable to the host Mac, but the *relative*
+structure is meaningful:
+
+```
+shift/left_small/1        0.67 ns    (Small fast path)
+shift/left_medium/1       3.85 ns    (Medium, stays Medium, stack path)
+shift/left_medium/63      8.28 ns    (promotes to Large, heap path)
+shift/left_large/1        8.11 ns    (8-limb Large, heap path)
+shift/left_large/65       8.94 ns    (slightly more work, stitching)
+shift/right_medium/1      3.68 ns    (stays Medium, stack path)
+shift/right_large/1       9.31 ns    (8-limb right-shift, heap path)
+chain/shift_small_10      1.76 ns/op (5x shift round-trip, stays Small)
+chain/shift_large_10     10.1 ns/op  (5x shift round-trip on Large)
+```
+
+The Small fast path at 0.67 ns — an order of magnitude under any kernel
+call — validates the "pay for complexity only when the value actually
+needs it" thesis at the shift layer.
+
+#### Stale bench comments fixed
+
+Two comments in `BM_boost_large_add` / `BM_hydra_large_add_for_boost_cmp`
+claimed "Hydra has no bit-shift operator" as rationale for the fixed-operand
+fold. Updated to reflect the post-Phase-1 reality: shifts exist, but fixed
+operands still isolate the add measurement from shift cost.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6_

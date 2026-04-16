@@ -542,6 +542,24 @@ static void test_shr_large_partial() {
     CHECK(trip == expected, "large: (a >> 32) << 32 matches a with low bits cleared");
 }
 
+static void test_shr_large_demotes_to_small() {
+    // Multi-tier demotion in a single shift: Large (4-limb) → Small (1-limb).
+    // Build a 4-limb value whose top three limbs each hold a single bit that
+    // all land inside the low limb after shifting right by 192.
+    uint64_t limbs[4] = {
+        0u,
+        0x1111ull,
+        0x2222ull,
+        0x3333ull,
+    };
+    Hydra a = Hydra::from_limbs(limbs, 4);
+    CHECK(a.is_large() || a.is_medium(), "input large-ish");
+    Hydra r = a >> 192;
+    // Value after >>192 is just the top limb: 0x3333.
+    CHECK(r.is_small(), "large >> 192 demotes to Small");
+    CHECK(r.to_u64() == 0x3333ull, "large >> 192 value correct");
+}
+
 static void test_shl_shr_roundtrip() {
     // For shift n, (a << n) >> n == a (when no bits lost from the top).
     // Use a value with top bit clear to ensure no information is lost.
@@ -777,6 +795,7 @@ int main() {
     test_shr_medium_demotes();
     test_shr_intra_limb_stitch();
     test_shr_large_partial();
+    test_shr_large_demotes_to_small();
     test_shl_shr_roundtrip();
 
     // div_u64 / mod_u64 tests

@@ -545,6 +545,159 @@ BENCHMARK(BM_chain_large_add)->Name("chain/large_add")
     ->Arg(8)->Arg(16)->Arg(64);
 
 // ─────────────────────────────────────────────────────────────────────────────
+// § 7b  Shift benchmarks  (Phase 1 division substrate)
+//
+// Goal: measure the per-tier shift cost at the representative cliff points.
+// The interesting shift magnitudes are dictated by the limb geometry, not by
+// arbitrary choice:
+//
+//   •  1  — trivial intra-limb, hits the carry path
+//   • 63  — maximum intra-limb shift; `64 - bits == 1`
+//   • 64  — pure whole-limb (bits == 0), memcpy fast path
+//   • 65  — first shift where BOTH whole and bits are non-zero
+//   • 127 — whole=1, bits=63 — the full stitch on a 2-limb window
+//
+// These exercise every branch of shl_limbs / shr_limbs (bits==0 vs bits!=0,
+// whole==0 vs whole>0).  Inputs are fixed (pre-seeded outside the loop) so
+// the only work in the timed region is the shift itself plus the result's
+// construction/demotion/deallocation.
+//
+// `DoNotOptimize` on both input and output prevents the compiler from
+// folding the known shift amount at compile time.  `ClobberMemory` keeps
+// heap side-effects honest on the Large path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── per-tier single-shift benchmarks ────────────────────────────────────────
+
+static void BM_shift_left_small(benchmark::State& state) {
+    const auto shift = static_cast<unsigned>(state.range(0));
+    Hydra a{0xDEAD'BEEF'CAFE'BABEull};
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a << shift;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_shift_left_small)->Name("shift/left_small")
+    ->Arg(1)->Arg(63);
+// shift==64 / 65 / 127 would cross into Medium/Large — covered by the
+// medium/large benches below.
+
+static void BM_shift_left_medium(benchmark::State& state) {
+    const auto shift = static_cast<unsigned>(state.range(0));
+    // Stays Medium for small shifts (≤ ~128 depending on input magnitude);
+    // shift==127 will promote to Large for a 3-limb input with the top bit set.
+    uint64_t limbs[3] = {
+        0x1111'2222'3333'4444ull,
+        0x5555'6666'7777'8888ull,
+        0x0000'0000'0000'00FFull,  // low-ish MSL so small shifts stay medium
+    };
+    Hydra a = Hydra::from_limbs(limbs, 3);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a << shift;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_shift_left_medium)->Name("shift/left_medium")
+    ->Arg(1)->Arg(63)->Arg(64)->Arg(65)->Arg(127);
+
+static void BM_shift_left_large(benchmark::State& state) {
+    const auto shift = static_cast<unsigned>(state.range(0));
+    // 8-limb Large — exercises the heap path (max_out > 4 even at shift=1).
+    Hydra a = make_large(8, 0xA11CE);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a << shift;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_shift_left_large)->Name("shift/left_large")
+    ->Arg(1)->Arg(63)->Arg(64)->Arg(65)->Arg(127);
+
+// ── right shifts ────────────────────────────────────────────────────────────
+
+static void BM_shift_right_medium(benchmark::State& state) {
+    const auto shift = static_cast<unsigned>(state.range(0));
+    // 3-limb medium — high bits set so small shifts still produce Medium
+    // and shift==127 demotes all the way to Small.
+    uint64_t limbs[3] = {
+        0x1111'2222'3333'4444ull,
+        0x5555'6666'7777'8888ull,
+        0xAAAA'BBBB'CCCC'DDDDull,
+    };
+    Hydra a = Hydra::from_limbs(limbs, 3);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a >> shift;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_shift_right_medium)->Name("shift/right_medium")
+    ->Arg(1)->Arg(63)->Arg(64)->Arg(65)->Arg(127);
+
+static void BM_shift_right_large(benchmark::State& state) {
+    const auto shift = static_cast<unsigned>(state.range(0));
+    Hydra a = make_large(8, 0xBEE7);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a >> shift;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_shift_right_large)->Name("shift/right_large")
+    ->Arg(1)->Arg(63)->Arg(64)->Arg(65)->Arg(127);
+
+// ── chained shifts ──────────────────────────────────────────────────────────
+//
+// Ten shifts per iteration (ops_per_iter counter) — mirrors the
+// chain/small_add_10 and chain/large_add patterns.  The accumulator is
+// shifted left then right by the same amount so it never unboundedly grows
+// or collapses; the steady-state tier mirrors the input tier.
+
+static void BM_chain_shift_small(benchmark::State& state) {
+    Hydra a{0x1F'FFFF'FFFF'FFFFull};   // 53 bits set — << 1 stays Small
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+    state.counters["ops_per_iter"] = 10;
+}
+BENCHMARK(BM_chain_shift_small)->Name("chain/shift_small_10");
+
+static void BM_chain_shift_large(benchmark::State& state) {
+    // Starts as a 4-limb value; shift cycles oscillate ±1 bit so we stay
+    // within ±1 limb of the original width — mirrors real use in Knuth D
+    // normalisation / de-normalisation where the shift amount is small.
+    Hydra a = make_large(4, 0x51DE5);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        Hydra r = a;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        r = r << 1;  r = r >> 1;
+        benchmark::DoNotOptimize(r);
+        benchmark::ClobberMemory();
+    }
+    state.counters["ops_per_iter"] = 10;
+}
+BENCHMARK(BM_chain_shift_large)->Name("chain/shift_large_10");
+
+// ─────────────────────────────────────────────────────────────────────────────
 // § 8  Boost.Multiprecision comparison  (opt-in: -DHYDRA_BENCH_BOOST=ON)
 //
 // Compile with:
@@ -628,10 +781,10 @@ static void BM_boost_large_add(benchmark::State& state) {
     const int n_bits = static_cast<int>(state.range(0));
     // Fixed operands: a is full-width, b is half-width.
     // No fold-back: DoNotOptimize on both operands prevents the compiler from
-    // constant-folding the addition.  A rolling fold (e.g. b = c >> 1) is not
-    // used because it is impossible to write an equivalent stabilising fold in
-    // Hydra (which has no bit-shift operator), making the two sides structurally
-    // asymmetric.  Fixed operands are the only provably equivalent approach.
+    // constant-folding the addition.  Hydra's `operator>>` landed with the
+    // division substrate (2026-04-15) so a rolling fold is now technically
+    // possible on both sides, but keeping fixed operands avoids charging the
+    // shift cost against the add comparison.
     bmp::cpp_int a = (bmp::cpp_int(1) << n_bits) - 1;
     bmp::cpp_int b = (bmp::cpp_int(1) << (n_bits / 2)) + 0xDEAD'BEEFull;
     for (auto _ : state) {
@@ -702,9 +855,9 @@ BENCHMARK(BM_boost_chain_large_add)->Name("boost/chain_large_add")
 static void BM_hydra_large_add_for_boost_cmp(benchmark::State& state) {
     const auto n = static_cast<uint32_t>(state.range(0) / 64);
     // Fixed operands: a is full-width (n limbs), b is half-width (n/2 limbs).
-    // Matches BM_boost_large_add's operand-size ratio.  No fold-back for the
-    // same reason documented there: Hydra has no bit-shift so there is no
-    // stabilising roll-forward that is equivalent to Boost's "b = c >> 1".
+    // Matches BM_boost_large_add's operand-size ratio.  Fixed operands keep the
+    // add measurement free of shift overhead now that Hydra has `operator>>`
+    // (landed with the division substrate, 2026-04-15).
     Hydra a = make_large(std::max(n, 2u));
     Hydra b = make_large(std::max(n / 2, 2u), 0xBEEF'CAFEull);
     for (auto _ : state) {
