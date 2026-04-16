@@ -1925,6 +1925,220 @@ static void test_tostring_vs_parse_cross_check() {
           "to_string cross-check with parse");
 }
 
+// ── Number theory: abs, operator/, operator%, gcd, extended_gcd, pow_mod ──
+
+using hydra::abs;
+using hydra::gcd;
+using hydra::EGCDResult;
+using hydra::extended_gcd;
+using hydra::pow_mod;
+
+// --- abs ---
+static void test_abs_positive() {
+    CHECK(abs(Hydra{42u}) == Hydra{42u}, "abs(42) == 42");
+}
+static void test_abs_negative() {
+    CHECK(abs(Hydra{-7}) == Hydra{7u}, "abs(-7) == 7");
+}
+static void test_abs_zero() {
+    CHECK(abs(Hydra{0u}) == Hydra{0u}, "abs(0) == 0");
+}
+
+// --- operator/ and operator% ---
+static void test_div_mod_operators() {
+    Hydra a{100u}, b{7u};
+    CHECK(a / b == Hydra{14u}, "100 / 7 == 14");
+    CHECK(a % b == Hydra{2u}, "100 % 7 == 2");
+}
+
+static void test_divmod_assign() {
+    Hydra a{100u};
+    a /= Hydra{10u};
+    CHECK(a == Hydra{10u}, "100 /= 10 == 10");
+    Hydra b{100u};
+    b %= Hydra{30u};
+    CHECK(b == Hydra{10u}, "100 %= 30 == 10");
+}
+
+// --- gcd: zero cases ---
+static void test_gcd_zero_zero() {
+    CHECK(gcd(Hydra{0u}, Hydra{0u}) == Hydra{0u}, "gcd(0, 0) == 0");
+}
+static void test_gcd_zero_x() {
+    CHECK(gcd(Hydra{0u}, Hydra{42u}) == Hydra{42u}, "gcd(0, 42) == 42");
+}
+static void test_gcd_x_zero() {
+    CHECK(gcd(Hydra{42u}, Hydra{0u}) == Hydra{42u}, "gcd(42, 0) == 42");
+}
+static void test_gcd_zero_neg() {
+    CHECK(gcd(Hydra{0u}, Hydra{-15}) == Hydra{15u}, "gcd(0, -15) == 15");
+}
+
+// --- gcd: positive / negative combinations ---
+static void test_gcd_positive() {
+    CHECK(gcd(Hydra{12u}, Hydra{8u}) == Hydra{4u}, "gcd(12, 8) == 4");
+}
+static void test_gcd_neg_pos() {
+    CHECK(gcd(Hydra{-12}, Hydra{8u}) == Hydra{4u}, "gcd(-12, 8) == 4");
+}
+static void test_gcd_pos_neg() {
+    CHECK(gcd(Hydra{12u}, Hydra{-8}) == Hydra{4u}, "gcd(12, -8) == 4");
+}
+static void test_gcd_neg_neg() {
+    CHECK(gcd(Hydra{-12}, Hydra{-8}) == Hydra{4u}, "gcd(-12, -8) == 4");
+}
+
+// --- gcd: co-prime values ---
+static void test_gcd_coprime() {
+    CHECK(gcd(Hydra{17u}, Hydra{13u}) == Hydra{1u}, "gcd(17, 13) == 1");
+}
+static void test_gcd_coprime_large() {
+    CHECK(gcd(Hydra{97u}, Hydra{89u}) == Hydra{1u}, "gcd(97, 89) == 1");
+}
+
+// --- gcd: powers of two ---
+static void test_gcd_powers_of_two() {
+    CHECK(gcd(Hydra{64u}, Hydra{16u}) == Hydra{16u}, "gcd(64, 16) == 16");
+}
+static void test_gcd_power_of_two_and_odd() {
+    CHECK(gcd(Hydra{128u}, Hydra{35u}) == Hydra{1u}, "gcd(128, 35) == 1");
+}
+
+// --- gcd: same value ---
+static void test_gcd_same() {
+    CHECK(gcd(Hydra{99u}, Hydra{99u}) == Hydra{99u}, "gcd(99, 99) == 99");
+}
+
+// --- gcd: large parsed decimal inputs ---
+static void test_gcd_large_decimal() {
+    Hydra a("123456789012345678901234567890");
+    Hydra b("987654321098765432109876543210");
+    Hydra g = gcd(a, b);
+    // Verify g divides both a and b.
+    CHECK(a % g == Hydra{0u}, "gcd divides a");
+    CHECK(b % g == Hydra{0u}, "gcd divides b");
+    // Verify g > 0
+    CHECK(g > Hydra{0u}, "gcd is positive for nonzero inputs");
+}
+static void test_gcd_large_coprime() {
+    // Two large primes (well, likely coprime numbers)
+    Hydra a("100000000000000000039");  // known prime
+    Hydra b("100000000000000000129");  // known prime
+    Hydra g = gcd(a, b);
+    CHECK(g == Hydra{1u}, "large coprime gcd == 1");
+}
+
+// --- extended_gcd ---
+static void test_egcd_basic() {
+    auto [g, x, y] = extended_gcd(Hydra{35u}, Hydra{15u});
+    CHECK(g == Hydra{5u}, "egcd(35,15).gcd == 5");
+    CHECK(Hydra{35u} * x + Hydra{15u} * y == g, "35*x + 15*y == 5");
+}
+static void test_egcd_coprime() {
+    auto [g, x, y] = extended_gcd(Hydra{17u}, Hydra{13u});
+    CHECK(g == Hydra{1u}, "egcd(17,13).gcd == 1");
+    CHECK(Hydra{17u} * x + Hydra{13u} * y == g, "17*x + 13*y == 1");
+}
+static void test_egcd_with_zero() {
+    auto [g, x, y] = extended_gcd(Hydra{0u}, Hydra{5u});
+    CHECK(g == Hydra{5u}, "egcd(0,5).gcd == 5");
+    CHECK(Hydra{0u} * x + Hydra{5u} * y == g, "0*x + 5*y == 5");
+}
+static void test_egcd_signed() {
+    auto [g, x, y] = extended_gcd(Hydra{-35}, Hydra{15u});
+    CHECK(g == Hydra{5u}, "egcd(-35,15).gcd == 5");
+    CHECK(Hydra{-35} * x + Hydra{15u} * y == g, "-35*x + 15*y == 5");
+}
+static void test_egcd_both_negative() {
+    auto [g, x, y] = extended_gcd(Hydra{-24}, Hydra{-18});
+    CHECK(g == Hydra{6u}, "egcd(-24,-18).gcd == 6");
+    CHECK(Hydra{-24} * x + Hydra{-18} * y == g, "-24*x + -18*y == 6");
+}
+static void test_egcd_large() {
+    Hydra a("123456789012345678901234567890");
+    Hydra b("987654321098765432109876543210");
+    auto [g, x, y] = extended_gcd(a, b);
+    CHECK(a * x + b * y == g, "egcd invariant holds for large values");
+    CHECK(!g.is_negative(), "egcd gcd is non-negative");
+}
+
+// --- pow_mod ---
+static void test_pow_mod_basic() {
+    // 2^10 mod 1000 = 1024 mod 1000 = 24
+    CHECK(pow_mod(Hydra{2u}, Hydra{10u}, Hydra{1000u}) == Hydra{24u},
+          "2^10 mod 1000 == 24");
+}
+static void test_pow_mod_zero_exp() {
+    // x^0 mod m = 1 (when m > 1)
+    CHECK(pow_mod(Hydra{7u}, Hydra{0u}, Hydra{5u}) == Hydra{1u},
+          "7^0 mod 5 == 1");
+}
+static void test_pow_mod_one_mod() {
+    // x^e mod 1 = 0
+    CHECK(pow_mod(Hydra{7u}, Hydra{100u}, Hydra{1u}) == Hydra{0u},
+          "7^100 mod 1 == 0");
+}
+static void test_pow_mod_large_exp() {
+    // Fermat's little theorem: a^(p-1) ≡ 1 (mod p) for prime p
+    Hydra p{97u};
+    CHECK(pow_mod(Hydra{3u}, Hydra{96u}, p) == Hydra{1u},
+          "Fermat: 3^96 mod 97 == 1");
+}
+static void test_pow_mod_negative_base() {
+    // base = -2, normalized: (-2) % 5 = -2, + 5 = 3.  3^3 = 27, 27 % 5 = 2.
+    Hydra r = pow_mod(Hydra{-2}, Hydra{3u}, Hydra{5u});
+    CHECK(r == Hydra{2u}, "(-2)^3 mod 5 == 2");
+}
+static void test_pow_mod_throws_zero_mod() {
+    bool threw = false;
+    try { pow_mod(Hydra{2u}, Hydra{3u}, Hydra{0u}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "pow_mod throws on mod == 0");
+}
+static void test_pow_mod_throws_negative_exp() {
+    bool threw = false;
+    try { pow_mod(Hydra{2u}, Hydra{-1}, Hydra{5u}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "pow_mod throws on negative exp");
+}
+static void test_pow_mod_throws_negative_mod() {
+    bool threw = false;
+    try { pow_mod(Hydra{2u}, Hydra{3u}, Hydra{-5}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "pow_mod throws on negative mod");
+}
+
+// --- Toy RSA showcase ---
+static void test_rsa_toy() {
+    Hydra n{3233u};
+    Hydra e{17u};
+    Hydra d{2753u};
+    Hydra m{65u};
+
+    Hydra c = pow_mod(m, e, n);
+    Hydra m2 = pow_mod(c, d, n);
+    CHECK(m2 == m, "RSA toy: decrypt(encrypt(m)) == m");
+}
+static void test_rsa_toy_all_messages() {
+    // Verify for a few different messages
+    Hydra n{3233u}, e{17u}, d{2753u};
+    uint64_t msgs[] = {0, 1, 2, 42, 65, 100, 1000, 3232};
+    for (uint64_t mi : msgs) {
+        Hydra m{mi};
+        Hydra c = pow_mod(m, e, n);
+        Hydra m2 = pow_mod(c, d, n);
+        CHECK(m2 == m, "RSA toy roundtrip for all messages");
+    }
+}
+static void test_pow_mod_large_parsed() {
+    // Larger modulus from parsed decimals
+    // p=61, q=53 → n=3233, e=17, d=2753 (same as above but via parse)
+    Hydra n("3233"), e("17"), d("2753"), m("42");
+    Hydra c = pow_mod(m, e, n);
+    Hydra m2 = pow_mod(c, d, n);
+    CHECK(m2 == m, "RSA parsed decimal roundtrip");
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -2163,6 +2377,55 @@ int main() {
     test_tostring_medium();
     test_tostring_large_known();
     test_tostring_vs_parse_cross_check();
+
+    // Number theory: abs
+    test_abs_positive();
+    test_abs_negative();
+    test_abs_zero();
+
+    // Number theory: operator/, operator%
+    test_div_mod_operators();
+    test_divmod_assign();
+
+    // Number theory: gcd
+    test_gcd_zero_zero();
+    test_gcd_zero_x();
+    test_gcd_x_zero();
+    test_gcd_zero_neg();
+    test_gcd_positive();
+    test_gcd_neg_pos();
+    test_gcd_pos_neg();
+    test_gcd_neg_neg();
+    test_gcd_coprime();
+    test_gcd_coprime_large();
+    test_gcd_powers_of_two();
+    test_gcd_power_of_two_and_odd();
+    test_gcd_same();
+    test_gcd_large_decimal();
+    test_gcd_large_coprime();
+
+    // Number theory: extended_gcd
+    test_egcd_basic();
+    test_egcd_coprime();
+    test_egcd_with_zero();
+    test_egcd_signed();
+    test_egcd_both_negative();
+    test_egcd_large();
+
+    // Number theory: pow_mod
+    test_pow_mod_basic();
+    test_pow_mod_zero_exp();
+    test_pow_mod_one_mod();
+    test_pow_mod_large_exp();
+    test_pow_mod_negative_base();
+    test_pow_mod_throws_zero_mod();
+    test_pow_mod_throws_negative_exp();
+    test_pow_mod_throws_negative_mod();
+
+    // Showcase: toy RSA
+    test_rsa_toy();
+    test_rsa_toy_all_messages();
+    test_pow_mod_large_parsed();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

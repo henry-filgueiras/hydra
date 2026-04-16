@@ -1245,6 +1245,110 @@ and at `-O2`.
 
 ---
 
+### Number Theory Primitives (Façade Layer)
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+The first "mathematically expressive" milestone above the signed arithmetic
+layer.  Three number-theory functions, plus convenience operators, all
+implemented as pure façade — no limb kernel modifications.
+
+#### Convenience operators and `abs()`
+
+| Symbol      | Maps to                     |
+|-------------|-----------------------------|
+| `a / b`     | `a.div(b)`                  |
+| `a % b`     | `a.mod(b)`                  |
+| `a /= b`    | `a = a / b`                 |
+| `a %= b`    | `a = a % b`                 |
+| `abs(x)`    | negation if negative, else identity |
+
+These are free functions / friend operators in the `hydra` namespace.
+`abs()` is the basis for sign-stripping in gcd/egcd.
+
+#### `gcd(a, b)` — Euclid's algorithm
+
+```cpp
+Hydra gcd(Hydra a, Hydra b);
+```
+
+- Works for signed inputs (magnitudes taken first via `abs()`).
+- Result is always non-negative.
+- `gcd(0, x) == abs(x)`, `gcd(0, 0) == 0`.
+- Small fast path preserved naturally — when both operands are Small
+  the `%` operator dispatches through the scalar `mod_u64` path with
+  zero heap allocation.
+
+#### `extended_gcd(a, b)` — Bézout coefficients
+
+```cpp
+struct EGCDResult { Hydra gcd; Hydra x; Hydra y; };
+EGCDResult extended_gcd(const Hydra& a, const Hydra& b);
+```
+
+Iterative extended Euclidean algorithm.  Invariant:
+`a*x + b*y == gcd(a, b)` for all inputs including signed and zero.
+
+Implementation works on magnitudes then adjusts coefficient signs
+based on the original signs of `a` and `b`.  The invariant is tested
+explicitly for every test case, including large (30+ digit) inputs.
+
+#### `pow_mod(base, exp, mod)` — binary modular exponentiation
+
+```cpp
+Hydra pow_mod(Hydra base, Hydra exp, const Hydra& mod);
+```
+
+- `mod > 0` required (throws `std::domain_error`)
+- `exp >= 0` required (throws `std::domain_error`)
+- Negative base is normalized into `[0, mod)` before squaring
+- `mod == 1` short-circuits to 0
+- Logarithmic in exponent size via repeated squaring
+- Uses existing `>>=`, `&`, `%`, `*` — no kernel changes
+
+#### Toy RSA showcase test
+
+```cpp
+n = 3233, e = 17, d = 2753, m = 65
+c = pow_mod(m, e, n)          // encrypt
+m2 = pow_mod(c, d, n)         // decrypt
+EXPECT_EQ(m2, m)              // roundtrip ✓
+```
+
+Additionally tested with 8 different message values (0 through 3232)
+for full coverage of the key pair.
+
+#### Architectural compliance
+
+```
+number theory layer   ← NEW: gcd, extended_gcd, pow_mod, abs
+  convenience ops     ← NEW: operator/, operator%, operator/=, operator%=
+  signed façade
+  magnitude arithmetic
+  limb kernels
+```
+
+No limb kernels were modified.  All three functions compose entirely
+from existing public Hydra operators.
+
+#### Test coverage
+
+54 new assertions across 33 new test functions:
+
+- `abs`: positive, negative, zero
+- `operator/`, `operator%`: basic, compound-assign
+- `gcd`: zero cases (4), sign combinations (4), co-prime (2),
+  powers of two (2), same value, large decimals (2)
+- `extended_gcd`: basic, coprime, zero, signed (2), large
+- `pow_mod`: basic, zero exp, mod==1, Fermat's little theorem,
+  negative base, throws (3)
+- RSA showcase: single message, all-messages sweep (8), parsed decimal
+
+All 758 tests (704 prior + 54 new) pass at `-O0` with ASan+UBSan
+and at `-O2`.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_

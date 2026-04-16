@@ -2448,6 +2448,112 @@ inline Hydra Hydra::mod(const Hydra& divisor) const {
 }
 
 // ─────────────────────────────────────────────────────────
+// Convenience: abs, operator/, operator%
+// ─────────────────────────────────────────────────────────
+
+[[nodiscard]] inline Hydra abs(Hydra x) {
+    if (x.is_negative()) return -x;
+    return x;
+}
+
+[[nodiscard]] inline Hydra operator/(const Hydra& a, const Hydra& b) {
+    return a.div(b);
+}
+
+[[nodiscard]] inline Hydra operator%(const Hydra& a, const Hydra& b) {
+    return a.mod(b);
+}
+
+inline Hydra& operator/=(Hydra& a, const Hydra& b) { return a = a / b; }
+inline Hydra& operator%=(Hydra& a, const Hydra& b) { return a = a % b; }
+
+// ─────────────────────────────────────────────────────────
+// Number theory: gcd, extended_gcd, pow_mod
+// ─────────────────────────────────────────────────────────
+
+// Euclid's algorithm.  Result is always non-negative.
+// gcd(0, x) == abs(x), gcd(0, 0) == 0.
+[[nodiscard]] inline Hydra gcd(Hydra a, Hydra b) {
+    a = abs(std::move(a));
+    b = abs(std::move(b));
+
+    while (b != Hydra{0u}) {
+        auto r = a % b;
+        a = std::move(b);
+        b = std::move(r);
+    }
+    return a;
+}
+
+// Bézout coefficients: a*x + b*y == gcd(a,b), gcd >= 0.
+struct EGCDResult {
+    Hydra gcd;
+    Hydra x;
+    Hydra y;
+};
+
+[[nodiscard]] inline EGCDResult extended_gcd(const Hydra& a, const Hydra& b) {
+    // Iterative extended Euclidean on magnitudes, then fix signs.
+    Hydra old_r = abs(a), r = abs(b);
+    Hydra old_s{1u},      s{0u};
+    Hydra old_t{0u},      t{1u};
+
+    while (r != Hydra{0u}) {
+        Hydra q = old_r / r;
+
+        {   // (old_r, r) = (r, old_r - q*r)
+            Hydra tmp = old_r - q * r;
+            old_r = std::move(r);
+            r     = std::move(tmp);
+        }
+        {   // (old_s, s) = (s, old_s - q*s)
+            Hydra tmp = old_s - q * s;
+            old_s = std::move(s);
+            s     = std::move(tmp);
+        }
+        {   // (old_t, t) = (t, old_t - q*t)
+            Hydra tmp = old_t - q * t;
+            old_t = std::move(t);
+            t     = std::move(tmp);
+        }
+    }
+
+    // old_r = gcd(|a|, |b|)
+    // old_s * |a| + old_t * |b| == old_r
+    // Adjust signs: if a was negative, negate x; if b was negative, negate y.
+    if (a.is_negative()) old_s = -old_s;
+    if (b.is_negative()) old_t = -old_t;
+
+    return { std::move(old_r), std::move(old_s), std::move(old_t) };
+}
+
+// Binary modular exponentiation: (base^exp) mod mod.
+// Requires mod > 0, exp >= 0.  Throws std::domain_error otherwise.
+[[nodiscard]] inline Hydra pow_mod(Hydra base, Hydra exp, const Hydra& mod) {
+    if (mod <= Hydra{0u})
+        throw std::domain_error("pow_mod: modulus must be positive");
+    if (exp.is_negative())
+        throw std::domain_error("pow_mod: exponent must be non-negative");
+
+    // Handle mod == 1 early: any number mod 1 == 0.
+    if (mod == Hydra{1u}) return Hydra{0u};
+
+    Hydra result{1u};
+    base = base % mod;
+    // Normalize negative base into [0, mod)
+    if (base.is_negative()) base = base + mod;
+
+    while (exp > Hydra{0u}) {
+        if (!((exp & Hydra{1u}).is_zero())) {
+            result = (result * base) % mod;
+        }
+        base = (base * base) % mod;
+        exp >>= 1;
+    }
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────
 // Convenience literals
 // ─────────────────────────────────────────────────────────
 
