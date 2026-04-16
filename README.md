@@ -1,5 +1,7 @@
 # 🐍 Hydra
 
+![Hydra Sigil](assets/hydra_sigil.svg)
+
 **A tiered arbitrary-precision integer for modern C++**
 *small values move like native machine integers; large values grow heads.*
 
