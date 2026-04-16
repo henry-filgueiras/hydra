@@ -33,7 +33,9 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <ostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1251,6 +1253,120 @@ struct Hydra {
         }
     }
 
+    // ── String parse constructor ────────────────────────
+    //
+    // Parses a decimal string with optional leading sign ('+' / '-').
+    // Leading zeros are tolerated.  Zero canonicalizes to non-negative.
+    // Throws std::invalid_argument on empty input or invalid characters.
+    //
+    // Strategy: acc = acc * 10 + digit, using existing arithmetic.
+    // For performance we accumulate up to 18 decimal digits at a time
+    // into a uint64_t (10^18 < 2^63), then multiply-add the chunk:
+    //   acc = acc * 10^chunk_len + chunk_value
+    //
+    explicit Hydra(std::string_view s) : meta(make_small_meta()), payload() {
+        if (s.empty())
+            throw std::invalid_argument("Hydra: empty string");
+
+        size_t pos = 0;
+        bool neg = false;
+
+        // Optional leading sign.
+        if (s[0] == '-') { neg = true; ++pos; }
+        else if (s[0] == '+') { ++pos; }
+
+        // Must have at least one digit.
+        if (pos >= s.size())
+            throw std::invalid_argument("Hydra: no digits in string");
+
+        // Skip leading zeros.
+        while (pos < s.size() && s[pos] == '0') ++pos;
+
+        // All zeros (or empty after stripping).
+        if (pos == s.size()) {
+            payload.small = 0;
+            return;  // zero is non-negative
+        }
+
+        // Validate remaining chars are all digits.
+        for (size_t i = pos; i < s.size(); ++i) {
+            if (s[i] < '0' || s[i] > '9')
+                throw std::invalid_argument(
+                    "Hydra: invalid character in string");
+        }
+
+        const size_t digit_count = s.size() - pos;
+
+        // Small fast path: ≤ 19 digits might fit in uint64_t.
+        // (UINT64_MAX = 18446744073709551615, 20 digits.)
+        if (digit_count <= 19) {
+            uint64_t v = 0;
+            bool overflow = false;
+            for (size_t i = pos; i < s.size(); ++i) {
+                uint64_t d = static_cast<uint64_t>(s[i] - '0');
+                // Check overflow: v * 10 + d > UINT64_MAX
+                if (v > (UINT64_MAX - d) / 10) {
+                    overflow = true;
+                    break;
+                }
+                v = v * 10 + d;
+            }
+            if (!overflow) {
+                payload.small = v;
+                if (neg && v != 0) meta |= bits::SIGN_BIT;
+                return;
+            }
+        }
+
+        // General path: chunk 18 decimal digits at a time.
+        // 10^18 = 1000000000000000000 (fits in uint64_t).
+        static constexpr uint64_t CHUNK_BASE = 1000000000000000000ull; // 10^18
+        static constexpr size_t   CHUNK_LEN  = 18;
+
+        // First chunk may be shorter than CHUNK_LEN.
+        size_t first_len = digit_count % CHUNK_LEN;
+        if (first_len == 0) first_len = CHUNK_LEN;
+
+        // Parse first chunk.
+        uint64_t chunk_val = 0;
+        for (size_t i = 0; i < first_len; ++i) {
+            chunk_val = chunk_val * 10
+                        + static_cast<uint64_t>(s[pos + i] - '0');
+        }
+        pos += first_len;
+
+        // Start accumulator from first chunk.
+        Hydra acc{chunk_val};
+
+        // Process remaining full chunks.
+        while (pos < s.size()) {
+            chunk_val = 0;
+            for (size_t i = 0; i < CHUNK_LEN; ++i) {
+                chunk_val = chunk_val * 10
+                            + static_cast<uint64_t>(s[pos + i] - '0');
+            }
+            pos += CHUNK_LEN;
+
+            // acc = acc * CHUNK_BASE + chunk_val
+            Hydra base{CHUNK_BASE};
+            acc = acc * base + Hydra{chunk_val};
+        }
+
+        // Steal result into *this.
+        meta = acc.meta;
+        std::memcpy(&payload, &acc.payload, sizeof(payload));
+        acc.meta = make_small_meta();
+        acc.payload.small = 0;
+
+        if (neg && limb_view().count > 0) meta |= bits::SIGN_BIT;
+    }
+
+    // Convenience: construct from const char*.
+    explicit Hydra(const char* s) : Hydra(std::string_view{s}) {}
+
+    // Convenience: construct from std::string.
+    explicit Hydra(const std::string& s) : Hydra(std::string_view{s}) {}
+
     // Copy
     Hydra(const Hydra& o) : meta(o.meta), payload() {
         switch (o.kind()) {
@@ -2122,7 +2238,12 @@ struct Hydra {
     // ─────────────────────────────────────────────────────
 
     // Returns decimal string representation.
-    // (Slow — for debugging only; not optimised.)
+    //
+    // Small path: direct uint64_t → digits, zero allocations.
+    // Medium / Large path: chunked base-10^18 extraction via
+    // divmod(10^18), producing 18 decimal digits per division.
+    // This is ~18× fewer divisions than the naive mod_u64(10) loop.
+    //
     [[nodiscard]] std::string to_string() const {
         const bool neg = is_negative();
 
@@ -2139,19 +2260,75 @@ struct Hydra {
             if (neg) buf[--i] = '-';
             return std::string(buf + i);
         }
-        // Medium / Large: work on magnitude via mod_u64/div_u64.
-        // These methods operate on limb_view (magnitude), sign-unaware.
+
+        // Medium / Large: chunked base-10^18 extraction.
+        //
+        // 10^18 = 1000000000000000000 fits in uint64_t.
+        // Each divmod step yields a 18-digit chunk (with leading
+        // zeros preserved internally) plus a quotient for the next
+        // iteration.
+        static constexpr uint64_t CHUNK_BASE = 1000000000000000000ull;
+        static constexpr int      CHUNK_LEN  = 18;
+
         Hydra copy = *this;
-        copy.clear_sign();  // work on positive magnitude
-        std::string digits;
-        digits.reserve(64);
-        while (copy.limb_count() > 0) {
-            digits.push_back('0' + static_cast<char>(copy.mod_u64(10)));
-            copy = copy.div_u64(10);
+        copy.clear_sign();
+
+        // Collect chunks in reverse order.  Each chunk is a
+        // uint64_t < 10^18 representing exactly CHUNK_LEN digits
+        // (except the most-significant chunk which may have fewer).
+        std::vector<uint64_t> chunks;
+        chunks.reserve(16);
+
+        while (copy.limb_view().count > 0) {
+            uint64_t rem = copy.mod_u64(CHUNK_BASE);
+            chunks.push_back(rem);
+            copy = copy.div_u64(CHUNK_BASE);
         }
-        if (neg) digits.push_back('-');
-        std::reverse(digits.begin(), digits.end());
-        return digits.empty() ? "0" : digits;
+
+        if (chunks.empty()) return "0";  // shouldn't happen (caught by small path)
+
+        // Build the string: most-significant chunk first (no leading zeros),
+        // then remaining chunks with zero-padding to CHUNK_LEN.
+        std::string result;
+        result.reserve(chunks.size() * CHUNK_LEN + 2);
+
+        if (neg) result.push_back('-');
+
+        // First chunk: variable-width (no leading zeros).
+        {
+            char buf[20];
+            int i = 19;
+            buf[i] = '\0';
+            uint64_t v = chunks.back();
+            if (v == 0) {
+                buf[--i] = '0';
+            } else {
+                while (v) {
+                    buf[--i] = '0' + static_cast<char>(v % 10);
+                    v /= 10;
+                }
+            }
+            result.append(buf + i);
+        }
+
+        // Remaining chunks: zero-padded to exactly CHUNK_LEN digits.
+        for (int ci = static_cast<int>(chunks.size()) - 2; ci >= 0; --ci) {
+            char buf[CHUNK_LEN + 1];
+            uint64_t v = chunks[ci];
+            for (int j = CHUNK_LEN - 1; j >= 0; --j) {
+                buf[j] = '0' + static_cast<char>(v % 10);
+                v /= 10;
+            }
+            buf[CHUNK_LEN] = '\0';
+            result.append(buf);
+        }
+
+        return result;
+    }
+
+    // Stream insertion operator.
+    friend std::ostream& operator<<(std::ostream& os, const Hydra& h) {
+        return os << h.to_string();
     }
 };
 

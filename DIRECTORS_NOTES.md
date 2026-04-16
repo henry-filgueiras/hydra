@@ -1152,6 +1152,99 @@ The signed hot path check `(a.meta | b.meta) == 0` is a single
 
 ---
 
+### String Parse / Format / Round-Trip Layer
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Three new capabilities form the "developer-facing usability" layer above
+the numeric engine, as specified in the sprint brief.
+
+#### String parse constructor
+
+```cpp
+explicit Hydra(std::string_view s);
+explicit Hydra(const char* s);
+explicit Hydra(const std::string& s);
+```
+
+Parses decimal strings with optional leading `+`/`-` sign.  Leading
+zeros are tolerated.  Zero canonicalizes to non-negative.  Invalid
+input (empty string, non-digit characters, sign-only) throws
+`std::invalid_argument`.
+
+**Strategy:** Chunked base-10^18 accumulation.  Up to 18 decimal
+digits are packed into a single `uint64_t` per iteration, then
+folded into the running total via `acc = acc * 10^18 + chunk`.
+This means the number of Hydra multiplications is `⌈digits / 18⌉`
+rather than one per digit — critical for 1000+ digit inputs.
+
+**Small fast path:** Inputs ≤ 19 digits that fit in `uint64_t` are
+parsed with no Hydra arithmetic at all — just native integer ops
+and one overflow check.
+
+#### Upgraded `to_string()`
+
+The Medium/Large path now uses chunked base-10^18 extraction via
+`mod_u64(10^18)` / `div_u64(10^18)`, yielding 18 decimal digits
+per division step.  This is ~18× fewer divisions than the prior
+`mod_u64(10)` loop.  Each chunk is formatted with zero-padding to
+exactly 18 digits (except the most-significant chunk which omits
+leading zeros).
+
+The Small path is unchanged (direct `uint64_t` → digits, zero allocs).
+
+#### `operator<<` (ostream)
+
+```cpp
+friend std::ostream& operator<<(std::ostream& os, const Hydra& h);
+```
+
+Delegates to `to_string()`.
+
+#### Architectural compliance
+
+All three features live in the Hydra class body (parse constructor)
+or as inline friend functions (ostream).  No formatting logic touches
+limb kernels or `hydra::detail`.  The separation is:
+
+```
+formatting layer     ← NEW: parse ctor, to_string(), operator<<
+signed façade
+magnitude kernels
+limb engine
+```
+
+#### Round-trip invariant
+
+For any string `s` that represents a valid integer:
+```cpp
+Hydra x(s);
+assert(x.to_string() == canonicalize(s));  // canonical form
+Hydra y(x.to_string());
+assert(x == y);                             // identity
+```
+
+Where `canonicalize()` strips leading zeros and normalizes `-0` → `0`.
+
+#### Test coverage
+
+97 new assertions across 30 new test functions:
+
+- Parse: simple positive, zero, negative zero, leading zeros,
+  `+` sign, negative, UINT64_MAX, UINT64_MAX+1, large negative,
+  INT64 boundaries, invalid (empty, bad chars, sign-only),
+  power-of-two (2^128), power-of-ten (10^30)
+- Round-trip: zero, negative zero, INT64 boundaries, UINT64_MAX,
+  powers of two (0–256 step 32), powers of ten (10^0–10^49),
+  ~1000-digit random number, 200 signed random fuzz trials
+- ostream: negative large, zero
+- Chunked to_string: 2^64, 2^128, cross-check with parse
+
+All 704 tests (607 prior + 97 new) pass at `-O0` with ASan+UBSan
+and at `-O2`.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
@@ -1163,8 +1256,10 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 - ~~**No full Hydra÷Hydra division.**~~ **Landed 2026-04-16** as Knuth
   Algorithm D in `detail::divmod_knuth_limbs` with `Hydra::divmod`/`div`/`mod`
   public API. See "Full Hydra÷Hydra Division" above.
-- **`to_string()` still slow.** Now uses `div_u64`/`mod_u64` (one alloc per
-  digit); replace with base-10^9 extraction to cut digit-loop count by 9×.
+- ~~**`to_string()` still slow.**~~ **Upgraded 2026-04-16** to chunked
+  base-10^18 extraction (`mod_u64`/`div_u64` with 10^18 divisor),
+  cutting division count by 18× vs the prior per-digit loop.
+  String parse constructor also landed in the same sprint.
 - ~~**Schoolbook O(n²) multiplication.**~~ **Karatsuba now production-
   dispatched** (2026-04-16).  `mul_general` routes to `detail::mul_karatsuba`
   whenever `max_limbs >= KARATSUBA_THRESHOLD_LIMBS == 32`.  Below the

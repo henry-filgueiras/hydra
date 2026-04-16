@@ -9,6 +9,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1678,6 +1680,251 @@ static void test_signed_divmod_int64_min_by_neg1() {
 
 // ── entry point ──────────────────────────────────────────────────────
 
+// ── String parse constructor tests ──────────────────────────────────
+
+static void test_parse_simple_positive() {
+    Hydra x("12345");
+    CHECK(x.to_string() == "12345", "parse simple positive");
+}
+
+static void test_parse_zero() {
+    Hydra x("0");
+    CHECK(x.to_string() == "0", "parse zero");
+    CHECK(!x.is_negative(), "parsed zero is non-negative");
+}
+
+static void test_parse_negative_zero() {
+    Hydra x("-0");
+    CHECK(x.to_string() == "0", "parse negative zero → '0'");
+    CHECK(!x.is_negative(), "negative zero canonicalizes to non-negative");
+}
+
+static void test_parse_leading_zeros() {
+    Hydra x("000042");
+    CHECK(x.to_string() == "42", "leading zeros stripped");
+}
+
+static void test_parse_leading_sign_plus() {
+    Hydra x("+999");
+    CHECK(x.to_string() == "999", "parse with + sign");
+}
+
+static void test_parse_negative() {
+    Hydra x("-42");
+    CHECK(x.to_string() == "-42", "parse negative");
+    CHECK(x.is_negative(), "parse negative sets sign");
+}
+
+static void test_parse_uint64_max() {
+    // UINT64_MAX = 18446744073709551615
+    Hydra x("18446744073709551615");
+    CHECK(x.to_string() == "18446744073709551615", "parse UINT64_MAX");
+}
+
+static void test_parse_uint64_max_plus_one() {
+    // 2^64 = 18446744073709551616 — should promote to Medium
+    Hydra x("18446744073709551616");
+    CHECK(x.to_string() == "18446744073709551616", "parse UINT64_MAX+1");
+}
+
+static void test_parse_large_negative() {
+    Hydra x("-18446744073709551616");
+    CHECK(x.to_string() == "-18446744073709551616", "parse large negative");
+    CHECK(x.is_negative(), "large negative has sign set");
+}
+
+static void test_parse_int64_boundaries() {
+    // INT64_MAX = 9223372036854775807
+    Hydra a("9223372036854775807");
+    CHECK(a == Hydra{INT64_MAX}, "parse INT64_MAX");
+
+    // INT64_MIN = -9223372036854775808
+    Hydra b("-9223372036854775808");
+    CHECK(b == Hydra{INT64_MIN}, "parse INT64_MIN");
+}
+
+static void test_parse_invalid_empty() {
+    bool threw = false;
+    try { Hydra x(""); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw, "parse empty string throws");
+}
+
+static void test_parse_invalid_chars() {
+    bool threw = false;
+    try { Hydra x("123abc"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw, "parse invalid chars throws");
+}
+
+static void test_parse_sign_only() {
+    bool threw = false;
+    try { Hydra x("-"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw, "parse sign-only throws");
+}
+
+static void test_parse_power_of_two() {
+    // 2^128 = 340282366920938463463374607431768211456
+    Hydra x("340282366920938463463374607431768211456");
+    Hydra expected = Hydra{1u} << 128;
+    CHECK(x == expected, "parse 2^128");
+}
+
+static void test_parse_power_of_ten() {
+    // 10^30 = 1000000000000000000000000000000
+    Hydra x("1000000000000000000000000000000");
+    CHECK(x.to_string() == "1000000000000000000000000000000", "parse 10^30 round-trip");
+}
+
+// ── Round-trip invariant tests ─────────────────────────────────────
+
+// Helper: canonical form strips leading zeros and normalizes negative zero.
+static std::string canonicalize(const std::string& s) {
+    if (s.empty()) return "0";
+    size_t pos = 0;
+    bool neg = false;
+    if (s[0] == '-') { neg = true; ++pos; }
+    else if (s[0] == '+') { ++pos; }
+    while (pos < s.size() && s[pos] == '0') ++pos;
+    if (pos == s.size()) return "0";
+    std::string result;
+    if (neg) result.push_back('-');
+    result.append(s, pos);
+    return result;
+}
+
+static void test_roundtrip_zero() {
+    Hydra x("0");
+    CHECK(x.to_string() == canonicalize("0"), "roundtrip zero");
+    Hydra y(x.to_string());
+    CHECK(x == y, "roundtrip zero identity");
+}
+
+static void test_roundtrip_negative_zero() {
+    Hydra x("-0");
+    CHECK(x.to_string() == canonicalize("-0"), "roundtrip -0 → 0");
+    Hydra y(x.to_string());
+    CHECK(x == y, "roundtrip negative zero identity");
+}
+
+static void test_roundtrip_int64_boundaries() {
+    // INT64_MAX
+    std::string s1 = "9223372036854775807";
+    Hydra x1(s1);
+    CHECK(x1.to_string() == canonicalize(s1), "roundtrip INT64_MAX string");
+    Hydra y1(x1.to_string());
+    CHECK(x1 == y1, "roundtrip INT64_MAX identity");
+
+    // INT64_MIN
+    std::string s2 = "-9223372036854775808";
+    Hydra x2(s2);
+    CHECK(x2.to_string() == canonicalize(s2), "roundtrip INT64_MIN string");
+    Hydra y2(x2.to_string());
+    CHECK(x2 == y2, "roundtrip INT64_MIN identity");
+
+    // UINT64_MAX
+    std::string s3 = "18446744073709551615";
+    Hydra x3(s3);
+    CHECK(x3.to_string() == canonicalize(s3), "roundtrip UINT64_MAX string");
+    Hydra y3(x3.to_string());
+    CHECK(x3 == y3, "roundtrip UINT64_MAX identity");
+}
+
+static void test_roundtrip_powers_of_two() {
+    for (unsigned shift = 0; shift <= 256; shift += 32) {
+        Hydra val = Hydra{1u} << shift;
+        std::string s = val.to_string();
+        Hydra back(s);
+        CHECK(val == back, "roundtrip 2^N identity");
+    }
+}
+
+static void test_roundtrip_powers_of_ten() {
+    // Build 10^N by repeated multiplication.
+    Hydra val{1u};
+    for (int i = 0; i < 50; ++i) {
+        std::string s = val.to_string();
+        Hydra back(s);
+        CHECK(val == back, "roundtrip 10^N identity");
+        val = val * Hydra{10u};
+    }
+}
+
+static void test_roundtrip_1000_digit_random() {
+    // Build a ~1000-digit random number by chaining:
+    //   acc = acc * (10^18) + random_chunk
+    std::mt19937_64 rng(42);
+    Hydra acc{1u};
+    for (int i = 0; i < 56; ++i) {  // 56 * 18 ≈ 1008 digits
+        uint64_t chunk = rng() % 1000000000000000000ull;
+        acc = acc * Hydra{1000000000000000000ull} + Hydra{chunk};
+    }
+    std::string s = acc.to_string();
+    CHECK(s.size() >= 1000, "random number has ~1000 digits");
+    Hydra back(s);
+    CHECK(acc == back, "roundtrip 1000-digit random");
+}
+
+static void test_roundtrip_signed_random_fuzz() {
+    // 200 random signed round-trips.
+    std::mt19937_64 rng(0xCAFE);
+    int pass_count = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+        // Random width: 1–20 chunks of 18 digits.
+        int n_chunks = 1 + static_cast<int>(rng() % 20);
+        Hydra acc{1u};
+        for (int i = 0; i < n_chunks; ++i) {
+            uint64_t chunk = rng() % 1000000000000000000ull;
+            acc = acc * Hydra{1000000000000000000ull} + Hydra{chunk};
+        }
+        bool neg = rng() & 1;
+        if (neg) acc = -acc;
+
+        std::string s = acc.to_string();
+        Hydra back(s);
+        if (acc == back) ++pass_count;
+    }
+    CHECK(pass_count == 200, "signed random fuzz: all 200 round-trips");
+}
+
+// ── ostream operator<< test ────────────────────────────────────────
+
+static void test_ostream_operator() {
+    Hydra x("-12345678901234567890");
+    std::ostringstream oss;
+    oss << x;
+    CHECK(oss.str() == x.to_string(), "ostream << matches to_string");
+}
+
+static void test_ostream_zero() {
+    Hydra x{0u};
+    std::ostringstream oss;
+    oss << x;
+    CHECK(oss.str() == "0", "ostream << zero");
+}
+
+// ── Chunked to_string correctness ──────────────────────────────────
+
+static void test_tostring_medium() {
+    // A 2-limb number that goes through the chunked path.
+    // 2^64 = 18446744073709551616
+    Hydra x = Hydra{1u} << 64;
+    CHECK(x.to_string() == "18446744073709551616", "to_string 2^64");
+}
+
+static void test_tostring_large_known() {
+    // 2^128 = 340282366920938463463374607431768211456
+    Hydra x = Hydra{1u} << 128;
+    CHECK(x.to_string() == "340282366920938463463374607431768211456",
+          "to_string 2^128");
+}
+
+static void test_tostring_vs_parse_cross_check() {
+    // Build a value via arithmetic, convert to string, parse back.
+    Hydra a("999999999999999999999999999999999999");
+    Hydra b = a + Hydra{1u};
+    CHECK(b.to_string() == "1000000000000000000000000000000000000",
+          "to_string cross-check with parse");
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -1881,6 +2128,41 @@ int main() {
     test_signed_add_overflow_to_medium();
     test_signed_sub_medium_to_small();
     test_signed_divmod_int64_min_by_neg1();
+
+    // String parse constructor
+    test_parse_simple_positive();
+    test_parse_zero();
+    test_parse_negative_zero();
+    test_parse_leading_zeros();
+    test_parse_leading_sign_plus();
+    test_parse_negative();
+    test_parse_uint64_max();
+    test_parse_uint64_max_plus_one();
+    test_parse_large_negative();
+    test_parse_int64_boundaries();
+    test_parse_invalid_empty();
+    test_parse_invalid_chars();
+    test_parse_sign_only();
+    test_parse_power_of_two();
+    test_parse_power_of_ten();
+
+    // Round-trip invariant tests
+    test_roundtrip_zero();
+    test_roundtrip_negative_zero();
+    test_roundtrip_int64_boundaries();
+    test_roundtrip_powers_of_two();
+    test_roundtrip_powers_of_ten();
+    test_roundtrip_1000_digit_random();
+    test_roundtrip_signed_random_fuzz();
+
+    // ostream operator<<
+    test_ostream_operator();
+    test_ostream_zero();
+
+    // Chunked to_string correctness
+    test_tostring_medium();
+    test_tostring_large_known();
+    test_tostring_vs_parse_cross_check();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
