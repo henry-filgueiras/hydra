@@ -2091,19 +2091,19 @@ static void test_pow_mod_negative_base() {
 }
 static void test_pow_mod_throws_zero_mod() {
     bool threw = false;
-    try { pow_mod(Hydra{2u}, Hydra{3u}, Hydra{0u}); }
+    try { (void)pow_mod(Hydra{2u}, Hydra{3u}, Hydra{0u}); }
     catch (const std::domain_error&) { threw = true; }
     CHECK(threw, "pow_mod throws on mod == 0");
 }
 static void test_pow_mod_throws_negative_exp() {
     bool threw = false;
-    try { pow_mod(Hydra{2u}, Hydra{-1}, Hydra{5u}); }
+    try { (void)pow_mod(Hydra{2u}, Hydra{-1}, Hydra{5u}); }
     catch (const std::domain_error&) { threw = true; }
     CHECK(threw, "pow_mod throws on negative exp");
 }
 static void test_pow_mod_throws_negative_mod() {
     bool threw = false;
-    try { pow_mod(Hydra{2u}, Hydra{3u}, Hydra{-5}); }
+    try { (void)pow_mod(Hydra{2u}, Hydra{3u}, Hydra{-5}); }
     catch (const std::domain_error&) { threw = true; }
     CHECK(threw, "pow_mod throws on negative mod");
 }

@@ -1354,9 +1354,8 @@ struct MontgomeryContext {
         }
 
         if (k == 1) {
-            // Single-limb modulus: use scalar divmod
-            uint64_t dummy_q[1];  // not used
-            // For na-limb dividend / 1-limb divisor, use divmod_u64_limbs
+            // Single-limb modulus: use scalar divmod_u64_limbs.
+            // We need a quotient buffer (discarded) to satisfy the API.
             std::vector<uint64_t> q(na);
             uint64_t rem = detail::divmod_u64_limbs(a, na, mod_limbs[0], q.data());
             r_out[0] = rem;
