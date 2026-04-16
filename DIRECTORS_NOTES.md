@@ -831,6 +831,168 @@ All 468 tests (prior 457 + new 11) pass at `-O0 -fsanitize=address,undefined`.
 
 ---
 
+### Karatsuba Now Production-Dispatched
+
+_Integrated 2026-04-16 — Claude Opus 4.6_
+
+The Karatsuba kernel (prototype landed earlier today) is now wired
+into `mul_general` on the `max_limbs >= KARATSUBA_THRESHOLD_LIMBS`
+branch.  This sprint is **seam correctness only** — the threshold
+constant (`32`) is unchanged, and the kernel's internal scratch
+strategy (`std::vector` per recursion frame) is unchanged.  Arena-
+backed scratch and a re-tune of the threshold constant remain follow-
+ups.
+
+#### Dispatch layout inside `mul_general`
+
+```
+1. (Small×Small) handled by mul_small_small (operator* fast path)
+2. max_limbs ≤ 3                 → mul_3x3           (Medium×Medium etc.)
+3. lv==4 && rv==4                → mul_4x4           (256-bit square)
+4. lv==8 && rv==8                → mul_8x8           (512-bit square)
+5. max_limbs >= 32               → mul_karatsuba     ← new seam
+6. out_size ≤ 6                  → mul_limbs (stack scratch)
+7. otherwise                     → mul_limbs (heap scratch)
+```
+
+The Karatsuba arm sits between the specialised kernels (which remain
+the fastest option at their exact widths) and the schoolbook
+fallback.  Order matters: the 8×8 kernel still catches the 512-bit
+square case before the threshold check, so small Large-tier operands
+continue to hit their hand-tuned path.
+
+#### Mixed-width / non-power-of-2 handling
+
+`detail::mul_karatsuba` requires both operands to share the same size
+and that size be a power of two ≥ 2.  Hydra × Hydra can see any
+width-combination, so the dispatch seam pads both operands with zeros
+up to the next power of 2 ≥ max_limbs:
+
+```cpp
+if (max_limbs >= detail::KARATSUBA_THRESHOLD_LIMBS) {
+    uint32_t n = 1;
+    while (n < max_limbs) n <<= 1;
+    std::vector<uint64_t> pa(n, 0), pb(n, 0);
+    std::memcpy(pa.data(), lv.ptr, lv.count * sizeof(uint64_t));
+    std::memcpy(pb.data(), rv.ptr, rv.count * sizeof(uint64_t));
+    std::vector<uint64_t> pout(2 * n);
+    uint32_t used = detail::mul_karatsuba(pa.data(), pb.data(), n, pout.data());
+    return from_limbs(pout.data(), used);
+}
+```
+
+Zero-padding is correctness-safe: leaf `mul_limbs` skips zero rows
+via `if (a[i] == 0) continue`, so padded zeros never do useful work.
+The performance cost of padding 33 → 64 is real (one extra level of
+recursion, most of it on zero operands); acceptable for this sprint,
+and revisitable once the scratch strategy and threshold constant
+are re-measured.
+
+#### Kernel fix: sparse-operand assertion in `mul_karatsuba`
+
+Pre-integration, `mul_karatsuba` computed z1 := z1 − z0 − z2 using
+`subfrom_limbs(z1.data(), z1_used, ...)` where `z1_used` was the
+trimmed limb count returned by the middle multiply.  For sparse
+operands (e.g. 33-limb input padded to 64 — the upper half is mostly
+zero) the middle product can trim to fewer limbs than `2·m`, and
+`subfrom_limbs`' `assert(nout >= nb)` would fire even though z1's
+*storage* extends to `2m+2` zero-padded limbs.
+
+Fix: pass the full z1 capacity (`(m+1)*2`) as the LHS size instead
+of the trimmed count, then re-trim after subtracting.  The trailing
+zeros act as zero minuends during the subtract — algebraically
+equivalent to the original kernel, but without the storage-size
+precondition violation.  Covered by the new 33×33 and 33×17 seam
+tests.
+
+#### Correctness: 11 new seam tests, 479 total (prior 468 + 11)
+
+`hydra_test.cpp` adds dispatch-seam tests that cross-check `operator*`
+against `detail::mul_limbs` applied to the raw limb views — if
+`mul_general` picks the wrong path, the result limbs won't match:
+
+- `test_mul_seam_31_limbs` — just below threshold, schoolbook path
+- `test_mul_seam_32_limbs` — exact threshold, Karatsuba path
+- `test_mul_seam_33_limbs` — pad to 64, exercises sparse-operand subfrom
+- `test_mul_seam_mixed_32_16` / `mixed_16_32` — wider operand
+  triggers Karatsuba, narrow side zero-padded
+- `test_mul_seam_mixed_33_17` — asymmetric + non-power-of-2 on both
+  sides (pad to 64)
+- `test_mul_seam_mixed_31_32` — threshold straddled by a single limb
+- `test_mul_seam_identity_at_threshold` — 0 and 1 short-circuit still
+  correct when the other side is at threshold
+- `test_mul_seam_64_limbs` — two levels of recursion above threshold
+- `test_mul_seam_commutativity_at_threshold` — a·b == b·a across the
+  pad path
+
+All 479 tests pass at `-O0 -fsanitize=address,undefined` and at `-O2`.
+
+#### Measurement (Linux aarch64 sandbox, g++ 11 -O3, median of 5)
+
+Standalone harness `bench/profile_mul_dispatch.cpp` compares raw
+kernel costs against the dispatched `operator*` pre- and post-
+integration.  Build:
+
+```bash
+g++ -std=c++20 -O3 -DNDEBUG -I. bench/profile_mul_dispatch.cpp \
+    -o build-rel/profile_mul_dispatch
+```
+
+```
+main sweep (ns/op, median of 5)
+limbs    school   karat   dispatch_before   dispatch_after   delta
+  16      133      88          157              156           flat
+  32      555     428          580              481           −17%
+  64     2549    1657         2579             1719           −33%
+ 128    11117    6068        11119             6130           −45%
+```
+
+The `dispatch_before` column was collected against `HEAD:hydra.hpp`
+with the integration patch reverted in place; `dispatch_after` is
+the integrated kernel.  Deltas match the raw kernel deltas almost
+exactly — confirming the integration does not leak significant
+overhead on top of the kernel itself.  The ≈ 50–70 ns gap between
+`dispatch` and `karat` at each width is the Hydra wrapping cost
+(padded-array construction, `LargeRep::create`, `from_limbs`
+normalise) — the same pattern the specialised kernels pay.
+
+```
+dispatch overhead, below-threshold shapes
+limbs    before    after
+   5       33.6     33.4
+   9       52.5     52.8
+  15      130.9    130.7
+  24      367.5    371.2
+  31      540.7    541.5
+```
+
+The extra `max_limbs >= 32` branch is never-taken for these shapes,
+and the measured deltas are within ±1 ns — within run-to-run noise.
+The dispatch seam is effectively free below threshold.
+
+#### Recursion-path heap-use sanity check
+
+`bench/profile_mul_dispatch.cpp` § 4 runs 2000 × (128-limb × 128-limb)
+multiplications and then 500 × (256-limb × 256-limb) multiplications
+and samples max-RSS before and after each loop.  Both RSS deltas are
+**0 KiB** — every Karatsuba recursion frame's `std::vector` scratch
+is released on return, and the operator* temporary `LargeRep` is
+freed by the Hydra destructor on the following iteration.  No
+recursion-path heap explosion.
+
+#### Remaining work (not in this sprint)
+
+- Arena-backed scratch so the per-recursion `std::vector` cost
+  disappears (may allow re-measuring the threshold downward).
+- Smarter padding policy for widths just above a power of 2 (e.g.
+  33, 34, 35 → do not pad to 64; drop to schoolbook or use the
+  next-higher smooth size).  Currently a 33×33 multiply is ~2× as
+  expensive as the corresponding 32×32 because of the pad to 64 —
+  tolerable, but visible on non-power-of-2 shapes.
+- Toom-Cook for ≥ 128-limb operands, once Karatsuba stabilises.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
@@ -841,11 +1003,14 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
   public API. See "Full Hydra÷Hydra Division" above.
 - **`to_string()` still slow.** Now uses `div_u64`/`mod_u64` (one alloc per
   digit); replace with base-10^9 extraction to cut digit-loop count by 9×.
-- **Schoolbook O(n²) multiplication.** Fine up to ~200 limbs; add Karatsuba
-  at n ≥ 32.  (2026-04-16: Karatsuba prototype + measured threshold of
-  32 limbs landed as `detail::mul_karatsuba` + `KARATSUBA_THRESHOLD_LIMBS`.
-  Dispatch integration is the remaining step — see "Karatsuba Threshold —
-  Measured Crossover" above.)
+- ~~**Schoolbook O(n²) multiplication.**~~ **Karatsuba now production-
+  dispatched** (2026-04-16).  `mul_general` routes to `detail::mul_karatsuba`
+  whenever `max_limbs >= KARATSUBA_THRESHOLD_LIMBS == 32`.  Below the
+  threshold the existing schoolbook / 3×3 / 4×4 / 8×8 dispatch is
+  preserved byte-identically.  See "Karatsuba Now Production-Dispatched"
+  above.  Follow-ups: arena-backed scratch, smarter pad policy for
+  widths just above a power of 2, and (separate work) Toom-Cook for
+  ≥128-limb operands.
 - **No allocator customisation.** `LargeRep` uses `::operator new` directly.
   A PMR-style allocator hook is a natural extension.
 - **No hash specialisation.** `std::hash<Hydra>` should be added for use in

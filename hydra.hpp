@@ -707,18 +707,28 @@ inline uint32_t mul_karatsuba(
     uint32_t sb_used = add_limbs(b_lo, m, b_hi, m, sum_b.data());
 
     // Middle multiply: (sum_a) * (sum_b).  Max size (m+1)*(m+1) = 2m+2.
-    std::vector<uint64_t> z1((m + 1) * 2, 0);
+    const uint32_t z1_cap = (m + 1) * 2;
+    std::vector<uint64_t> z1(z1_cap, 0);
     uint32_t z1_used = mul_limbs(
         sum_a.data(), sa_used,
         sum_b.data(), sb_used,
         z1.data());
+    (void)z1_used;  // used only for the optional post-subtract retrim
 
     // z1 := z1 - z0 - z2.  out[0..2m-1] = z0, out[2m..4m-1] = z2.
-    // The 2m region bound is the "full" region regardless of trim.
-    subfrom_limbs(z1.data(), z1_used, out,           2 * m);
-    subfrom_limbs(z1.data(), z1_used, out + 2 * m,   2 * m);
+    //
+    // Pass the FULL z1 capacity (2m+2) as the LHS size rather than the
+    // trimmed z1_used.  For sparse operands (e.g. zero-padded halves
+    // from mul_general's pow2 padding) z1_used can be < 2m, even though
+    // algebraically z1 ≥ z0 + z2 always holds.  The trailing positions
+    // of z1 are zero-initialized, so subfrom_limbs treats them as zero
+    // minuends and propagates borrow exactly as expected.
+    subfrom_limbs(z1.data(), z1_cap, out,           2 * m);
+    subfrom_limbs(z1.data(), z1_cap, out + 2 * m,   2 * m);
 
-    // Retrim z1_used since it may now be smaller.
+    // Retrim: the subtract may have written into limbs past z1_used, so
+    // scan from the top of the full capacity.
+    z1_used = z1_cap;
     while (z1_used > 0 && z1[z1_used - 1] == 0) --z1_used;
 
     // Accumulate z1 into out at offset m (middle position).
@@ -1552,7 +1562,47 @@ struct Hydra {
             return from_limbs(out, used);
         }
 
-        // ── Generic fallback ─────────────────────────────────
+        // ── Karatsuba dispatch seam (Large-tier only) ────────
+        //
+        // Benchmark-derived crossover: above KARATSUBA_THRESHOLD_LIMBS
+        // the recursive kernel's O(n^log2 3) scaling overtakes
+        // schoolbook's O(n²).  Below the threshold (including the
+        // entire Small and Medium tiers) we fall through to the
+        // existing mul_limbs fallback — a single branch of dispatch
+        // overhead for those shapes.
+        //
+        // The Karatsuba kernel requires BOTH operands to be the same
+        // size AND the common size to be a power of two.  General
+        // Hydra × Hydra multiplication sees arbitrary mixed widths,
+        // so we pad both operands up to the next power of two at or
+        // above max_limbs.  Zero-padding is correctness-safe (zeros
+        // contribute nothing to the product); mul_limbs' `if (a[i]==0)
+        // continue` fast-path in the recursion leaves recovers most
+        // of the padded waste.
+        //
+        // The result is always ≤ lv.count + rv.count limbs; anything
+        // beyond that is guaranteed zero so from_limbs → normalize
+        // trims correctly.
+        if (max_limbs >= detail::KARATSUBA_THRESHOLD_LIMBS) {
+            uint32_t n = 1;
+            while (n < max_limbs) n <<= 1;
+
+            std::vector<uint64_t> pa(n, 0);
+            std::vector<uint64_t> pb(n, 0);
+            std::memcpy(pa.data(), lv.ptr,
+                        lv.count * sizeof(uint64_t));
+            std::memcpy(pb.data(), rv.ptr,
+                        rv.count * sizeof(uint64_t));
+
+            std::vector<uint64_t> pout(2 * n);
+            uint32_t used = detail::mul_karatsuba(
+                pa.data(), pb.data(), n, pout.data());
+            // `used` is already trimmed by mul_karatsuba; from_limbs
+            // handles any final Large→Medium→Small demotion.
+            return from_limbs(pout.data(), used);
+        }
+
+        // ── Generic fallback (schoolbook) ────────────────────
         if (out_size <= 6) {
             uint64_t out[6];
             uint32_t used = detail::mul_limbs(

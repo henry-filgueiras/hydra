@@ -419,6 +419,138 @@ static void test_karatsuba_recursion_boundary() {
     }
 }
 
+// ── mul_general dispatch-seam tests ───────────────────────────────────
+//
+// These tests exercise the dispatch boundary of mul_general at the
+// Karatsuba threshold.  Every test does a Hydra × Hydra multiplication
+// through the public operator* and cross-checks against a reference
+// product computed directly with the schoolbook kernel on the raw
+// limb arrays — so whatever path mul_general picks (schoolbook,
+// 4×4/8×8 specialised kernel, or Karatsuba) must produce an identical
+// result.
+//
+// The threshold is KARATSUBA_THRESHOLD_LIMBS = 32.  The tests span the
+// near-threshold band explicitly (31, 32, 33 limbs) and then probe a
+// selection of mixed widths on either side of the boundary to make
+// sure the seam handles non-square, non-power-of-two inputs.
+
+// Produce a full-width n-limb Hydra (MSL bit 63 set) from a seed.
+static Hydra make_large_seeded(uint32_t n_limbs, uint64_t seed) {
+    std::vector<uint64_t> limbs(n_limbs);
+    uint64_t v = seed ? seed : 0x1u;
+    for (auto& l : limbs) {
+        v ^= v << 13; v ^= v >> 7; v ^= v << 17;
+        l = v | 1u;
+    }
+    limbs.back() |= (1ull << 63);
+    return Hydra::from_limbs(limbs.data(), n_limbs);
+}
+
+// Cross-check: operator* result == schoolbook mul_limbs on the raw
+// limbs.  Both Hydras are decomposed via their limb_view, multiplied
+// with detail::mul_limbs into a scratch buffer, then re-assembled
+// via from_limbs.  Any dispatch-path bug shows up as a mismatch.
+static void check_mul_matches_schoolbook(
+    const Hydra& a, const Hydra& b, const char* label)
+{
+    auto lv = a.limb_view();
+    auto rv = b.limb_view();
+    std::vector<uint64_t> ref(lv.count + rv.count, 0);
+    uint32_t used = hydra::detail::mul_limbs(
+        lv.ptr, lv.count, rv.ptr, rv.count, ref.data());
+    Hydra expected = Hydra::from_limbs(ref.data(), used);
+    Hydra got = a * b;
+    CHECK(got == expected, label);
+}
+
+// ── explicit near-threshold widths ────────────────────────────────────
+
+static void test_mul_seam_31_limbs() {
+    // Just below threshold — should stay on schoolbook fallback.
+    Hydra a = make_large_seeded(31, 0x5EA31A);
+    Hydra b = make_large_seeded(31, 0x5EA31B);
+    check_mul_matches_schoolbook(a, b, "operator* 31x31 (below threshold, schoolbook path)");
+}
+
+static void test_mul_seam_32_limbs() {
+    // Exactly at threshold — first width that routes to Karatsuba.
+    Hydra a = make_large_seeded(32, 0x5EA32A);
+    Hydra b = make_large_seeded(32, 0x5EA32B);
+    check_mul_matches_schoolbook(a, b, "operator* 32x32 (exact threshold, Karatsuba path)");
+}
+
+static void test_mul_seam_33_limbs() {
+    // Just above threshold — requires pad-to-64 for the Karatsuba
+    // pow2 precondition.  Exercises the "non-power-of-two" pad path.
+    Hydra a = make_large_seeded(33, 0x5EA33A);
+    Hydra b = make_large_seeded(33, 0x5EA33B);
+    check_mul_matches_schoolbook(a, b, "operator* 33x33 (above threshold, padded to 64)");
+}
+
+// ── mixed widths near the threshold ───────────────────────────────────
+
+static void test_mul_seam_mixed_32_16() {
+    // Wider operand triggers Karatsuba; narrow operand is zero-padded.
+    Hydra a = make_large_seeded(32, 0xA1);
+    Hydra b = make_large_seeded(16, 0xB2);
+    check_mul_matches_schoolbook(a, b, "operator* 32x16 (max triggers Karatsuba, rhs padded)");
+}
+
+static void test_mul_seam_mixed_16_32() {
+    // Commutativity check on the mixed-width path.
+    Hydra a = make_large_seeded(16, 0xC3);
+    Hydra b = make_large_seeded(32, 0xD4);
+    check_mul_matches_schoolbook(a, b, "operator* 16x32 (max triggers Karatsuba, lhs padded)");
+}
+
+static void test_mul_seam_mixed_33_17() {
+    // Asymmetric & non-power-of-two on both sides — max=33, pad to 64.
+    Hydra a = make_large_seeded(33, 0xE5);
+    Hydra b = make_large_seeded(17, 0xF6);
+    check_mul_matches_schoolbook(a, b, "operator* 33x17 (asymmetric, padded to 64)");
+}
+
+static void test_mul_seam_mixed_31_32() {
+    // Threshold straddled by a single limb — rhs hits threshold, lhs
+    // does not; max_limbs=32 still dispatches to Karatsuba (pad to 32).
+    Hydra a = make_large_seeded(31, 0x77);
+    Hydra b = make_large_seeded(32, 0x88);
+    check_mul_matches_schoolbook(a, b, "operator* 31x32 (straddles threshold)");
+}
+
+// ── integrity checks on the dispatch path ─────────────────────────────
+
+static void test_mul_seam_identity_at_threshold() {
+    // (0) · (large) and (1) · (large) must still work when the right
+    // operand is at the threshold — the zero/one short-circuit lives
+    // in the small-small fast path, but the general path has its own
+    // `count==0` zero check that the Karatsuba branch must preserve.
+    Hydra big = make_large_seeded(32, 0xD1D00);
+
+    Hydra zero_times = Hydra{0u} * big;
+    CHECK(zero_times.to_string() == "0", "0 * threshold_large == 0");
+
+    Hydra one_times = Hydra{1u} * big;
+    CHECK(one_times == big, "1 * threshold_large == threshold_large");
+}
+
+static void test_mul_seam_64_limbs() {
+    // Two levels of recursion above the threshold (64 → 32 → 16 base).
+    // Guards against any off-by-one in the recursive output-layout.
+    Hydra a = make_large_seeded(64, 0x640A);
+    Hydra b = make_large_seeded(64, 0x640B);
+    check_mul_matches_schoolbook(a, b, "operator* 64x64 (deep Karatsuba recursion)");
+}
+
+static void test_mul_seam_commutativity_at_threshold() {
+    // a*b == b*a for threshold-sized operands.
+    Hydra a = make_large_seeded(32, 0x0C0FFEE);
+    Hydra b = make_large_seeded(33, 0x0BADF00D);
+    Hydra ab = a * b;
+    Hydra ba = b * a;
+    CHECK(ab == ba, "operator* commutative across Karatsuba seam (32x33 vs 33x32)");
+}
+
 // ── medium / small path regression tests ─────────────────────────────
 
 static void test_medium_add_inplace() {
@@ -1057,6 +1189,18 @@ int main() {
     test_karatsuba_64x64();
     test_karatsuba_all_ones();
     test_karatsuba_recursion_boundary();
+
+    // mul_general dispatch-seam tests (Karatsuba integration)
+    test_mul_seam_31_limbs();
+    test_mul_seam_32_limbs();
+    test_mul_seam_33_limbs();
+    test_mul_seam_mixed_32_16();
+    test_mul_seam_mixed_16_32();
+    test_mul_seam_mixed_33_17();
+    test_mul_seam_mixed_31_32();
+    test_mul_seam_identity_at_threshold();
+    test_mul_seam_64_limbs();
+    test_mul_seam_commutativity_at_threshold();
 
     // Bit-shift tests
     test_shl_zero_shift();

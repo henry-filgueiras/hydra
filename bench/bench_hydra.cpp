@@ -885,6 +885,83 @@ BENCHMARK(BM_mul_karatsuba)->Name("mul_karatsuba")
     ->Arg(2)->Arg(4)->Arg(8)
     ->Arg(16)->Arg(32)->Arg(64);
 
+// ── § 7e  Dispatched operator* across the Karatsuba threshold ───────────────
+//
+// The §7d benchmarks above call the raw detail-namespace kernels.  These
+// §7e benchmarks call the PUBLIC `operator*` and therefore measure the
+// post-integration dispatch path:
+//
+//     max_limbs <  KARATSUBA_THRESHOLD_LIMBS  → schoolbook (mul_limbs)
+//     max_limbs >= KARATSUBA_THRESHOLD_LIMBS  → mul_karatsuba (padded to pow2)
+//
+// Widths 16 / 32 / 64 / 128 span:
+//
+//   • 16  — below threshold, confirms the dispatch branch is free
+//           (same code path as before integration)
+//   • 32  — exactly at threshold, first shape that takes the Karatsuba arm
+//   • 64  — one power of 2 above threshold, two levels of recursion
+//   • 128 — deep recursion, checks scalability of the dispatch seam
+//
+// Both operands are kept in full-width `make_large_hydra` form so the
+// padding is minimal (operand is already a power-of-2 wide at 16/32/64/128).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Build a random full-width n-limb Hydra (MSL bit 63 set).
+static Hydra make_large_hydra(uint32_t n, uint64_t seed) {
+    XorShift64 rng{seed};
+    std::vector<uint64_t> limbs(n);
+    for (uint32_t i = 0; i < n; ++i) limbs[i] = rng.next() | 1u;
+    limbs.back() |= (1ull << 63);
+    return Hydra::from_limbs(limbs.data(), n);
+}
+
+static void BM_hydra_mul_dispatched(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    Hydra a = make_large_hydra(n, 0xA11CE ^ n);
+    Hydra b = make_large_hydra(n, 0xB0B   ^ n);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        benchmark::DoNotOptimize(b);
+        Hydra c = a * b;
+        benchmark::DoNotOptimize(c);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.counters["limbs"] = n;
+}
+BENCHMARK(BM_hydra_mul_dispatched)->Name("mul_dispatched")
+    ->Arg(16)->Arg(32)->Arg(64)->Arg(128);
+
+// ── § 7f  Dispatch-overhead probe for below-threshold shapes ────────────────
+//
+// Sanity check that adding the `max_limbs >= KARATSUBA_THRESHOLD_LIMBS`
+// branch to mul_general did NOT regress the cost of shapes that continue
+// to use the schoolbook path.  These benchmarks deliberately stay below
+// the threshold and use shapes NOT covered by the 3×3 / 4×4 / 8×8
+// specialised kernels, so what we're measuring is the generic schoolbook
+// fallback + one extra (never-taken) branch.
+//
+// Expected delta vs pre-integration: within noise (≤ 1 ns).
+// ─────────────────────────────────────────────────────────────────────────────
+static void BM_hydra_mul_below_threshold(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    Hydra a = make_large_hydra(n, 0x5B011A ^ n);
+    Hydra b = make_large_hydra(n, 0x5B022B ^ n);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(a);
+        benchmark::DoNotOptimize(b);
+        Hydra c = a * b;
+        benchmark::DoNotOptimize(c);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.counters["limbs"] = n;
+}
+// 5, 6, 7 limbs: between the 3×3 (covers ≤3) and 8×8 kernels.
+// 9–31: above 8×8, fully in the schoolbook fallback, strictly below threshold.
+BENCHMARK(BM_hydra_mul_below_threshold)->Name("mul_below_threshold")
+    ->Arg(5)->Arg(9)->Arg(15)->Arg(24)->Arg(31);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // § 8  Boost.Multiprecision comparison  (opt-in: -DHYDRA_BENCH_BOOST=ON)
 //
