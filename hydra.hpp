@@ -3081,7 +3081,7 @@ struct EGCDResult {
             // The window value is the integer formed by bits [bit_pos .. bit_pos - len + 1].
             // We want the window to end with a 1 bit (odd value) for table lookup.
             int window_len = WINDOW;
-            if (bit_pos < WINDOW - 1) window_len = bit_pos + 1;
+            if (bit_pos < static_cast<int>(WINDOW) - 1) window_len = bit_pos + 1;
 
             // Extract window_len bits starting from bit_pos (MSB first)
             uint32_t wval = 0;
