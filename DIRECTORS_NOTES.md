@@ -1468,6 +1468,64 @@ cmake --build build-rel --target hydra_bench -j
 
 ---
 
+### README Documentation Surgery — Performance Story Upgrade
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+#### Motivation
+
+Hydra reached a significant modular arithmetic benchmark milestone:
+2×–3× faster than Boost.Multiprecision, within 3×–5× of GMP, within
+4×–6× of OpenSSL across 256–4096-bit widths.  This deserved first-scroll
+visibility in the README, not burial in a detail section.
+
+#### Placement rationale
+
+The README now follows the flow: **hook → quick example → performance
+proof → architecture story → deep dive**.  The Performance Snapshot
+section sits immediately after Quick Example and before Design Goals.
+This placement optimizes for:
+
+- **First-scroll credibility:** Visitors see benchmark numbers within
+  the first screenful, before committing to read architecture details.
+- **Scanability:** A compact 3-row table (256/1024/2048-bit) with bold
+  Hydra numbers and inline comparison libraries.
+- **Honest framing:** GMP and OpenSSL numbers are shown alongside Hydra
+  (not hidden), making the "competitive constant-factor gap" story
+  immediately credible rather than hypey.
+
+#### Changes made
+
+1. **Tagline refresh:** Updated from "tiered arbitrary-precision integer"
+   to "high-performance arbitrary-precision integer library" with
+   "competitive modular arithmetic · clean systems-first architecture"
+   subtitle.  Reflects the project's current state more accurately.
+
+2. **New section: ⚡ Performance Snapshot — Modular Exponentiation:**
+   Placed after Quick Example.  Contains an inline SVG bar chart
+   (`assets/hydra_powmod_bench.svg`), a compact 3-row benchmark table,
+   bullet-point summary of relative performance, and a one-line
+   explanation of techniques used.
+
+3. **Old benchmark table:** Moved into a `<details>` collapsible under
+   the new Performance Snapshot section.  The micro-benchmark data
+   (add/mul/shift per-operation) is still accessible but doesn't
+   compete for first-scroll attention.
+
+4. **SVG chart:** Dark-themed horizontal bar chart matching the repo's
+   visual style.  Shows all four libraries at each width with
+   proportional bar lengths.  Labels are outside bars for readability.
+
+#### Tone decisions
+
+- No "RSA library" or "production crypto replacement" language
+- Used "modular exponentiation workloads" and "big integer arithmetic
+  comparison" framing
+- Explicitly called out "portable C++20 with zero assembly" to set
+  expectations honestly against GMP/OpenSSL's hand-tuned asm
+
+---
+
 ---
 
 ## Resolved Dragons (Historical Performance Archaeology)
