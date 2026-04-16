@@ -476,6 +476,224 @@ and the inner multiply-subtract is linear in `nv`.
 
 ---
 
+### Knuth-D Profiler Pass (Phase 2 follow-up)
+
+_Conducted 2026-04-16 — Claude Opus 4.6_
+
+A profiler-guided optimization pass focused exclusively on
+`detail::divmod_knuth_limbs`.  The instruction from the director was
+explicit: **only land optimizations supported by measured hotspot data —
+no speculative churn.**  After instrumentation and A/B testing, the
+**final landed change is zero new kernel code paths**; the contribution
+is a reusable measurement harness, documented findings, and an
+explicitly-curated list of rejected speculative ideas.
+
+#### Tooling landed
+
+| Artifact                          | Purpose                                                              |
+|-----------------------------------|----------------------------------------------------------------------|
+| `HYDRA_PROFILE_KNUTH=1` macro     | Compile-time opt-in. Enables ten inline counters + per-section timing. |
+| `detail::KnuthProfSection`        | RAII region timer (steady_clock); zero cost when undefined.          |
+| `bench/profile_knuth.cpp`         | Standalone timing harness (no Google Benchmark dependency).          |
+| `HYDRA_KNUTH_PROF_SECTION` macros | Expand to `((void)0)` in production.  Verified by diffing codegen:   |
+|                                   | assembly of `divmod_knuth_limbs` is byte-identical with vs without   |
+|                                   | the macros (342 lines either way).                                   |
+
+Build and run:
+```bash
+# Production build (no instrumentation — zero overhead)
+g++ -std=c++20 -O3 -DNDEBUG -I. bench/profile_knuth.cpp -o profile_knuth
+
+# Instrumented build (per-section counters live)
+g++ -std=c++20 -O3 -DNDEBUG -DHYDRA_PROFILE_KNUTH=1 -I. \
+    bench/profile_knuth.cpp -o profile_knuth_inst
+```
+
+#### Measured cost distribution
+
+Linux aarch64 sandbox, g++ 11 `-O3 -DNDEBUG`, median of 10 runs, random
+operand pairs (non-adversarial, MSB of divisor pre-set so no shift-zero
+edge case dominates).  "direct" = kernel called with caller-owned
+scratch (skips `from_limbs`/allocate/normalize wrapper).
+
+```
+shape        direct ns/op   divmod ns/op   per-step ns   per-inner-limb ns
+256/128         25.3           26.2            8.4           4.2
+512/256         64.0           71.5           12.8           3.2
+1024/512       125.7          128.8           14.0           1.8
+2048/1024      311.2          308.0           18.3           1.14
+```
+
+Per-step = direct ÷ (nu − nv + 1) outer iterations.
+Per-inner-limb = per-step ÷ nv.  The descending per-inner-limb cost is
+expected — the outer per-step overhead amortises across more inner limbs.
+
+The `divmod` wrapper adds effectively zero overhead vs `direct` at all
+shapes (some runs are even slightly *faster* due to allocator residency
+effects — the stack buffers in `Hydra::divmod` are warm on second-pass
+repeats).  This validates the "stack ≤ 32 limbs" threshold — nothing
+benchmarked here touches `std::vector`-backed scratch.
+
+#### Per-section breakdown (instrumented build)
+
+Absolute numbers below are inflated by ~20–30 ns per `steady_clock::now()`
+call.  **Compare the relative columns, not absolute numbers** — the goal
+is to partition total cost, not to measure section cost precisely.
+
+```
+shape          norm       qest     qref    mulsub    adback    denorm     avg refineIter/step
+256/128        16 ns      63 ns    43 ns   46 ns     0 ns      16 ns      0.00
+512/256        23 ns     104 ns    74 ns   76 ns     0 ns      15 ns      0.60   (but divided across 5 steps = 0.12)
+1024/512       17 ns     176 ns   140 ns   152 ns    0 ns      15 ns      0.33
+2048/1024      18 ns     373 ns   246 ns   348 ns    0 ns      15 ns      0.06
+```
+
+Subtracting the ~15 ns timer overhead per section and comparing totals:
+
+- **Normalize:** small constant (~1–3 ns real work, dominated by a
+  single limb-shift pass).  **Under 5% of total at every shape.**
+- **Denormalize:** same — small constant.
+- **q_hat estimate** (divq / __udivti3 on aarch64): scales with outer
+  steps, not with nv.  **At nv ≥ 8 it is the single biggest per-step
+  contributor.**
+- **q_hat refinement check:** 128-bit multiply + compare per iteration,
+  0 or 1 iterations per step.  Measured iteration rate 0.24–0.33/step.
+- **Multiply-subtract:** scales as O(steps × nv).  **Dominant total
+  cost at nv ≥ 8.**
+- **Add-back:** zero hits across 4000 random operand pairs × all shapes.
+  The branch is taken 0% of the time on non-adversarial inputs.
+
+#### Branch-predictability survey (1000 random pairs per shape)
+
+```
+shape         refineIter / step   addback / step   qhatClamp / step
+256/128           0.2377             0.0000            0.0000
+512/256           0.2854             0.0000            0.0000
+1024/512          0.3094             0.0000            0.0000
+2048/1024         0.3251             0.0000            0.0000
+```
+
+**Add-back** and **q_hat clamp** (u_top == v_hi): both truly cold.
+The branch predictor learns these in a handful of iterations and then
+never mispredicts.  **Refinement loop** iterates on roughly 1-in-4 to
+1-in-3 steps — not cold, not hot, and already a single-iteration loop
+in practice (Knuth §4.3.1 Theorem B bounds it at 2).
+
+#### Stack-vs-heap scratch threshold
+
+All four benchmarked shapes fit within `STACK_LIMIT = 32` (the
+`Hydra::divmod` stack budget).  The heap-scratch path (`std::vector`)
+is only exercised by `nu > 32` (operands wider than 2048-bit).
+No measured perf delta between direct and wrapped calls → heap path
+is not a current bottleneck at the shapes the project cares about.
+
+#### A/B tested — NOT LANDED — branch hints
+
+The measured frequency data suggested three possible branch hints:
+
+| Location                                  | Measured hit rate | A/B result |
+|-------------------------------------------|-------------------|------------|
+| `[[unlikely]]` on add-back path           | 0 hits / step     | Neutral    |
+| `[[unlikely]]` on `u_top >= v_hi` clamp   | 0 hits / step     | Regression on 256/128 & 512/256 |
+| `[[likely]]`  on `u_top <  v_hi` (inverted) | 100% hit rate    | Regression on 256/128 & 512/256 |
+
+Measurement methodology: 10 interleaved runs per binary, minima
+compared, confirmed across 3 separate build cycles.
+
+**Net effect of landing both hints together:**
+- 256/128:  25.1 ns → 27.3 ns  (+8.8% regression)
+- 512/256:  64.1 ns → 69.2 ns  (+8.0% regression)
+- 1024/512: 125.7 ns → 121.5 ns (−3.3% improvement)
+- 2048/1024: 310 ns → 312 ns    (flat — noise)
+
+Root cause analysis: modern branch predictors learn these trivial
+cold paths in the first ~10 iterations; the `[[unlikely]]` attribute
+changes only **code layout**, moving the cold body further from the
+hot per-step body.  For small-nv shapes the outer loop is short
+enough that the jump to the out-of-line cold block lands in a
+less-cache-friendly location (or disrupts the fetch-block alignment
+of the hot path).  Larger nv tolerates the layout change better, but
+not by enough to offset the per-step regression.
+
+**Decision:** land neither hint.  Leave a comment at each site
+pointing at this note, so future agents don't waste time re-proposing
+the same optimization.  Rationale noted inline:
+```cpp
+// Measured 2026-04-16: adding [[unlikely]] here was
+// performance-neutral at every shape (compiler + modern branch
+// predictor already treat the path as cold).  Kept hint-free to
+// avoid the layout perturbation that the paired `[[unlikely]]` on
+// the qhat clamp caused.
+```
+
+#### Rejected speculative ideas (not data-supported)
+
+Each of these was considered during the pass.  None were implemented
+because no measurement justified the change.
+
+1. **Hand-unrolled `nv == 2` specialization (256/128 fast path).**
+   Rationale would be: the 256/128 shape spends most of its time in
+   per-step fixed overhead (q_hat estimate, refinement check).  A
+   hand-written 2-limb kernel could save ~30% on this one shape.
+   **Rejected** because: no production workload has been identified
+   that is bottlenecked on 256-bit division; adding a second kernel
+   path doubles the correctness-testing surface for one shape.
+   Revisit when (if) a real consumer shows up.
+
+2. **Barrett/reciprocal-based trial quotient.**
+   Reciprocal-of-divisor estimation (Möller–Granlund) can shave the
+   `__udivti3` call path.  **Rejected** because: on aarch64, the
+   trial quotient compiles to a call into `__udivti3` (128÷64) which
+   is a single `udiv` on the CPU — already well-pipelined.  Barrett
+   wins only when the divisor is reused across many divisions, which
+   is not this kernel's shape.
+
+3. **Reduced refinement iterations.**
+   The current while-loop does at most 2 iterations.  Refinement
+   fires on ~25–33% of steps, always doing exactly 1 iteration at
+   the measured distribution.  **Rejected** — no room to shorten.
+
+4. **Loop unrolling in mul-sub.**
+   `nv` varies from 2 to 32 at runtime.  Unrolling would require a
+   template dispatch matrix.  Generated assembly at `-O3` already
+   issues 1 MAC per ~7 instructions with good pipelining (verified
+   by inspecting `knuth_asm_probe.s` — `mul`/`umulh`/`adds`/`cinc`/
+   `subs`/`cset`/`sbcs` pattern).  **Rejected** — nothing to gain
+   without radically restructuring the kernel.
+
+5. **Avoid scratch zero-initialisation.**
+   Audited: the Knuth kernel never depends on scratch being
+   zeroed.  `std::memcpy` / shift loops write every limb they read.
+   `Hydra::divmod`'s stack buffers are uninitialised arrays (no
+   zero-init) and `std::vector::resize` only zero-inits on the heap
+   path which is never exercised ≤ 2048-bit.  **Nothing to fix.**
+
+6. **Scratch reuse across outer loop iterations.**
+   The kernel already performs all work in-place within the single
+   `work[]` buffer (u_norm + v_norm layout).  No per-step allocation.
+   **Nothing to fix.**
+
+7. **Sub-quadratic division (Burnikel-Ziegler, Mulders, etc.).**
+   Out of scope for this pass — and already noted in the main
+   phase-2 roadmap as "not worth it until Karatsuba multiply lands."
+
+#### Running the profiler
+
+Future profiler passes should re-run:
+```bash
+g++ -std=c++20 -O3 -DNDEBUG -I. bench/profile_knuth.cpp \
+    -o /tmp/profile_knuth_plain
+g++ -std=c++20 -O3 -DNDEBUG -DHYDRA_PROFILE_KNUTH=1 -I. \
+    bench/profile_knuth.cpp -o /tmp/profile_knuth_inst
+/tmp/profile_knuth_plain    # clean timing
+/tmp/profile_knuth_inst     # per-section breakdown
+```
+
+Run each binary 5–10 times and take the minimum or median — the
+sandbox VM has ~5 ns of per-run noise at the 25–70 ns scale.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_

@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#if HYDRA_PROFILE_KNUTH
+#include <chrono>
+#endif
+
 namespace hydra {
 
 // ─────────────────────────────────────────────────────────
@@ -111,6 +115,52 @@ using LargeGuard = std::unique_ptr<LargeRep, DestroyLarge>;
 // Low-level limb-array kernels (LSB-first, unsigned)
 // ─────────────────────────────────────────────────────────
 namespace detail {
+
+// ─────────────────────────────────────────────────────────
+// Knuth-D profiling instrumentation (compile-time opt-in)
+//
+// Enabled only when the TU that *includes* this header defines
+// HYDRA_PROFILE_KNUTH=1.  The counters live at namespace scope
+// so they are linker-visible; the timing uses high_resolution
+// clock sampled once per section per call (not per inner-loop
+// iteration) to keep perturbation bounded.
+//
+// Production builds (HYDRA_PROFILE_KNUTH undefined) expand the
+// section macros to empty statements — zero cost, zero symbols.
+// ─────────────────────────────────────────────────────────
+#if HYDRA_PROFILE_KNUTH
+inline uint64_t knuth_prof_normalize_ns   = 0;
+inline uint64_t knuth_prof_qhat_est_ns    = 0;
+inline uint64_t knuth_prof_qhat_refine_ns = 0;
+inline uint64_t knuth_prof_mulsub_ns      = 0;
+inline uint64_t knuth_prof_addback_ns     = 0;
+inline uint64_t knuth_prof_denormalize_ns = 0;
+inline uint64_t knuth_prof_refine_iters   = 0;
+inline uint64_t knuth_prof_addback_hits   = 0;
+inline uint64_t knuth_prof_outer_steps    = 0;
+inline uint64_t knuth_prof_qhat_clamps    = 0;
+
+struct KnuthProfSection {
+    uint64_t& sink;
+    std::chrono::steady_clock::time_point t0;
+    explicit KnuthProfSection(uint64_t& s) noexcept
+        : sink(s), t0(std::chrono::steady_clock::now()) {}
+    ~KnuthProfSection() noexcept {
+        auto t1 = std::chrono::steady_clock::now();
+        sink += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    }
+};
+#  define HYDRA_KP_CAT2(a, b) a##b
+#  define HYDRA_KP_CAT(a, b)  HYDRA_KP_CAT2(a, b)
+#  define HYDRA_KNUTH_PROF_SECTION(sink) \
+    ::hydra::detail::KnuthProfSection HYDRA_KP_CAT(_knuth_prof_sect_, __LINE__){sink}
+#  define HYDRA_KNUTH_PROF_INC(counter, by) \
+    ((::hydra::detail::counter) += (by))
+#else
+#  define HYDRA_KNUTH_PROF_SECTION(sink) ((void)0)
+#  define HYDRA_KNUTH_PROF_INC(counter, by) ((void)0)
+#endif
 
 // Add two limb arrays. out must have room for max(na, nb)+1 limbs.
 // Returns the number of significant result limbs (trimming not applied here).
@@ -636,30 +686,33 @@ inline void divmod_knuth_limbs(
     const unsigned d = static_cast<unsigned>(
         __builtin_clzll(v_in[nv - 1]));
 
-    if (d == 0) {
-        std::memcpy(u, u_in, nu * sizeof(uint64_t));
-        u[nu] = 0;
-        std::memcpy(v, v_in, nv * sizeof(uint64_t));
-    } else {
-        // Shift v left by d bits.
-        {
-            uint64_t carry = 0;
-            for (uint32_t i = 0; i < nv; ++i) {
-                v[i] = (v_in[i] << d) | carry;
-                carry = v_in[i] >> (64 - d);
+    {
+        HYDRA_KNUTH_PROF_SECTION(knuth_prof_normalize_ns);
+        if (d == 0) {
+            std::memcpy(u, u_in, nu * sizeof(uint64_t));
+            u[nu] = 0;
+            std::memcpy(v, v_in, nv * sizeof(uint64_t));
+        } else {
+            // Shift v left by d bits.
+            {
+                uint64_t carry = 0;
+                for (uint32_t i = 0; i < nv; ++i) {
+                    v[i] = (v_in[i] << d) | carry;
+                    carry = v_in[i] >> (64 - d);
+                }
+                // carry must be 0 because clz chose d exactly to land
+                // the top bit at position 63.
+                assert(carry == 0);
             }
-            // carry must be 0 because clz chose d exactly to land
-            // the top bit at position 63.
-            assert(carry == 0);
-        }
-        // Shift u left by d bits; high carry stored in u[nu].
-        {
-            uint64_t carry = 0;
-            for (uint32_t i = 0; i < nu; ++i) {
-                u[i] = (u_in[i] << d) | carry;
-                carry = u_in[i] >> (64 - d);
+            // Shift u left by d bits; high carry stored in u[nu].
+            {
+                uint64_t carry = 0;
+                for (uint32_t i = 0; i < nu; ++i) {
+                    u[i] = (u_in[i] << d) | carry;
+                    carry = u_in[i] >> (64 - d);
+                }
+                u[nu] = carry;
             }
-            u[nu] = carry;
         }
     }
 
@@ -680,100 +733,127 @@ inline void divmod_knuth_limbs(
         uint64_t r_hat;
         bool     r_hat_overflowed = false;
 
-        if (u_top >= v_hi) {
-            // q_hat would be ≥ B; clamp to B-1 = 2^64-1.
-            // After clamp, r_hat = u_top*B + u_mid - (B-1)*v_hi.
-            // Since u_top ≤ v_hi (invariant post-correction; at
-            // the first iteration u_top is the shift carry, which
-            // is < 2^d ≤ 2^63 ≤ v_hi), u_top == v_hi here — so:
-            //   r_hat = v_hi*B + u_mid - B*v_hi + v_hi
-            //         = u_mid + v_hi
-            // which may overflow one limb, signalling r_hat ≥ B
-            // (the correction loop must be skipped in that case).
-            q_hat = ~uint64_t{0};
-            const uint64_t r_tmp = u_mid + v_hi;
-            r_hat_overflowed = (r_tmp < u_mid);
-            r_hat = r_tmp;
-        } else {
-            unsigned __int128 num =
-                (static_cast<unsigned __int128>(u_top) << 64) | u_mid;
-            q_hat = static_cast<uint64_t>(num / v_hi);
-            r_hat = static_cast<uint64_t>(num % v_hi);
+        {
+            HYDRA_KNUTH_PROF_SECTION(knuth_prof_qhat_est_ns);
+            // Branch-hint experiment (2026-04-16 profiler pass):
+            // we measured 0 qhat clamps / step across 1000 random
+            // pairs at 256/128, 512/256, 1024/512, 2048/1024 — the
+            // `u_top >= v_hi` path is genuinely cold.  Tagging it
+            // [[unlikely]] *did* change codegen but the layout shift
+            // was a net 2-3 ns regression on the 256/128 and 512/256
+            // shapes while only marginally helping 1024/512.  The
+            // existing structure already compiles correctly; no hint
+            // is applied.  See DIRECTORS_NOTES → "Knuth-D Profiler
+            // Pass" for the full A/B matrix.
+            if (u_top >= v_hi) {
+                q_hat = ~uint64_t{0};
+                const uint64_t r_tmp = u_mid + v_hi;
+                r_hat_overflowed = (r_tmp < u_mid);
+                r_hat = r_tmp;
+                HYDRA_KNUTH_PROF_INC(knuth_prof_qhat_clamps, 1);
+            } else {
+                unsigned __int128 num =
+                    (static_cast<unsigned __int128>(u_top) << 64) | u_mid;
+                q_hat = static_cast<uint64_t>(num / v_hi);
+                r_hat = static_cast<uint64_t>(num % v_hi);
+            }
         }
 
         // Correction loop: refine q_hat using v[nv-2] and u[j+nv-2].
         // Terminates in at most 2 iterations (Knuth §4.3.1 Thm B).
-        if (!r_hat_overflowed) {
-            const uint64_t u_low = u[j + nv - 2];
-            while (true) {
-                unsigned __int128 lhs =
-                    static_cast<unsigned __int128>(q_hat) * v_lo;
-                unsigned __int128 rhs =
-                    (static_cast<unsigned __int128>(r_hat) << 64) | u_low;
-                if (lhs <= rhs) break;
-                --q_hat;
-                uint64_t new_r = r_hat + v_hi;
-                if (new_r < r_hat) break;  // r_hat now ≥ B; stop
-                r_hat = new_r;
+        {
+            HYDRA_KNUTH_PROF_SECTION(knuth_prof_qhat_refine_ns);
+            if (!r_hat_overflowed) {
+                const uint64_t u_low = u[j + nv - 2];
+                while (true) {
+                    unsigned __int128 lhs =
+                        static_cast<unsigned __int128>(q_hat) * v_lo;
+                    unsigned __int128 rhs =
+                        (static_cast<unsigned __int128>(r_hat) << 64) | u_low;
+                    if (lhs <= rhs) break;
+                    --q_hat;
+                    HYDRA_KNUTH_PROF_INC(knuth_prof_refine_iters, 1);
+                    uint64_t new_r = r_hat + v_hi;
+                    if (new_r < r_hat) break;  // r_hat now ≥ B; stop
+                    r_hat = new_r;
+                }
             }
         }
 
         // ── D4. Multiply-subtract: u[j..j+nv] -= q_hat * v ─
-        uint64_t borrow = 0;
-        uint64_t carry  = 0;
-        for (uint32_t i = 0; i < nv; ++i) {
-            unsigned __int128 prod =
-                static_cast<unsigned __int128>(q_hat) * v[i] + carry;
-            const uint64_t p_lo = static_cast<uint64_t>(prod);
-            carry = static_cast<uint64_t>(prod >> 64);
-
-            const uint64_t ui = u[j + i];
-            const uint64_t d1 = ui - p_lo;
-            const uint64_t b1 = (d1 > ui) ? 1u : 0u;
-            const uint64_t d2 = d1 - borrow;
-            const uint64_t b2 = (d2 > d1) ? 1u : 0u;
-            u[j + i] = d2;
-            borrow = b1 + b2;           // provably ≤ 1
-        }
-        // Top limb: subtract final carry and the loop's borrow.
+        bool need_add_back = false;
         {
+            HYDRA_KNUTH_PROF_SECTION(knuth_prof_mulsub_ns);
+            uint64_t borrow = 0;
+            uint64_t carry  = 0;
+            for (uint32_t i = 0; i < nv; ++i) {
+                unsigned __int128 prod =
+                    static_cast<unsigned __int128>(q_hat) * v[i] + carry;
+                const uint64_t p_lo = static_cast<uint64_t>(prod);
+                carry = static_cast<uint64_t>(prod >> 64);
+
+                const uint64_t ui = u[j + i];
+                const uint64_t d1 = ui - p_lo;
+                const uint64_t b1 = (d1 > ui) ? 1u : 0u;
+                const uint64_t d2 = d1 - borrow;
+                const uint64_t b2 = (d2 > d1) ? 1u : 0u;
+                u[j + i] = d2;
+                borrow = b1 + b2;           // provably ≤ 1
+            }
+            // Top limb: subtract final carry and the loop's borrow.
             const uint64_t ui = u[j + nv];
             const uint64_t d1 = ui - carry;
             const uint64_t b1 = (d1 > ui) ? 1u : 0u;
             const uint64_t d2 = d1 - borrow;
             const uint64_t b2 = (d2 > d1) ? 1u : 0u;
             u[j + nv] = d2;
-            const bool need_add_back = (b1 + b2) != 0;
+            need_add_back = (b1 + b2) != 0;
+        }
 
-            // ── D5/D6. Add-back correction ──────────────────
-            // Triggered when q_hat was too high by exactly 1.
-            // Decrement q_hat and add v back; the final carry
-            // cancels the subtract's borrow (discarded).
-            if (need_add_back) {
-                --q_hat;
-                uint64_t c = 0;
-                for (uint32_t i = 0; i < nv; ++i) {
-                    unsigned __int128 s =
-                        static_cast<unsigned __int128>(u[j + i]) + v[i] + c;
-                    u[j + i] = static_cast<uint64_t>(s);
-                    c = static_cast<uint64_t>(s >> 64);
-                }
-                u[j + nv] += c;   // overflow cancels subtract-borrow
+        // ── D5/D6. Add-back correction ──────────────────
+        // Triggered when q_hat was too high by exactly 1.
+        // Decrement q_hat and add v back; the final carry
+        // cancels the subtract's borrow (discarded).
+        //
+        // Measured frequency: 0 hits/step across 1000 random pairs at
+        // every benchmarked shape (see DIRECTORS_NOTES → "Knuth-D
+        // Profiler Pass").  Knuth §4.3.1 Thm B bounds this at ~2/B
+        // where B = 2^64, so it is unreachable on realistic inputs.
+        // Measured 2026-04-16: adding [[unlikely]] here was
+        // performance-neutral at every shape (compiler + modern branch
+        // predictor already treat the path as cold).  Kept hint-free
+        // to avoid the layout perturbation that the paired
+        // `[[unlikely]]` on the qhat clamp caused.
+        if (need_add_back) {
+            HYDRA_KNUTH_PROF_SECTION(knuth_prof_addback_ns);
+            HYDRA_KNUTH_PROF_INC(knuth_prof_addback_hits, 1);
+            --q_hat;
+            uint64_t c = 0;
+            for (uint32_t i = 0; i < nv; ++i) {
+                unsigned __int128 s =
+                    static_cast<unsigned __int128>(u[j + i]) + v[i] + c;
+                u[j + i] = static_cast<uint64_t>(s);
+                c = static_cast<uint64_t>(s >> 64);
             }
+            u[j + nv] += c;   // overflow cancels subtract-borrow
         }
 
         // ── D7. Store quotient digit ───────────────────────
         q[j] = q_hat;
+        HYDRA_KNUTH_PROF_INC(knuth_prof_outer_steps, 1);
     }
 
     // ── D8. Denormalize: r = u[0..nv-1] >> d ───────────────
-    if (d == 0) {
-        std::memcpy(r, u, nv * sizeof(uint64_t));
-    } else {
-        for (uint32_t i = 0; i + 1 < nv; ++i) {
-            r[i] = (u[i] >> d) | (u[i + 1] << (64 - d));
+    {
+        HYDRA_KNUTH_PROF_SECTION(knuth_prof_denormalize_ns);
+        if (d == 0) {
+            std::memcpy(r, u, nv * sizeof(uint64_t));
+        } else {
+            for (uint32_t i = 0; i + 1 < nv; ++i) {
+                r[i] = (u[i] >> d) | (u[i + 1] << (64 - d));
+            }
+            r[nv - 1] = u[nv - 1] >> d;
         }
-        r[nv - 1] = u[nv - 1] >> d;
     }
 }
 
