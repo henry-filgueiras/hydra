@@ -343,7 +343,7 @@ static bool cross_validate(Operands& ops) {
 
 #ifdef HYDRA_POWMOD_BOOST
     {
-        auto b_result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
+        bmp::cpp_int b_result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
         std::string b_str = b_result.str();
         if (h_str != b_str) {
             fprintf(stderr, "MISMATCH at %u bits: Hydra=%s  Boost=%s\n",
@@ -455,26 +455,11 @@ static void print_json(const std::vector<BenchRow>& rows) {
             printf("      }%s\n", last ? "" : ",");
         };
 
-        bool last_is_hydra = true;
-#ifdef HYDRA_POWMOD_BOOST
-        last_is_hydra = false;
+        bool has_more = false;
+#if defined(HYDRA_POWMOD_BOOST) || defined(HYDRA_POWMOD_GMP) || defined(HYDRA_POWMOD_OPENSSL)
+        has_more = true;
 #endif
-#ifdef HYDRA_POWMOD_GMP
-        last_is_hydra = false;
-#endif
-#ifdef HYDRA_POWMOD_OPENSSL
-        last_is_hydra = false;
-#endif
-
-#ifdef HYDRA_POWMOD_OPENSSL
-        print_backend("hydra", row.hydra, false);
-#elif defined(HYDRA_POWMOD_GMP)
-        print_backend("hydra", row.hydra, false);
-#elif defined(HYDRA_POWMOD_BOOST)
-        print_backend("hydra", row.hydra, false);
-#else
-        print_backend("hydra", row.hydra, true);
-#endif
+        print_backend("hydra", row.hydra, !has_more);
 
 #ifdef HYDRA_POWMOD_BOOST
         {
