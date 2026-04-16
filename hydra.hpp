@@ -9,8 +9,15 @@
 // Invariant: every value occupies the *smallest* valid representation.
 // normalize() enforces this after every mutation.
 //
-// Phase-1 scope: unsigned arithmetic only.
-// The sign bit in metadata is reserved but not yet interpreted.
+// Phase-2 semantic completeness: signed arithmetic is now supported.
+// Representation: sign-magnitude — the `limbs` hold |value|, and the
+// sign is encoded in meta bit 2 (bits::SIGN_BIT).  Zero is always
+// non-negative (canonical form: SIGN_BIT clear when limb_count() == 0).
+//
+// Division truncates toward zero (C++ semantics):
+//   quotient sign = sign(dividend) XOR sign(divisor)
+//   remainder has sign(dividend), |remainder| < |divisor|
+//   invariant: dividend = divisor * quotient + remainder
 //
 // C++20, GCC/Clang, x86-64 / aarch64.
 
@@ -1142,6 +1149,31 @@ struct Hydra {
     [[nodiscard]] bool is_medium() const noexcept { return kind() == Kind::Medium; }
     [[nodiscard]] bool is_large()  const noexcept { return kind() == Kind::Large;  }
 
+    // ── Sign helpers ──────────────────────────────────────
+    //
+    // Sign-magnitude encoding: meta bit 2 stores the sign.
+    // Invariant: zero is ALWAYS non-negative (SIGN_BIT clear).
+    //
+    [[nodiscard]] bool is_negative() const noexcept {
+        return (meta & bits::SIGN_BIT) != 0;
+    }
+    [[nodiscard]] bool is_positive() const noexcept {
+        return !is_negative() && limb_view().count > 0;
+    }
+    [[nodiscard]] bool is_zero() const noexcept {
+        return limb_view().count == 0;
+    }
+    void set_negative() noexcept {
+        meta |= bits::SIGN_BIT;
+    }
+    void clear_sign() noexcept {
+        meta &= ~bits::SIGN_BIT;
+    }
+    // Flip the sign. No-op on zero (preserves zero-sign invariant).
+    void negate() noexcept {
+        if (limb_view().count > 0) meta ^= bits::SIGN_BIT;
+    }
+
     [[nodiscard]] uint8_t used_medium_limbs() const noexcept {
         return static_cast<uint8_t>((meta & bits::USED_MASK) >> bits::USED_SHIFT);
     }
@@ -1202,6 +1234,22 @@ struct Hydra {
     constexpr Hydra(T v) noexcept               // NOLINT(google-explicit-constructor)
         : meta(make_small_meta()), payload()
     { payload.small = static_cast<uint64_t>(v); }
+
+    // Implicit conversion from all signed integer types.
+    // Handles INT64_MIN correctly via unsigned two's-complement arithmetic.
+    template<std::signed_integral T>
+    constexpr Hydra(T v) noexcept               // NOLINT(google-explicit-constructor)
+        : meta(make_small_meta()), payload()
+    {
+        if (v < 0) {
+            // 0 - unsigned(v) is a well-defined two's-complement negate.
+            payload.small = 0ull - static_cast<uint64_t>(
+                static_cast<int64_t>(v));
+            meta |= bits::SIGN_BIT;
+        } else {
+            payload.small = static_cast<uint64_t>(v);
+        }
+    }
 
     // Copy
     Hydra(const Hydra& o) : meta(o.meta), payload() {
@@ -1307,9 +1355,14 @@ struct Hydra {
     // ─────────────────────────────────────────────────────
 
     void normalize() noexcept {
+        // Preserve sign across Kind transitions.
+        // Zero is ALWAYS non-negative (sign bit cleared when magnitude == 0).
+        const uint64_t sign = meta & bits::SIGN_BIT;
+
         switch (kind()) {
         case Kind::Small:
-            // Already minimal.
+            // Already minimal; enforce zero-sign invariant.
+            if (payload.small == 0) meta &= ~bits::SIGN_BIT;
             break;
 
         case Kind::Medium: {
@@ -1318,14 +1371,15 @@ struct Hydra {
             while (u > 0 && payload.medium[u - 1] == 0) --u;
 
             if (u == 0) {
-                meta = make_small_meta();
+                meta = make_small_meta();  // zero → clear sign
                 payload.small = 0;
             } else if (u == 1) {
                 uint64_t v = payload.medium[0];
-                meta = make_small_meta();
+                meta = make_small_meta() | sign;
                 payload.small = v;
             } else {
                 set_used_medium_limbs(u);
+                // sign bit preserved (set_used_medium_limbs only touches USED_MASK)
             }
             break;
         }
@@ -1340,24 +1394,24 @@ struct Hydra {
 
             if (u == 0) {
                 LargeRep::destroy(rep);
-                meta = make_small_meta();
+                meta = make_small_meta();  // zero → clear sign
                 payload.small = 0;
             } else if (u == 1) {
                 uint64_t v = rep->limbs()[0];
                 LargeRep::destroy(rep);
-                meta = make_small_meta();
+                meta = make_small_meta() | sign;
                 payload.small = v;
             } else if (u <= 3) {
                 // Demote to Medium: copy limbs before freeing rep.
                 uint64_t tmp[3] = {};
                 std::memcpy(tmp, rep->limbs(), u * sizeof(uint64_t));
                 LargeRep::destroy(rep);
-                meta            = make_medium_meta(static_cast<uint8_t>(u));
+                meta            = make_medium_meta(static_cast<uint8_t>(u)) | sign;
                 payload.medium[0] = tmp[0];
                 payload.medium[1] = tmp[1];
                 payload.medium[2] = tmp[2];
             }
-            // else: stays Large, used already trimmed.
+            // else: stays Large, used already trimmed, sign already preserved.
             break;
         }
         }
@@ -1384,10 +1438,28 @@ struct Hydra {
     // Comparison
     // ─────────────────────────────────────────────────────
 
-    [[nodiscard]] int compare(const Hydra& o) const noexcept {
+    // Magnitude-only compare (ignores sign).
+    [[nodiscard]] int compare_magnitude(const Hydra& o) const noexcept {
         auto lv = limb_view();
         auto rv = o.limb_view();
         return detail::cmp_limbs(lv.ptr, lv.count, rv.ptr, rv.count);
+    }
+
+    // Full signed compare: positive > negative, magnitudes compared
+    // with reversal for both-negative.
+    [[nodiscard]] int compare(const Hydra& o) const noexcept {
+        const bool a_neg = is_negative();
+        const bool b_neg = o.is_negative();
+
+        // Different signs: positive beats negative.
+        if (a_neg && !b_neg) return -1;
+        if (!a_neg && b_neg) return  1;
+
+        // Same sign: compare magnitudes, reverse if both negative.
+        auto lv = limb_view();
+        auto rv = o.limb_view();
+        int c = detail::cmp_limbs(lv.ptr, lv.count, rv.ptr, rv.count);
+        return a_neg ? -c : c;
     }
 
     [[nodiscard]] friend bool operator==(const Hydra& a, const Hydra& b) noexcept {
@@ -1403,10 +1475,14 @@ struct Hydra {
     }
 
     // ─────────────────────────────────────────────────────
-    // Addition kernels
+    // Addition kernels (magnitude-level helpers)
+    //
+    // These operate on magnitude (payload) and return a
+    // non-negative result.  The sign-aware operators below
+    // set the sign bit as needed.
     // ─────────────────────────────────────────────────────
 
-    // ── hot path: Small + Small ──────────────────────────
+    // ── hot path: Small + Small (magnitudes) ────────────
     //
     // The compiler sees a single branch on overflow; no heap, no
     // function-pointer dispatch. On x86-64/aarch64 this folds into
@@ -1424,9 +1500,9 @@ struct Hydra {
         return make_medium(sum, 1, 0, 2);
     }
 
-    // ── general path via limb arrays ────────────────────
+    // ── general magnitude addition via limb arrays ──────
 
-    [[nodiscard]] static Hydra add_general(
+    [[nodiscard]] static Hydra add_magnitudes(
         const Hydra& a, const Hydra& b)
     {
         auto lv = a.limb_view();
@@ -1446,15 +1522,10 @@ struct Hydra {
         // Heap path — write the kernel output *directly* into the final
         // LargeRep, skipping the intermediate std::vector scratch buffer
         // and the subsequent memcpy/memmove that from_limbs would perform.
-        //
-        // LargeGuard provides exception-safety: if add_limbs or anything
-        // downstream throws, the rep is freed before propagation.
         LargeGuard rep{ LargeRep::create(max_limbs) };
         rep->used = detail::add_limbs(
             lv.ptr, lv.count, rv.ptr, rv.count, rep->limbs());
 
-        // Commit the rep into a Hydra, then let normalize() handle trimming
-        // and potential demotion to Medium or Small if high limbs are zero.
         Hydra result;
         result.meta          = make_large_meta();
         result.payload.large = rep.release();
@@ -1462,28 +1533,15 @@ struct Hydra {
         return result;
     }
 
-    // ─────────────────────────────────────────────────────
-    // Subtraction kernels (unsigned: result saturates at 0 if b > a)
-    // ─────────────────────────────────────────────────────
+    // ── general magnitude subtraction (|a| >= |b| assumed) ──
 
-    [[nodiscard]] static Hydra sub_small_small(
-        uint64_t a, uint64_t b) noexcept
-    {
-        // Unsigned: saturate at 0.
-        return Hydra{ (a >= b) ? a - b : 0u };
-    }
-
-    [[nodiscard]] static Hydra sub_general(
+    [[nodiscard]] static Hydra sub_magnitudes(
         const Hydra& a, const Hydra& b)
     {
-        // Saturate at zero if b > a.
-        if (a.compare(b) <= 0) {
-            if (a.compare(b) == 0) return Hydra{};
-            return Hydra{};   // b > a: underflow → 0 (unsigned sat)
-        }
-
         auto lv = a.limb_view();
         auto rv = b.limb_view();
+
+        if (lv.count == 0) return Hydra{};  // 0 - 0 = 0
 
         if (lv.count <= 4) {
             uint64_t out[4];
@@ -1495,6 +1553,38 @@ struct Hydra {
         uint32_t used = detail::sub_limbs(
             lv.ptr, lv.count, rv.ptr, rv.count, out.data());
         return from_limbs(out.data(), used);
+    }
+
+    // ── sign-aware addition helper (for non-hot-path) ───
+
+    [[nodiscard]] static Hydra add_signed(
+        const Hydra& a, const Hydra& b)
+    {
+        const bool a_neg = a.is_negative();
+        const bool b_neg = b.is_negative();
+
+        if (a_neg == b_neg) {
+            // Same sign: add magnitudes, keep the common sign.
+            Hydra r = add_magnitudes(a, b);
+            if (a_neg && r.limb_view().count > 0) r.set_negative();
+            return r;
+        }
+
+        // Opposite signs: subtract smaller magnitude from larger.
+        int c = a.compare_magnitude(b);
+        if (c == 0) return Hydra{};   // cancel out
+
+        if (c > 0) {
+            // |a| > |b|: result has sign of a
+            Hydra r = sub_magnitudes(a, b);
+            if (a_neg && r.limb_view().count > 0) r.set_negative();
+            return r;
+        } else {
+            // |b| > |a|: result has sign of b
+            Hydra r = sub_magnitudes(b, a);
+            if (b_neg && r.limb_view().count > 0) r.set_negative();
+            return r;
+        }
     }
 
     // ─────────────────────────────────────────────────────
@@ -1623,27 +1713,61 @@ struct Hydra {
     // inline and optimise them without seeing through virtual dispatch.
     // ─────────────────────────────────────────────────────
 
+    // ─────────────────────────────────────────────────────
+    // Unary operators
+    // ─────────────────────────────────────────────────────
+
+    [[nodiscard]] Hydra operator-() const {
+        Hydra r = *this;
+        r.negate();
+        return r;
+    }
+
+    [[nodiscard]] Hydra operator+() const { return *this; }
+
+    // ─────────────────────────────────────────────────────
+    // Binary arithmetic operators (sign-aware)
+    // ─────────────────────────────────────────────────────
+
     [[nodiscard]] friend Hydra operator+(const Hydra& a, const Hydra& b) {
-        // ── hot path ──────────────────────────────────────
-        if (a.is_small() && b.is_small()) [[likely]]
+        // ── hot path: both Small, both non-negative ─────
+        // (a.meta | b.meta) == 0 ⟹ both Kind::Small AND both sign-clear.
+        if ((a.meta | b.meta) == 0) [[likely]]
             return add_small_small(a.payload.small, b.payload.small);
 
-        // ── general path (all other Kind pairs) ──────────
-        return add_general(a, b);
+        // ── sign-aware general path ─────────────────────
+        return add_signed(a, b);
     }
 
     [[nodiscard]] friend Hydra operator-(const Hydra& a, const Hydra& b) {
-        if (a.is_small() && b.is_small()) [[likely]]
-            return sub_small_small(a.payload.small, b.payload.small);
+        // ── hot path: both Small, both non-negative ─────
+        if ((a.meta | b.meta) == 0) [[likely]] {
+            uint64_t av = a.payload.small, bv = b.payload.small;
+            if (av >= bv) return Hydra{av - bv};
+            // a < b → negative result
+            Hydra r{bv - av};
+            r.set_negative();
+            return r;
+        }
 
-        return sub_general(a, b);
+        // General: a - b = a + (-b)
+        Hydra neg_b = b;
+        neg_b.negate();
+        return add_signed(a, neg_b);
     }
 
     [[nodiscard]] friend Hydra operator*(const Hydra& a, const Hydra& b) {
-        if (a.is_small() && b.is_small()) [[likely]]
-            return mul_small_small(a.payload.small, b.payload.small);
+        const bool sign = a.is_negative() != b.is_negative();
 
-        return mul_general(a, b);
+        // ── hot path: both Small (magnitudes) ───────────
+        Hydra r;
+        if (a.is_small() && b.is_small()) [[likely]]
+            r = mul_small_small(a.payload.small, b.payload.small);
+        else
+            r = mul_general(a, b);
+
+        if (sign && r.limb_view().count > 0) r.set_negative();
+        return r;
     }
 
     // Compound assignment
@@ -1664,8 +1788,10 @@ struct Hydra {
     //   s = a[i] + b[i] + carry happen before the write to out[i].
     //
     Hydra& operator+=(const Hydra& rhs) {
-        // ── fast path: this is Large and capacity is sufficient ───
-        if (is_large()) {
+        // ── fast path: this is Large, same sign, capacity sufficient ───
+        // The same-sign guard ensures we always add magnitudes (never
+        // subtract), so the existing aliasing-safe add_limbs path works.
+        if (is_large() && is_negative() == rhs.is_negative()) {
             auto lv = limb_view();          // snapshot *before* mutation
             auto rv = rhs.limb_view();
             uint32_t max_limbs = std::max(lv.count, rv.count) + 1;
@@ -1779,6 +1905,96 @@ struct Hydra {
 
     Hydra& operator<<=(unsigned shift) { return *this = *this << shift; }
     Hydra& operator>>=(unsigned shift) { return *this = *this >> shift; }
+
+    // ─────────────────────────────────────────────────────
+    // Bitwise operators (&, |, ^, ~)
+    //
+    // &, |, ^ operate on non-negative operands only.
+    // Throws std::domain_error on negative inputs.
+    //
+    // ~ uses the two's complement identity: ~x = -(x + 1)
+    // This is the standard infinite-precision semantic
+    // (matches Python, Java BigInteger).
+    // ─────────────────────────────────────────────────────
+
+    [[nodiscard]] Hydra operator~() const {
+        // ~x = -(x + 1) for non-negative x
+        // ~(-x) = x - 1  for negative x (since ~(~y) = y)
+        if (is_negative()) {
+            // ~(-|x|) = |x| - 1
+            Hydra mag = *this;
+            mag.clear_sign();
+            return mag - Hydra{1u};
+        }
+        // ~(+x) = -(x + 1)
+        Hydra r = *this + Hydra{1u};
+        r.set_negative();
+        return r;
+    }
+
+    [[nodiscard]] friend Hydra operator&(const Hydra& a, const Hydra& b) {
+        if (a.is_negative() || b.is_negative())
+            throw std::domain_error("Hydra: bitwise & requires non-negative operands");
+        auto lv = a.limb_view();
+        auto rv = b.limb_view();
+        uint32_t n = std::min(lv.count, rv.count);
+        if (n == 0) return Hydra{};
+
+        if (n <= 4) {
+            uint64_t out[4];
+            for (uint32_t i = 0; i < n; ++i) out[i] = lv.ptr[i] & rv.ptr[i];
+            return from_limbs(out, n);
+        }
+        std::vector<uint64_t> out(n);
+        for (uint32_t i = 0; i < n; ++i) out[i] = lv.ptr[i] & rv.ptr[i];
+        return from_limbs(out.data(), n);
+    }
+
+    [[nodiscard]] friend Hydra operator|(const Hydra& a, const Hydra& b) {
+        if (a.is_negative() || b.is_negative())
+            throw std::domain_error("Hydra: bitwise | requires non-negative operands");
+        auto lv = a.limb_view();
+        auto rv = b.limb_view();
+        uint32_t n = std::max(lv.count, rv.count);
+        if (n == 0) return Hydra{};
+
+        auto fetch = [](const LimbView& v, uint32_t i) -> uint64_t {
+            return (i < v.count) ? v.ptr[i] : 0u;
+        };
+        if (n <= 4) {
+            uint64_t out[4];
+            for (uint32_t i = 0; i < n; ++i) out[i] = fetch(lv, i) | fetch(rv, i);
+            return from_limbs(out, n);
+        }
+        std::vector<uint64_t> out(n);
+        for (uint32_t i = 0; i < n; ++i) out[i] = fetch(lv, i) | fetch(rv, i);
+        return from_limbs(out.data(), n);
+    }
+
+    [[nodiscard]] friend Hydra operator^(const Hydra& a, const Hydra& b) {
+        if (a.is_negative() || b.is_negative())
+            throw std::domain_error("Hydra: bitwise ^ requires non-negative operands");
+        auto lv = a.limb_view();
+        auto rv = b.limb_view();
+        uint32_t n = std::max(lv.count, rv.count);
+        if (n == 0) return Hydra{};
+
+        auto fetch = [](const LimbView& v, uint32_t i) -> uint64_t {
+            return (i < v.count) ? v.ptr[i] : 0u;
+        };
+        if (n <= 4) {
+            uint64_t out[4];
+            for (uint32_t i = 0; i < n; ++i) out[i] = fetch(lv, i) ^ fetch(rv, i);
+            return from_limbs(out, n);
+        }
+        std::vector<uint64_t> out(n);
+        for (uint32_t i = 0; i < n; ++i) out[i] = fetch(lv, i) ^ fetch(rv, i);
+        return from_limbs(out.data(), n);
+    }
+
+    Hydra& operator&=(const Hydra& o) { return *this = *this & o; }
+    Hydra& operator|=(const Hydra& o) { return *this = *this | o; }
+    Hydra& operator^=(const Hydra& o) { return *this = *this ^ o; }
 
     // ─────────────────────────────────────────────────────
     // Scalar division and modulo
@@ -1908,6 +2124,8 @@ struct Hydra {
     // Returns decimal string representation.
     // (Slow — for debugging only; not optimised.)
     [[nodiscard]] std::string to_string() const {
+        const bool neg = is_negative();
+
         if (is_small()) {
             if (payload.small == 0) return "0";
             char buf[22];
@@ -1918,18 +2136,20 @@ struct Hydra {
                 buf[--i] = '0' + static_cast<char>(v % 10);
                 v /= 10;
             }
+            if (neg) buf[--i] = '-';
             return std::string(buf + i);
         }
-        // Medium / Large: repeated short division by 10 via mod_u64/div_u64.
-        // Each iteration is O(n) with zero heap activity for mod_u64,
-        // and one LargeRep allocation for div_u64 (on the heap path).
+        // Medium / Large: work on magnitude via mod_u64/div_u64.
+        // These methods operate on limb_view (magnitude), sign-unaware.
         Hydra copy = *this;
+        copy.clear_sign();  // work on positive magnitude
         std::string digits;
         digits.reserve(64);
         while (copy.limb_count() > 0) {
             digits.push_back('0' + static_cast<char>(copy.mod_u64(10)));
             copy = copy.div_u64(10);
         }
+        if (neg) digits.push_back('-');
         std::reverse(digits.begin(), digits.end());
         return digits.empty() ? "0" : digits;
     }
@@ -1964,15 +2184,39 @@ inline Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const {
     if (uv.count == 0)
         return { Hydra{}, Hydra{} };
 
-    // ── Ordering short-circuits ─────────────────────────
-    const int cmp = compare(divisor);
-    if (cmp < 0)  return { Hydra{}, *this };      // q = 0, r = self
-    if (cmp == 0) return { Hydra{1u}, Hydra{} };  // q = 1, r = 0
+    // ── Sign handling (truncation toward zero) ──────────
+    //
+    // C++ semantics:
+    //   quotient sign  = sign(dividend) XOR sign(divisor)
+    //   remainder sign = sign(dividend)
+    //   invariant: dividend == divisor * quotient + remainder
+    //
+    const bool u_neg = is_negative();
+    const bool v_neg = divisor.is_negative();
+    const bool q_neg = u_neg != v_neg;     // quotient sign
+    const bool r_neg = u_neg;              // remainder sign
+
+    // ── Magnitude ordering short-circuits ───────────────
+    const int cmp = compare_magnitude(divisor);
+    if (cmp < 0)  {
+        // |dividend| < |divisor| → q=0, r=dividend (preserve dividend sign)
+        return { Hydra{}, *this };
+    }
+    if (cmp == 0) {
+        // |dividend| == |divisor| → q=±1, r=0
+        Hydra q{1u};
+        if (q_neg) q.set_negative();
+        return { q, Hydra{} };
+    }
 
     // ── Single-limb divisor: delegate to scalar path ───
     if (dv.count == 1) {
         const uint64_t d = dv.ptr[0];
-        return { div_u64(d), Hydra{ mod_u64(d) } };
+        Hydra q = div_u64(d);     // magnitude quotient
+        Hydra r{mod_u64(d)};      // magnitude remainder
+        if (q_neg && q.limb_view().count > 0) q.set_negative();
+        if (r_neg && r.limb_view().count > 0) r.set_negative();
+        return { q, r };
     }
 
     // ── General multi-limb case: Knuth Algorithm D ─────
@@ -1980,14 +2224,6 @@ inline Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const {
     const uint32_t nv = dv.count;
     const uint32_t nq = nu - nv + 1;
 
-    // Scratch sizing:
-    //   q_buf:    nq      limbs  (quotient)
-    //   r_buf:    nv      limbs  (remainder)
-    //   work_buf: nu+1+nv limbs  (u_norm | v_norm scratch)
-    //
-    // Stack budget: nu ≤ 32 → q ≤ 32, r ≤ 32, work ≤ 65.
-    // Total ~1032 bytes — well within frame budget, zero
-    // heap activity for the common case.
     constexpr uint32_t STACK_LIMIT = 32;
 
     uint64_t  q_stack[STACK_LIMIT + 1];
@@ -2018,12 +2254,12 @@ inline Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const {
         dv.ptr, nv,
         q_buf, r_buf, work_buf);
 
-    // from_limbs trims trailing zeros and picks the smallest
-    // valid tier — no explicit normalize() needed.
-    return {
-        Hydra::from_limbs(q_buf, nq),
-        Hydra::from_limbs(r_buf, nv),
-    };
+    // Build magnitude results, then apply signs.
+    Hydra q = Hydra::from_limbs(q_buf, nq);
+    Hydra r = Hydra::from_limbs(r_buf, nv);
+    if (q_neg && q.limb_view().count > 0) q.set_negative();
+    if (r_neg && r.limb_view().count > 0) r.set_negative();
+    return { q, r };
 }
 
 inline Hydra Hydra::div(const Hydra& divisor) const {

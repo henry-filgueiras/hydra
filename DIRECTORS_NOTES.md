@@ -78,11 +78,13 @@ stack-allocated buffers for result sizes ≤ 4 (add) or ≤ 6 (mul) limbs,
 avoiding heap allocation for everything up to 256- and 384-bit results
 respectively.
 
-#### Subtraction Saturates at Zero (Phase 1)
+#### ~~Subtraction Saturates at Zero (Phase 1)~~ → Signed Subtraction (Phase 2)
 
-Unsigned saturating subtraction: `a - b` where `b > a` returns 0. Signed
-arithmetic is reserved for phase 2 (the sign bit in metadata is already
-allocated at bit 2).
+~~Unsigned saturating subtraction: `a - b` where `b > a` returns 0.~~
+**Phase 2 update (2026-04-16):** Subtraction now produces signed results.
+`Hydra{3} - Hydra{10}` returns `Hydra{-7}`.  The sign bit in metadata
+(bit 2) is fully interpreted.  See "Signed Arithmetic + Semantic
+Completeness" in Current Canon for the full design.
 
 ---
 
@@ -993,11 +995,171 @@ recursion-path heap explosion.
 
 ---
 
+### Signed Arithmetic + Semantic Completeness (Phase 2)
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+The sign bit (meta bit 2, `bits::SIGN_BIT`) is now fully interpreted.
+Hydra uses **sign-magnitude representation**: the limb array holds
+|value| and the sign bit encodes the sign.  This was chosen because all
+existing kernels (`add_limbs`, `sub_limbs`, `mul_limbs`, `divmod_knuth_limbs`)
+are magnitude-only — sign-magnitude lets the signed layer dispatch to
+existing kernels without modifying them.
+
+#### Core design invariant
+
+**Zero is always non-negative.**  `normalize()` clears the sign bit
+when the magnitude is zero.  Every constructor, factory, and arithmetic
+result maintains this invariant.  This avoids the semantic ambiguity of
+"positive zero" vs "negative zero" and makes comparison trivially
+correct.
+
+#### Signed constructors
+
+Template constructors for both `std::unsigned_integral` (existing) and
+`std::signed_integral` (new) provide implicit conversion from all native
+integer types.  The signed constructor handles `INT64_MIN` correctly via
+the unsigned two's-complement identity:
+
+```cpp
+uint64_t mag = 0ull - static_cast<uint64_t>(static_cast<int64_t>(v));
+```
+
+This is well-defined for all signed types including `INT64_MIN` (where
+the negation wraps to `2^63` as desired).
+
+#### Native interop
+
+Because constructors from signed and unsigned integral types are
+implicit (non-`explicit`), all existing binary operators (`+`, `-`, `*`,
+`<=>`, `==`, etc.) work with native types automatically via implicit
+conversion.  `Hydra a{5}; a + (-3);` promotes `-3` to `Hydra{-3}` and
+dispatches through the signed addition path.
+
+No explicit operator overloads for `uint64_t`/`int64_t` were needed.
+The implicit-conversion cost for Small values is zero (one meta-word
+write + one payload write, both register-width).
+
+#### Signed addition / subtraction
+
+The hot path (`(a.meta | b.meta) == 0`) catches the common case: both
+operands Small AND both non-negative.  This is a single `or`+`jnz`
+instruction pair — identical to the prior `is_small() && is_small()`
+check but also rules out negatives in zero extra work.
+
+The sign-aware general path dispatches on the sign pair:
+
+- **Same sign**: add magnitudes, keep sign → reuses `add_magnitudes()`
+  (formerly `add_general`).
+- **Opposite signs**: compare magnitudes → subtract smaller from larger
+  → apply sign of the larger magnitude → reuses `sub_magnitudes()`
+  (formerly `sub_general`, with the saturation-at-zero behavior removed).
+
+Subtraction is defined as `a - b = a + (-b)` — flip the sign of `b`
+and call the signed addition path.
+
+The `operator+=` fast path is restricted to same-sign operands (where
+magnitude addition is correct and the aliasing argument still holds).
+Opposite-sign `+=` falls back to `*this = *this + rhs`.
+
+**Behavioral change**: `sub_general` no longer saturates at zero.
+`Hydra{3} - Hydra{10}` now returns `Hydra{-7}`.  All prior code
+consuming subtraction results was unsigned-only, so this is a clean
+semantic upgrade with no backward-compatibility risk.
+
+#### Signed multiplication
+
+`operator*` XORs the signs of the operands and applies to the magnitude
+product.  The magnitude product is computed by the existing unsigned
+`mul_small_small` / `mul_general` kernels — no kernel changes.
+
+#### Signed division (truncation toward zero)
+
+Follows standard C++ truncation-toward-zero semantics:
+
+- `quotient sign = sign(dividend) XOR sign(divisor)`
+- `remainder sign = sign(dividend)`
+- `|remainder| < |divisor|`
+- **Invariant**: `dividend == divisor * quotient + remainder`
+
+The Knuth D kernel itself is unchanged — it operates on magnitudes.
+The `divmod()` method strips signs before dispatch, then applies them
+to the results.  `div_u64` and `mod_u64` are magnitude-only and
+called via the single-limb delegation path with signs applied afterward.
+
+#### Signed comparison
+
+`compare()` dispatches on the sign pair first:
+
+- Different signs: positive > negative (no magnitude comparison needed).
+- Same sign, both non-negative: magnitude comparison as before.
+- Same sign, both negative: **reversed** magnitude comparison
+  (`-3 > -10` because `|3| < |10|`).
+
+`compare_magnitude()` (new) provides sign-unaware magnitude comparison
+for internal use by division and signed addition.
+
+#### Bitwise operators
+
+- `&`, `|`, `^`: operate on magnitudes of **non-negative** operands.
+  Throw `std::domain_error` on negative inputs.  This is the
+  minimum-viable semantic; infinite-two's-complement semantics for
+  negative operands are a Phase-3 candidate.
+- `~x`: uses the two's-complement identity `~x = -(x + 1)`.  This is
+  the standard infinite-precision interpretation (Python, Java
+  BigInteger).  Works for both positive and negative operands:
+  `~5 = -6`, `~(-6) = 5`, `~~x = x`.
+- Compound assigns `&=`, `|=`, `^=` delegate to the binary operators.
+
+#### Test coverage
+
+128 new assertions across 65 new test functions:
+
+- Signed construction: `int8_t`, `int16_t`, `int32_t`, `int64_t`,
+  `INT64_MIN`, `INT64_MAX`
+- Signed `+`, `-`, `*`: positive×positive, negative×negative,
+  mixed-sign, cancel-to-zero, Large-tier cross-sign
+- Signed `divmod`: all four sign combinations (`++`, `-+`, `+-`, `--`),
+  exact divisibility, dividend-smaller, Large-tier invariant,
+  `INT64_MIN / (-1)` overflow into Medium
+- Unary negation: positive, negative, zero, double-negate
+- Comparison: all 6 operators across positive, negative, zero, and
+  Large-tier signed values; mixed `Hydra`-vs-`int` literal
+- Native interop: `Hydra + int`, `Hydra - int`, `Hydra * -int`,
+  comparison with `uint64_t` and `int64_t`
+- Bitwise: `&`, `|`, `^` for Small, Medium, Large; `~` for positive
+  and negative; roundtrip `~~x == x`; compound assigns; throws on
+  negative
+- Normalize sign preservation: Large→Small demotion, zero clears sign
+- Adversarial: negative overflow to Medium, Medium→Small signed
+  subtraction, `INT64_MIN / (-1)` producing Medium-tier quotient
+
+All 607 tests (479 prior + 128 new) pass at `-O0` with ASan+UBSan and
+at `-O2`.
+
+#### Performance verification
+
+Mul dispatch profile and Knuth-D profile re-run after landing.
+All numbers match prior measurements within run-to-run noise:
+
+- Below-threshold schoolbook dispatch: ±1 ns (noise)
+- Karatsuba dispatch: ±5 ns (noise)
+- Division kernel: ±3 ns (noise)
+
+The signed hot path check `(a.meta | b.meta) == 0` is a single
+`or`+branch pair — no measurable overhead vs the prior
+`is_small() && is_small()` check.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 
-- **No signed arithmetic.** Sign bit (meta bit 2) is allocated but ignored.
+- ~~**No signed arithmetic.** Sign bit (meta bit 2) is allocated but ignored.~~
+  **Landed 2026-04-16** — full signed arithmetic with sign-magnitude
+  representation.  See "Signed Arithmetic + Semantic Completeness"
+  above.
 - ~~**No full Hydra÷Hydra division.**~~ **Landed 2026-04-16** as Knuth
   Algorithm D in `detail::divmod_knuth_limbs` with `Hydra::divmod`/`div`/`mod`
   public API. See "Full Hydra÷Hydra Division" above.

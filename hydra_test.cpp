@@ -1149,6 +1149,533 @@ static void test_div_u64_result_normalized_to_small() {
     CHECK(q.to_u64() == UINT64_MAX, "div_u64 quotient value correct");
 }
 
+// ── signed arithmetic, native interop, comparison, bitwise tests ─────
+
+// ── Signed construction ────────────────────────────────────────────
+
+static void test_signed_constructor_positive() {
+    Hydra a{42};       // int
+    CHECK(a.to_string() == "42", "Hydra(42) == 42");
+    CHECK(!a.is_negative(), "Hydra(42) is not negative");
+}
+
+static void test_signed_constructor_negative() {
+    Hydra a{-7};
+    CHECK(a.to_string() == "-7", "Hydra(-7) == -7");
+    CHECK(a.is_negative(), "Hydra(-7) is negative");
+}
+
+static void test_signed_constructor_zero() {
+    Hydra a{0};
+    CHECK(a.to_string() == "0", "Hydra(0) == 0");
+    CHECK(!a.is_negative(), "Hydra(0) is not negative");
+}
+
+static void test_signed_constructor_int64_min() {
+    // INT64_MIN = -9223372036854775808
+    Hydra a{INT64_MIN};
+    CHECK(a.is_negative(), "INT64_MIN is negative");
+    CHECK(a.to_string() == "-9223372036854775808", "INT64_MIN to_string");
+}
+
+static void test_signed_constructor_int64_max() {
+    Hydra a{INT64_MAX};
+    CHECK(!a.is_negative(), "INT64_MAX is positive");
+    CHECK(a.to_string() == "9223372036854775807", "INT64_MAX to_string");
+}
+
+static void test_signed_constructor_int8() {
+    Hydra a{int8_t{-128}};
+    CHECK(a.to_string() == "-128", "int8_t(-128) to_string");
+}
+
+static void test_signed_constructor_int16() {
+    Hydra a{int16_t{-32768}};
+    CHECK(a.to_string() == "-32768", "int16_t(-32768) to_string");
+}
+
+static void test_signed_constructor_int32() {
+    Hydra a{int32_t{-2147483648}};
+    CHECK(a.to_string() == "-2147483648", "int32_t(INT32_MIN) to_string");
+}
+
+// ── Signed addition ────────────────────────────────────────────────
+
+static void test_signed_add_pos_pos() {
+    Hydra a{5}, b{3};
+    CHECK((a + b).to_string() == "8", "5 + 3 == 8");
+}
+
+static void test_signed_add_neg_neg() {
+    Hydra a{-5}, b{-3};
+    CHECK((a + b).to_string() == "-8", "-5 + -3 == -8");
+}
+
+static void test_signed_add_pos_neg_pos_wins() {
+    Hydra a{10}, b{-3};
+    CHECK((a + b).to_string() == "7", "10 + (-3) == 7");
+}
+
+static void test_signed_add_pos_neg_neg_wins() {
+    Hydra a{3}, b{-10};
+    CHECK((a + b).to_string() == "-7", "3 + (-10) == -7");
+}
+
+static void test_signed_add_cancel_to_zero() {
+    Hydra a{42}, b{-42};
+    Hydra c = a + b;
+    CHECK(c.to_string() == "0", "42 + (-42) == 0");
+    CHECK(!c.is_negative(), "42 + (-42) is not negative");
+}
+
+static void test_signed_add_large_neg() {
+    Hydra a = make_large(4, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    b.negate();  // b is negative
+    // a + (-b) = a - |b|
+    Hydra c = a + b;
+    // If |a| > |b|: positive; else negative
+    // Doesn't matter which — check invariant
+    Hydra d = c - a;
+    CHECK(d == b, "signed add/sub roundtrip with Large");
+}
+
+// ── Signed subtraction ─────────────────────────────────────────────
+
+static void test_signed_sub_to_negative() {
+    Hydra a{3u}, b{10u};
+    Hydra c = a - b;
+    CHECK(c.to_string() == "-7", "3 - 10 == -7");
+    CHECK(c.is_negative(), "3 - 10 is negative");
+}
+
+static void test_signed_sub_neg_from_pos() {
+    Hydra a{5}, b{-3};
+    CHECK((a - b).to_string() == "8", "5 - (-3) == 8");
+}
+
+static void test_signed_sub_neg_from_neg() {
+    Hydra a{-5}, b{-3};
+    CHECK((a - b).to_string() == "-2", "-5 - (-3) == -2");
+}
+
+static void test_signed_sub_symmetric() {
+    Hydra a{42u}, b{58u};
+    Hydra c = a - b;
+    Hydra d = b - a;
+    CHECK(c.to_string() == "-16", "42 - 58 == -16");
+    CHECK(d.to_string() == "16", "58 - 42 == 16");
+    CHECK((c + d).to_string() == "0", "(a-b) + (b-a) == 0");
+}
+
+// ── Signed multiplication ──────────────────────────────────────────
+
+static void test_signed_mul_pos_pos() {
+    Hydra a{7}, b{6};
+    CHECK((a * b).to_string() == "42", "7 * 6 == 42");
+}
+
+static void test_signed_mul_pos_neg() {
+    Hydra a{7}, b{-6};
+    CHECK((a * b).to_string() == "-42", "7 * (-6) == -42");
+}
+
+static void test_signed_mul_neg_neg() {
+    Hydra a{-7}, b{-6};
+    CHECK((a * b).to_string() == "42", "(-7) * (-6) == 42");
+}
+
+static void test_signed_mul_neg_zero() {
+    Hydra a{-7}, b{0};
+    Hydra c = a * b;
+    CHECK(c.to_string() == "0", "(-7) * 0 == 0");
+    CHECK(!c.is_negative(), "(-7) * 0 is not negative");
+}
+
+static void test_signed_mul_large_cross_sign() {
+    Hydra a = make_large(4, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    b.negate();
+    Hydra c = a * b;
+    CHECK(c.is_negative(), "positive * negative → negative");
+    Hydra d = a * (-b);  // a * |b|
+    Hydra e = -c;        // |a*b|
+    CHECK(d == e, "a * |b| == |a * (-b)|");
+}
+
+// ── Signed division (truncation toward zero) ───────────────────────
+
+static void test_signed_divmod_pos_pos() {
+    Hydra a{7}, b{3};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "2", "7 / 3 == 2");
+    CHECK(r.to_string() == "1", "7 % 3 == 1");
+    CHECK(a == b * q + r, "7 == 3*2 + 1 invariant");
+}
+
+static void test_signed_divmod_neg_pos() {
+    // -7 / 3 → q = -2, r = -1  (truncate toward zero)
+    Hydra a{-7}, b{3};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "-2", "-7 / 3 == -2");
+    CHECK(r.to_string() == "-1", "-7 % 3 == -1");
+    CHECK(a == b * q + r, "-7 == 3*(-2) + (-1) invariant");
+}
+
+static void test_signed_divmod_pos_neg() {
+    // 7 / -3 → q = -2, r = 1
+    Hydra a{7}, b{-3};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "-2", "7 / (-3) == -2");
+    CHECK(r.to_string() == "1", "7 % (-3) == 1");
+    CHECK(a == b * q + r, "7 == (-3)*(-2) + 1 invariant");
+}
+
+static void test_signed_divmod_neg_neg() {
+    // -7 / -3 → q = 2, r = -1
+    Hydra a{-7}, b{-3};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "2", "(-7) / (-3) == 2");
+    CHECK(r.to_string() == "-1", "(-7) % (-3) == -1");
+    CHECK(a == b * q + r, "-7 == (-3)*2 + (-1) invariant");
+}
+
+static void test_signed_divmod_exact() {
+    Hydra a{-12}, b{4};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "-3", "-12 / 4 == -3");
+    CHECK(r.to_string() == "0", "-12 % 4 == 0");
+    CHECK(!r.is_negative(), "remainder 0 is not negative");
+    CHECK(a == b * q + r, "-12 == 4 * (-3) + 0 invariant");
+}
+
+static void test_signed_divmod_dividend_smaller() {
+    Hydra a{-2}, b{5};
+    auto [q, r] = a.divmod(b);
+    CHECK(q.to_string() == "0", "-2 / 5 == 0");
+    CHECK(r.to_string() == "-2", "-2 % 5 == -2");
+    CHECK(a == b * q + r, "-2 == 5*0 + (-2) invariant");
+}
+
+static void test_signed_divmod_large_invariant() {
+    Hydra a = make_large(8, 0xAAAA);
+    a.negate();
+    Hydra b = make_large(4, 0xBBBB);
+    auto [q, r] = a.divmod(b);
+    // invariant: a == b * q + r
+    CHECK(a == b * q + r, "signed large divmod invariant");
+    CHECK(q.is_negative(), "negative / positive → negative quotient");
+}
+
+// ── Unary negation ─────────────────────────────────────────────────
+
+static void test_negate_positive() {
+    Hydra a{42};
+    Hydra b = -a;
+    CHECK(b.to_string() == "-42", "-(42) == -42");
+}
+
+static void test_negate_negative() {
+    Hydra a{-42};
+    Hydra b = -a;
+    CHECK(b.to_string() == "42", "-(-42) == 42");
+}
+
+static void test_negate_zero() {
+    Hydra a{0};
+    Hydra b = -a;
+    CHECK(b.to_string() == "0", "-(0) == 0");
+    CHECK(!b.is_negative(), "-(0) is not negative");
+}
+
+static void test_double_negate() {
+    Hydra a{-999};
+    CHECK((-(-a)) == a, "--a == a");
+}
+
+// ── Comparison completeness ────────────────────────────────────────
+
+static void test_cmp_pos_neg() {
+    Hydra a{5}, b{-5};
+    CHECK(a > b, "5 > -5");
+    CHECK(b < a, "-5 < 5");
+    CHECK(a != b, "5 != -5");
+    CHECK(a >= b, "5 >= -5");
+    CHECK(b <= a, "-5 <= 5");
+}
+
+static void test_cmp_neg_neg() {
+    Hydra a{-3}, b{-10};
+    CHECK(a > b, "-3 > -10");
+    CHECK(b < a, "-10 < -3");
+}
+
+static void test_cmp_zero_neg() {
+    Hydra a{0}, b{-1};
+    CHECK(a > b, "0 > -1");
+    CHECK(a >= b, "0 >= -1");
+}
+
+static void test_cmp_equal_neg() {
+    Hydra a{-42}, b{-42};
+    CHECK(a == b, "-42 == -42");
+    CHECK(a >= b, "-42 >= -42");
+    CHECK(a <= b, "-42 <= -42");
+}
+
+static void test_cmp_with_int_literal() {
+    Hydra a{100};
+    CHECK(a > 50, "Hydra{100} > 50");
+    CHECK(a == 100, "Hydra{100} == 100");
+    CHECK(a < 200, "Hydra{100} < 200");
+    CHECK(a > -5, "Hydra{100} > -5");
+}
+
+static void test_cmp_large_signed() {
+    Hydra a = make_large(4, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    Hydra neg_b = -b;
+    CHECK(a > neg_b, "positive Large > negative Large");
+    CHECK(neg_b < Hydra{0}, "negative Large < 0");
+}
+
+// ── Native interop (mixed arithmetic) ──────────────────────────────
+
+static void test_interop_add_int() {
+    Hydra a{100u};
+    Hydra b = a + 50;
+    CHECK(b.to_string() == "150", "Hydra + int literal");
+}
+
+static void test_interop_sub_int() {
+    Hydra a{100u};
+    Hydra b = a - 150;
+    CHECK(b.to_string() == "-50", "Hydra(100) - 150 == -50");
+}
+
+static void test_interop_mul_int() {
+    Hydra a{7};
+    Hydra b = a * -6;
+    CHECK(b.to_string() == "-42", "Hydra(7) * -6 == -42");
+}
+
+static void test_interop_compare_u64() {
+    Hydra a{UINT64_MAX};
+    CHECK(a > 0u, "UINT64_MAX > 0");
+    CHECK(a == UINT64_MAX, "Hydra{UINT64_MAX} == UINT64_MAX");
+}
+
+static void test_interop_compare_i64() {
+    Hydra a{-1};
+    CHECK(a < 0u, "-1 < 0u (unsigned 0)");
+    CHECK(a == -1, "Hydra{-1} == -1");
+}
+
+static void test_interop_add_negative_int() {
+    Hydra a = make_large(4, 0x1234);
+    Hydra b = a + (-1);
+    Hydra c = a - Hydra{1u};
+    CHECK(b == c, "large + (-1) == large - 1");
+}
+
+// ── Bitwise operators ──────────────────────────────────────────────
+
+static void test_bitwise_and_basic() {
+    Hydra a{0xFF00u}, b{0x0FF0u};
+    Hydra c = a & b;
+    CHECK(c == Hydra{0x0F00u}, "0xFF00 & 0x0FF0 == 0x0F00");
+}
+
+static void test_bitwise_and_zero() {
+    Hydra a{42u}, b{0u};
+    CHECK((a & b) == Hydra{0u}, "x & 0 == 0");
+}
+
+static void test_bitwise_or_basic() {
+    Hydra a{0xFF00u}, b{0x00FFu};
+    CHECK((a | b) == Hydra{0xFFFFu}, "0xFF00 | 0x00FF == 0xFFFF");
+}
+
+static void test_bitwise_or_zero() {
+    Hydra a{42u};
+    CHECK((a | Hydra{0u}) == a, "x | 0 == x");
+}
+
+static void test_bitwise_xor_basic() {
+    Hydra a{0xAAAAu}, b{0x5555u};
+    CHECK((a ^ b) == Hydra{0xFFFFu}, "0xAAAA ^ 0x5555 == 0xFFFF");
+}
+
+static void test_bitwise_xor_self() {
+    Hydra a{42u};
+    CHECK((a ^ a) == Hydra{0u}, "x ^ x == 0");
+}
+
+static void test_bitwise_not_zero() {
+    Hydra a{0u};
+    Hydra b = ~a;
+    CHECK(b.to_string() == "-1", "~0 == -1");
+}
+
+static void test_bitwise_not_positive() {
+    Hydra a{0u};
+    Hydra b{5u};
+    Hydra c = ~b;  // ~5 = -(5+1) = -6
+    CHECK(c.to_string() == "-6", "~5 == -6");
+}
+
+static void test_bitwise_not_negative() {
+    Hydra a{-6};
+    Hydra b = ~a;  // ~(-6) = |-6|-1 = 5
+    CHECK(b.to_string() == "5", "~(-6) == 5");
+}
+
+static void test_bitwise_not_roundtrip() {
+    Hydra a{42u};
+    CHECK(~(~a) == a, "~~x == x");
+}
+
+static void test_bitwise_and_medium() {
+    // Medium (2-limb) AND
+    Hydra a = Hydra::make_medium(UINT64_MAX, 0xFF00FF00FF00FF00ull, 0, 2);
+    Hydra b = Hydra::make_medium(0x0F0F0F0F0F0F0F0Full, UINT64_MAX, 0, 2);
+    Hydra c = a & b;
+    auto lv = c.limb_view();
+    CHECK(lv.count == 2, "medium & medium → 2 limbs");
+    CHECK(lv.ptr[0] == 0x0F0F0F0F0F0F0F0Full, "AND limb 0");
+    CHECK(lv.ptr[1] == 0xFF00FF00FF00FF00ull, "AND limb 1");
+}
+
+static void test_bitwise_or_large() {
+    Hydra a = make_large(4, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    Hydra c = a | b;
+    // c should have all bits set that are in either a or b
+    CHECK((c & a) == a, "(a|b) & a == a");
+    CHECK((c & b) == b, "(a|b) & b == b");
+}
+
+static void test_bitwise_xor_large() {
+    Hydra a = make_large(4, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    Hydra c = a ^ b;
+    CHECK((c ^ a) == b, "(a^b) ^ a == b");
+    CHECK((c ^ b) == a, "(a^b) ^ b == a");
+}
+
+static void test_bitwise_negative_throws() {
+    Hydra a{-1}, b{1};
+    bool threw_and = false, threw_or = false, threw_xor = false;
+    try { (void)(a & b); } catch (const std::domain_error&) { threw_and = true; }
+    try { (void)(a | b); } catch (const std::domain_error&) { threw_or = true; }
+    try { (void)(a ^ b); } catch (const std::domain_error&) { threw_xor = true; }
+    CHECK(threw_and, "bitwise & with negative throws");
+    CHECK(threw_or, "bitwise | with negative throws");
+    CHECK(threw_xor, "bitwise ^ with negative throws");
+}
+
+static void test_bitwise_compound_assign() {
+    Hydra a{0xFF00u};
+    a &= Hydra{0x0FF0u};
+    CHECK(a == Hydra{0x0F00u}, "&= works");
+    a |= Hydra{0x000Fu};
+    CHECK(a == Hydra{0x0F0Fu}, "|= works");
+    a ^= Hydra{0xFFFFu};
+    CHECK(a == Hydra{0xF0F0u}, "^= works");
+}
+
+// ── Mixed-tier signed arithmetic ───────────────────────────────────
+
+static void test_signed_add_small_neg_plus_large() {
+    Hydra a{-1};
+    Hydra b = make_large(4, 0x1234);
+    Hydra c = a + b;
+    Hydra d = b + a;
+    CHECK(c == d, "commutativity: small neg + large");
+    // c should be b - 1
+    Hydra expected = b - Hydra{1u};
+    CHECK(c == expected, "(-1) + large == large - 1");
+}
+
+static void test_signed_mul_medium_neg_times_large() {
+    Hydra a = Hydra::make_medium(7, 1, 0, 2);
+    a.negate();
+    Hydra b = make_large(4, 0x5678);
+    Hydra c = a * b;
+    Hydra d = (-a) * b;
+    CHECK(c.is_negative(), "neg medium * pos large → negative");
+    CHECK((-c) == d, "|neg * pos| == |neg| * pos");
+}
+
+// ── Normalize preserves sign across tier demotion ──────────────────
+
+static void test_normalize_sign_large_to_small() {
+    // Build a Large with a single non-zero limb + sign bit.
+    auto* rep = LargeRep::create(8);
+    rep->used = 4;
+    rep->limbs()[0] = 42;
+    rep->limbs()[1] = 0;
+    rep->limbs()[2] = 0;
+    rep->limbs()[3] = 0;
+    Hydra a;
+    a.meta = Hydra::make_large_meta() | hydra::bits::SIGN_BIT;
+    a.payload.large = rep;
+    a.normalize();
+    CHECK(a.is_small(), "Large(1-limb) demotes to Small");
+    CHECK(a.is_negative(), "sign preserved across Large→Small");
+    CHECK(a.to_string() == "-42", "Large→Small with sign == -42");
+}
+
+static void test_normalize_sign_zero_clears() {
+    Hydra a{42u};
+    a.set_negative();
+    // Manually set payload to 0 (simulating a sub result)
+    a.payload.small = 0;
+    a.normalize();
+    CHECK(!a.is_negative(), "zero clears sign after normalize");
+}
+
+// ── Adversarial signed edge cases ──────────────────────────────────
+
+static void test_signed_add_overflow_to_medium() {
+    // UINT64_MAX + 1 as addition; now test -(UINT64_MAX) + (-1) → -UINT64_MAX-1
+    Hydra a{UINT64_MAX};
+    a.negate();  // -UINT64_MAX
+    Hydra b{-1};
+    Hydra c = a + b;
+    // Expected: -(UINT64_MAX + 1) = -(2^64)
+    CHECK(c.is_negative(), "negative overflow to medium");
+    CHECK(c.is_medium(), "negative overflow lands in medium");
+    // Magnitude should be 2^64 = [0, 1] in limbs
+    auto lv = c.limb_view();
+    CHECK(lv.count == 2, "magnitude has 2 limbs");
+    CHECK(lv.ptr[0] == 0, "limb 0 == 0");
+    CHECK(lv.ptr[1] == 1, "limb 1 == 1");
+}
+
+static void test_signed_sub_medium_to_small() {
+    // -2^64 - (-UINT64_MAX) = -(2^64) + UINT64_MAX = -(2^64 - UINT64_MAX) = -(1) = -1
+    Hydra a = Hydra::make_medium(0, 1, 0, 2);  // 2^64
+    a.negate();  // -2^64
+    Hydra b{UINT64_MAX};
+    b.negate();  // -UINT64_MAX
+    Hydra c = a - b;  // -2^64 - (-UINT64_MAX) = -2^64 + UINT64_MAX = -(2^64 - UINT64_MAX) = -1
+    CHECK(c.to_string() == "-1", "-2^64 - (-UINT64_MAX) == -1");
+    CHECK(c.is_small(), "result demotes to Small");
+}
+
+static void test_signed_divmod_int64_min_by_neg1() {
+    // INT64_MIN / (-1) = INT64_MAX + 1 = 2^63 (overflows int64_t but Hydra handles it)
+    Hydra a{INT64_MIN};
+    Hydra b{-1};
+    auto [q, r] = a.divmod(b);
+    // q = -INT64_MIN = 2^63 = 9223372036854775808
+    CHECK(q.to_string() == "9223372036854775808", "INT64_MIN / (-1) overflow into medium");
+    CHECK(r.to_string() == "0", "INT64_MIN % (-1) == 0");
+    CHECK(!r.is_negative(), "remainder 0 is not negative");
+    CHECK(a == b * q + r, "divmod invariant for INT64_MIN / -1");
+}
+
 // ── entry point ──────────────────────────────────────────────────────
 
 int main() {
@@ -1262,6 +1789,98 @@ int main() {
     test_divmod_512_over_256();
     test_divmod_1024_over_512();
     test_div_mod_delegate_consistency();
+
+    // Signed construction
+    test_signed_constructor_positive();
+    test_signed_constructor_negative();
+    test_signed_constructor_zero();
+    test_signed_constructor_int64_min();
+    test_signed_constructor_int64_max();
+    test_signed_constructor_int8();
+    test_signed_constructor_int16();
+    test_signed_constructor_int32();
+
+    // Signed addition
+    test_signed_add_pos_pos();
+    test_signed_add_neg_neg();
+    test_signed_add_pos_neg_pos_wins();
+    test_signed_add_pos_neg_neg_wins();
+    test_signed_add_cancel_to_zero();
+    test_signed_add_large_neg();
+
+    // Signed subtraction
+    test_signed_sub_to_negative();
+    test_signed_sub_neg_from_pos();
+    test_signed_sub_neg_from_neg();
+    test_signed_sub_symmetric();
+
+    // Signed multiplication
+    test_signed_mul_pos_pos();
+    test_signed_mul_pos_neg();
+    test_signed_mul_neg_neg();
+    test_signed_mul_neg_zero();
+    test_signed_mul_large_cross_sign();
+
+    // Signed division (truncation toward zero)
+    test_signed_divmod_pos_pos();
+    test_signed_divmod_neg_pos();
+    test_signed_divmod_pos_neg();
+    test_signed_divmod_neg_neg();
+    test_signed_divmod_exact();
+    test_signed_divmod_dividend_smaller();
+    test_signed_divmod_large_invariant();
+
+    // Unary negation
+    test_negate_positive();
+    test_negate_negative();
+    test_negate_zero();
+    test_double_negate();
+
+    // Comparison completeness
+    test_cmp_pos_neg();
+    test_cmp_neg_neg();
+    test_cmp_zero_neg();
+    test_cmp_equal_neg();
+    test_cmp_with_int_literal();
+    test_cmp_large_signed();
+
+    // Native interop
+    test_interop_add_int();
+    test_interop_sub_int();
+    test_interop_mul_int();
+    test_interop_compare_u64();
+    test_interop_compare_i64();
+    test_interop_add_negative_int();
+
+    // Bitwise operators
+    test_bitwise_and_basic();
+    test_bitwise_and_zero();
+    test_bitwise_or_basic();
+    test_bitwise_or_zero();
+    test_bitwise_xor_basic();
+    test_bitwise_xor_self();
+    test_bitwise_not_zero();
+    test_bitwise_not_positive();
+    test_bitwise_not_negative();
+    test_bitwise_not_roundtrip();
+    test_bitwise_and_medium();
+    test_bitwise_or_large();
+    test_bitwise_xor_large();
+    test_bitwise_negative_throws();
+    test_bitwise_compound_assign();
+
+    // Mixed-tier signed
+    test_signed_add_small_neg_plus_large();
+    test_signed_mul_medium_neg_times_large();
+
+    // Normalize preserves sign
+    test_normalize_sign_large_to_small();
+    test_normalize_sign_zero_clears();
+
+    // Adversarial signed edge cases
+    test_signed_add_overflow_to_medium();
+    test_signed_sub_medium_to_small();
+    test_signed_divmod_int64_min_by_neg1();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
