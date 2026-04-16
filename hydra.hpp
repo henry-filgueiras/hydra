@@ -1316,20 +1316,20 @@ inline void montgomery_mul_fused(
     }
 
     // Result is in work[0..k-1], with possible overflow in work[k].
-    // Conditional subtraction: if work[0..k] >= mod, subtract mod.
+    const uint64_t* T = work;
+
     bool need_sub = false;
-    if (work[k] != 0) {
+    if (T[k] != 0) {
         need_sub = true;
     } else {
         for (uint32_t i = k; i-- > 0;) {
-            if (work[i] > mod[i]) { need_sub = true; break; }
-            if (work[i] < mod[i]) { need_sub = false; break; }
+            if (T[i] > mod[i]) { need_sub = true; break; }
+            if (T[i] < mod[i]) { need_sub = false; break; }
         }
-        // If all equal, work == mod → subtract
         if (!need_sub) {
             bool all_equal = true;
             for (uint32_t i = 0; i < k; ++i) {
-                if (work[i] != mod[i]) { all_equal = false; break; }
+                if (T[i] != mod[i]) { all_equal = false; break; }
             }
             if (all_equal) need_sub = true;
         }
@@ -1338,7 +1338,7 @@ inline void montgomery_mul_fused(
     if (need_sub) {
         uint64_t borrow = 0;
         for (uint32_t i = 0; i < k; ++i) {
-            uint64_t wi = work[i];
+            uint64_t wi = T[i];
             uint64_t mi = mod[i];
             uint64_t d1 = wi - mi;
             uint64_t b1 = (d1 > wi) ? 1u : 0u;
@@ -1348,7 +1348,7 @@ inline void montgomery_mul_fused(
             borrow = b1 + b2;
         }
     } else {
-        std::memcpy(out, work, k * sizeof(uint64_t));
+        std::memcpy(out, T, k * sizeof(uint64_t));
     }
 }
 
@@ -3143,6 +3143,13 @@ struct EGCDResult {
     // Fused CIOS kernels need only k+2 limbs of scratch (vs 2k+1 for
     // the separate mul+REDC path).  We still need 2k+1 for from_montgomery
     // which uses the non-fused REDC, so work_buf is sized to the max.
+    //
+    // Note: the per-row limb shift in CIOS was investigated as a potential
+    // bottleneck.  Offset-tracking (sliding pointer into 2k+1 buffer)
+    // helped at 512/1024 but regressed at 2048/4096 due to cache pressure.
+    // Ring-buffer modular indexing was worse.  The compiler already handles
+    // the simple shift loop efficiently.  Conclusion: the shift is not
+    // the dominant cost; the O(k²) multiply-accumulate is.
     //
     // Dispatch threshold: fused CIOS wins at k >= 8 (512+ bits) due to
     // better cache locality and fewer memory passes.  At small k, the

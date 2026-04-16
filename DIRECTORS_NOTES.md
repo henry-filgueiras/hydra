@@ -2298,4 +2298,57 @@ at 2048-bit, 30-40% at 4096-bit.
 
 ---
 
+### Dragon — CIOS Per-Row Shift/Memmove Tax (Null Result)
+
+_Investigated 2026-04-16 — Claude Opus 4.6_
+_Status: **HYPOTHESIS REJECTED** — the per-row shift is not a material bottleneck._
+
+#### Hypothesis
+
+The fused CIOS kernel shifts k+1 limbs per row (lines 1312-1315 of
+`montgomery_mul_fused`).  Over k outer rows, that's O(k²) 64-bit copies.
+At k=16 (1024-bit) this is ~272 copies; at k=64 (4096-bit), ~4160 copies.
+Estimated to be ~10-13% of total cycle count.
+
+The hypothesis was that replacing the physical shift with a logical offset /
+sliding pointer / ring buffer would recover this overhead, especially at
+larger widths where the absolute copy count is highest.
+
+#### Approaches tested
+
+1. **Linear buffer + pointer advance (2k+1 buffer):**
+   - Eliminates shift entirely — `++T` instead of loop
+   - Result: -15% at 512, -13% at 1024 (**win**)
+   - But: +17% at 2048, +20% at 4096 (**regression**)
+   - Root cause: doubling buffer from k+2 to 2k+1 limbs hurts cache at
+     large k.  At k=64, buffer goes from 528B to 1040B.
+
+2. **Ring buffer with modular indexing (k+2 buffer):**
+   - Same footprint, uses `(base + j) % tlen` in inner loop
+   - Result: massive regression at all widths
+   - Root cause: modulo in inner MAC loop is far more expensive than shift
+
+3. **memmove (k+2 buffer):**
+   - Replace manual shift loop with `std::memmove`
+   - Result: ~0% change (noise-level)
+   - Root cause: compiler already optimizes the simple loop equivalently
+
+#### Conclusion
+
+The shift is not the dominant cost.  The compiler handles the simple
+ascending-copy loop efficiently (likely unrolled, possibly SIMD'd).  The
+real cost center is the 2 × k inner MAC loops per row (multiply-accumulate),
+which are O(k²) multiplications — the shift is O(k²) copies but each copy
+is ~10× cheaper than each MAC.
+
+#### Impact on next targets
+
+This investigation confirms that the **O(k²) schoolbook multiply inside
+CIOS is the true dominant cost**.  The next meaningful improvement at
+2048+ bits requires reducing the multiply complexity, not the bookkeeping.
+The primary candidate is Karatsuba multiplication inside the Montgomery
+path (see Dragon note above re: Karatsuba inside Montgomery multiply).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

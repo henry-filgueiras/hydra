@@ -2509,7 +2509,7 @@ static void test_fused_montgomery_mul_vs_separate() {
 
     uint64_t out_sep[1] = {0}, out_fused[1] = {0};
     uint64_t work_sep[3] = {0};  // 2k+1
-    uint64_t work_fused[3] = {0};  // k+2
+    uint64_t work_fused[3] = {0};  // 2k+1
 
     hydra::detail::montgomery_mul(a, b, k, mod, n0inv, out_sep, work_sep);
     hydra::detail::montgomery_mul_fused(a, b, k, mod, n0inv, out_fused, work_fused);
