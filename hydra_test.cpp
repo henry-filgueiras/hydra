@@ -2370,6 +2370,131 @@ static void test_pow_mod_montgomery_mod_equals_3() {
     CHECK(result == Hydra{1u}, "pow_mod Montgomery: 5^100 mod 3 = 1");
 }
 
+// ── Additional pow_mod edge cases and squaring-specific tests ──
+
+static void test_pow_mod_base_zero() {
+    // 0^n mod m = 0 for n > 0
+    CHECK(hydra::pow_mod(Hydra{0u}, Hydra{5u}, Hydra{7u}) == Hydra{0u},
+          "pow_mod: 0^5 mod 7 = 0");
+    CHECK(hydra::pow_mod(Hydra{0u}, Hydra{1u}, Hydra{13u}) == Hydra{0u},
+          "pow_mod: 0^1 mod 13 = 0");
+}
+
+static void test_pow_mod_exp_zero() {
+    // a^0 mod m = 1 for m > 1
+    CHECK(hydra::pow_mod(Hydra{999u}, Hydra{0u}, Hydra{7u}) == Hydra{1u},
+          "pow_mod: 999^0 mod 7 = 1");
+    CHECK(hydra::pow_mod(Hydra{0u}, Hydra{0u}, Hydra{5u}) == Hydra{1u},
+          "pow_mod: 0^0 mod 5 = 1");
+}
+
+static void test_pow_mod_mod_one() {
+    // a^n mod 1 = 0 for all a, n
+    CHECK(hydra::pow_mod(Hydra{42u}, Hydra{100u}, Hydra{1u}) == Hydra{0u},
+          "pow_mod: 42^100 mod 1 = 0");
+    CHECK(hydra::pow_mod(Hydra{0u}, Hydra{0u}, Hydra{1u}) == Hydra{0u},
+          "pow_mod: 0^0 mod 1 = 0");
+}
+
+static void test_pow_mod_base_less_than_mod() {
+    // base < mod, odd mod
+    Hydra r = hydra::pow_mod(Hydra{3u}, Hydra{4u}, Hydra{11u});
+    // 3^4 = 81, 81 mod 11 = 4
+    CHECK(r == Hydra{4u}, "pow_mod: 3^4 mod 11 = 4 (base < mod)");
+}
+
+static void test_pow_mod_base_greater_than_mod() {
+    // base > mod, odd mod — should reduce first
+    Hydra r = hydra::pow_mod(Hydra{100u}, Hydra{3u}, Hydra{13u});
+    // 100 mod 13 = 9, 9^3 = 729, 729 mod 13 = 1
+    CHECK(r == Hydra{1u}, "pow_mod: 100^3 mod 13 = 1 (base > mod)");
+}
+
+static void test_pow_mod_montgomery_sqr_specific() {
+    // Test specifically that squaring path gives correct results
+    // by verifying a^2 mod m via pow_mod matches (a*a) mod m
+    Hydra a("99999999999999999999999999999999");  // ~106 bits
+    Hydra mod("1000000000000000000000000000000007");  // odd 110-bit modulus
+    Hydra exp{2u};
+    Hydra result = hydra::pow_mod(a, exp, mod);
+    Hydra expected = (a * a) % mod;
+    CHECK(result == expected, "pow_mod sqr specific: a^2 matches a*a mod m");
+}
+
+static void test_pow_mod_montgomery_sqr_chain() {
+    // a^4 = (a^2)^2 — exercises multiple squarings in sequence
+    Hydra a("12345678901234567890123456789012345678901234567890");
+    Hydra mod("99999999999999999999999999999999999999999999999989");  // odd
+    Hydra r4 = hydra::pow_mod(a, Hydra{4u}, mod);
+    Hydra manual = (a * a) % mod;
+    manual = (manual * manual) % mod;
+    CHECK(r4 == manual, "pow_mod sqr chain: a^4 matches manual squaring");
+}
+
+static void test_pow_mod_random_odd_moduli_near_threshold() {
+    // Test with moduli near MONTGOMERY_MAX_LIMBS (48 limbs = 3072 bits)
+    // Use 2048-bit (32 limbs) and 3072-bit (48 limbs) to exercise near-threshold
+    std::mt19937_64 rng(0xDEAD'BEEF);
+
+    auto make_odd_hydra = [&](uint32_t n_limbs) {
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;  // ensure odd
+        limbs.back() |= (1ull << 63);  // ensure top bit set
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    for (uint32_t n_limbs : {32u, 48u}) {
+        Hydra base = make_odd_hydra(4);  // small base
+        Hydra exp{1000u};               // modest exponent
+        Hydra mod = make_odd_hydra(n_limbs);
+
+        Hydra mont = hydra::pow_mod(base, exp, mod);
+        Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+        CHECK(mont == naive,
+              "pow_mod near threshold cross-check");
+    }
+}
+
+static void test_pow_mod_sliding_window_coverage() {
+    // Test with exponents that exercise different window patterns:
+    // - exp with runs of zeros
+    // - exp with runs of ones
+    // - small odd exp
+    // - exp = 2 (single squaring)
+    // - exp = 3 (square + multiply)
+    Hydra base("123456789012345678901234567");
+    Hydra mod("999999999999999999999999999999999999961");  // odd prime-ish
+
+    for (uint64_t e : {2u, 3u, 7u, 15u, 16u, 17u, 255u, 256u, 1023u, 65535u}) {
+        Hydra result = hydra::pow_mod(base, Hydra{e}, mod);
+        Hydra naive = hydra::pow_mod_naive(base % mod, Hydra{e}, mod);
+        CHECK(result == naive,
+              "pow_mod sliding window cross-check");
+    }
+}
+
+static void test_pow_mod_montgomery_2048bit_cross() {
+    // 2048-bit cross-check against naive
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    Hydra base = make(256, 42);      // 256-bit base
+    Hydra exp  = make(64, 99);       // 64-bit exponent (keep naive tractable)
+    Hydra mod  = make(2048, 7777);   // 2048-bit odd modulus
+
+    Hydra mont = hydra::pow_mod(base, exp, mod);
+    Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+    CHECK(mont == naive, "pow_mod 2048-bit Montgomery cross-check");
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -2674,6 +2799,18 @@ int main() {
     test_pow_mod_even_mod_fallback();
     test_pow_mod_montgomery_base_larger_than_mod();
     test_pow_mod_montgomery_mod_equals_3();
+
+    // Additional pow_mod edge cases and squaring-specific tests
+    test_pow_mod_base_zero();
+    test_pow_mod_exp_zero();
+    test_pow_mod_mod_one();
+    test_pow_mod_base_less_than_mod();
+    test_pow_mod_base_greater_than_mod();
+    test_pow_mod_montgomery_sqr_specific();
+    test_pow_mod_montgomery_sqr_chain();
+    test_pow_mod_random_odd_moduli_near_threshold();
+    test_pow_mod_sliding_window_coverage();
+    test_pow_mod_montgomery_2048bit_cross();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

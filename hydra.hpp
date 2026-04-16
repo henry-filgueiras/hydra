@@ -1281,9 +1281,14 @@ inline void montgomery_mul(
     montgomery_redc(work, k, mod, n0inv, out);
 }
 
-// Fused multiply-and-reduce for the inner squaring case.
-// Identical to montgomery_mul but with a==b; the calling code
-// can share the same buffer.  We just delegate for now.
+// Dedicated Montgomery squaring: compute a²·R^{-1} mod n
+// Exploits symmetry of cross-terms: for k limbs, the full product a*a has
+// k² term multiplications, but a² only needs k*(k-1)/2 cross-terms
+// (each doubled) plus k diagonal terms.  This saves ~25-40% of the
+// multiplications in the product phase vs calling montgomery_mul(a,a,...).
+//
+// work must have at least (2k+1) limbs.
+//
 inline void montgomery_sqr(
     const uint64_t* a,
     uint32_t k,
@@ -1292,7 +1297,66 @@ inline void montgomery_sqr(
     uint64_t* out,
     uint64_t* work) noexcept
 {
-    montgomery_mul(a, a, k, mod, n0inv, out, work);
+    uint32_t prod_size = 2 * k;
+    std::memset(work, 0, (prod_size + 1) * sizeof(uint64_t));
+
+    // Step 1: Compute cross-terms (i < j) and accumulate doubled.
+    // For each pair (i, j) where i < j, a[i]*a[j] appears twice in a².
+    for (uint32_t i = 0; i < k; ++i) {
+        if (a[i] == 0) continue;
+        uint64_t carry = 0;
+        for (uint32_t j = i + 1; j < k; ++j) {
+            unsigned __int128 t =
+                static_cast<unsigned __int128>(a[i]) * a[j]
+                + work[i + j]
+                + carry;
+            work[i + j] = static_cast<uint64_t>(t);
+            carry = static_cast<uint64_t>(t >> 64);
+        }
+        work[i + k] += carry;
+        if (work[i + k] < carry) {
+            for (uint32_t jj = i + k + 1; jj <= prod_size; ++jj) {
+                work[jj]++;
+                if (work[jj] != 0) break;
+            }
+        }
+    }
+
+    // Step 2: Double all cross-terms (left-shift the entire work array by 1 bit).
+    uint64_t prev_carry = 0;
+    for (uint32_t i = 0; i <= prod_size; ++i) {
+        uint64_t cur = work[i];
+        work[i] = (cur << 1) | prev_carry;
+        prev_carry = cur >> 63;
+    }
+
+    // Step 3: Add diagonal terms a[i]*a[i] at positions 2*i, 2*i+1.
+    uint64_t diag_carry = 0;
+    for (uint32_t i = 0; i < k; ++i) {
+        unsigned __int128 sq = static_cast<unsigned __int128>(a[i]) * a[i];
+        uint64_t lo = static_cast<uint64_t>(sq);
+        uint64_t hi = static_cast<uint64_t>(sq >> 64);
+
+        // Add lo to work[2*i]
+        unsigned __int128 s = static_cast<unsigned __int128>(work[2 * i])
+                              + lo + diag_carry;
+        work[2 * i] = static_cast<uint64_t>(s);
+        uint64_t c = static_cast<uint64_t>(s >> 64);
+
+        // Add hi to work[2*i+1]
+        s = static_cast<unsigned __int128>(work[2 * i + 1]) + hi + c;
+        work[2 * i + 1] = static_cast<uint64_t>(s);
+        diag_carry = static_cast<uint64_t>(s >> 64);
+    }
+    // Propagate any final carry
+    for (uint32_t i = 2 * k; diag_carry && i <= prod_size; ++i) {
+        uint64_t s = work[i] + diag_carry;
+        diag_carry = (s < work[i]) ? 1u : 0u;
+        work[i] = s;
+    }
+
+    // Step 4: Montgomery reduction
+    montgomery_redc(work, k, mod, n0inv, out);
 }
 
 } // namespace detail
@@ -1417,13 +1481,17 @@ struct MontgomeryContext {
         // a_mont = montgomery_mul(a, R² mod n)
         // = a · R² · R^{-1} mod n = a · R mod n
         //
-        // Pad a to k limbs
-        std::vector<uint64_t> a_padded(k, 0);
-        std::memcpy(a_padded.data(), a_limbs,
-                    std::min(a_count, k) * sizeof(uint64_t));
+        // Pad a to k limbs on stack (max 64 limbs = 512 bytes)
+        constexpr uint32_t MAX_K = 64;
+        uint64_t a_padded[MAX_K];
+        uint32_t copy_count = (a_count < k) ? a_count : k;
+        std::memcpy(a_padded, a_limbs, copy_count * sizeof(uint64_t));
+        if (copy_count < k)
+            std::memset(a_padded + copy_count, 0,
+                        (k - copy_count) * sizeof(uint64_t));
 
         detail::montgomery_mul(
-            a_padded.data(), r_sq.data(),
+            a_padded, r_sq.data(),
             k, mod_limbs.data(), n0inv, out, work);
     }
 
@@ -2887,6 +2955,14 @@ struct EGCDResult {
 // The conversion to/from Montgomery form (2 mul+redc each)
 // is a one-time cost amortised over O(n) squarings.
 //
+// Uses a 4-bit sliding window for exponentiation:
+//   - Precompute odd powers base^1, base^3, ..., base^15 in Montgomery form
+//   - Process exponent in 4-bit windows from MSB to LSB
+//   - Reduces multiplications from ~n/2 to ~n/4 for n-bit exponents
+//
+// All scratch buffers use stack arrays for k <= MONTGOMERY_MAX_LIMBS (64),
+// avoiding heap allocation in the hot path.
+//
 [[nodiscard]] inline Hydra pow_mod_montgomery(
     Hydra base, Hydra exp, const Hydra& mod)
 {
@@ -2903,55 +2979,166 @@ struct EGCDResult {
 
     auto base_lv = base.limb_view();
 
-    // Allocate limb buffers for Montgomery-space values
-    // All are k limbs wide.
-    std::vector<uint64_t> base_mont(k, 0);
-    std::vector<uint64_t> result_mont(k, 0);
-    std::vector<uint64_t> work(2 * k + 1, 0);
-    std::vector<uint64_t> temp(k, 0);
+    // ── Stack-based scratch buffers ──
+    // MONTGOMERY_MAX_LIMBS is 64 (4096 bits).  All buffers fit on stack.
+    // Total stack frame: ~10 KB for k=64 (table 4KB + work 1KB + misc).
+    constexpr uint32_t MAX_K = 64;
+    uint64_t work_buf[2 * MAX_K + 1];
+    uint64_t temp_buf[MAX_K];
+    uint64_t result_mont_buf[MAX_K];
 
-    // Convert base to Montgomery form
-    ctx.to_montgomery(base_lv.ptr, base_lv.count,
-                      base_mont.data(), work.data());
+    // Zero-init the working buffers
+    std::memset(work_buf, 0, (2 * k + 1) * sizeof(uint64_t));
+    std::memset(temp_buf, 0, k * sizeof(uint64_t));
+    std::memset(result_mont_buf, 0, k * sizeof(uint64_t));
+
+    // ── Sliding window precomputation ──
+    // Window size W=4: precompute base^1, base^3, base^5, ..., base^15
+    // in Montgomery form.  table[i] = base^(2i+1) for i in [0..7].
+    constexpr uint32_t WINDOW = 4;
+    constexpr uint32_t TABLE_SIZE = 1u << (WINDOW - 1);  // 8
+    uint64_t table[TABLE_SIZE][MAX_K];
+
+    // table[0] = base in Montgomery form
+    {
+        // Pad base to k limbs on stack
+        uint64_t a_padded[MAX_K];
+        std::memset(a_padded, 0, k * sizeof(uint64_t));
+        uint32_t copy_count = (base_lv.count < k) ? base_lv.count : k;
+        std::memcpy(a_padded, base_lv.ptr, copy_count * sizeof(uint64_t));
+
+        detail::montgomery_mul(
+            a_padded, ctx.r_sq.data(),
+            k, ctx.mod_limbs.data(), ctx.n0inv,
+            table[0], work_buf);
+    }
+
+    // base_sq = base² in Montgomery form (used to build odd powers)
+    uint64_t base_sq[MAX_K];
+    detail::montgomery_sqr(
+        table[0], k, ctx.mod_limbs.data(), ctx.n0inv,
+        base_sq, work_buf);
+
+    // table[i] = table[i-1] * base_sq = base^(2i+1)
+    for (uint32_t i = 1; i < TABLE_SIZE; ++i) {
+        detail::montgomery_mul(
+            table[i - 1], base_sq,
+            k, ctx.mod_limbs.data(), ctx.n0inv,
+            table[i], work_buf);
+    }
 
     // result_mont = 1 in Montgomery form = R mod n
-    // = to_montgomery(1)
-    uint64_t one = 1;
-    ctx.to_montgomery(&one, 1, result_mont.data(), work.data());
-
-    // Binary exponentiation in Montgomery space
-    // Process exponent bits from LSB to MSB
-    while (exp > Hydra{0u}) {
-        if (!((exp & Hydra{1u}).is_zero())) {
-            // result_mont = result_mont * base_mont (Montgomery mul)
-            detail::montgomery_mul(
-                result_mont.data(), base_mont.data(),
-                k, ctx.mod_limbs.data(), ctx.n0inv,
-                temp.data(), work.data());
-            std::memcpy(result_mont.data(), temp.data(),
-                        k * sizeof(uint64_t));
-        }
-        // base_mont = base_mont² (Montgomery square)
-        detail::montgomery_sqr(
-            base_mont.data(),
+    {
+        uint64_t one_padded[MAX_K];
+        std::memset(one_padded, 0, k * sizeof(uint64_t));
+        one_padded[0] = 1;
+        detail::montgomery_mul(
+            one_padded, ctx.r_sq.data(),
             k, ctx.mod_limbs.data(), ctx.n0inv,
-            temp.data(), work.data());
-        std::memcpy(base_mont.data(), temp.data(),
-                    k * sizeof(uint64_t));
+            result_mont_buf, work_buf);
+    }
 
-        exp >>= 1;
+    // ── Extract exponent bits ──
+    // We need to process from MSB to LSB for sliding window.
+    // Extract all exponent limbs and find the highest set bit.
+    auto exp_lv = exp.limb_view();
+    uint32_t exp_limb_count = exp_lv.count;
+    if (exp_limb_count == 0) {
+        // exp == 0 → result is 1 mod n (already handled by dispatch, but be safe)
+        uint64_t result_limbs_buf[MAX_K];
+        std::memset(result_limbs_buf, 0, k * sizeof(uint64_t));
+        ctx.from_montgomery(result_mont_buf, result_limbs_buf, work_buf);
+        uint32_t used = k;
+        while (used > 0 && result_limbs_buf[used - 1] == 0) --used;
+        if (used == 0) return Hydra{0u};
+        return Hydra::from_limbs(result_limbs_buf, used);
+    }
+
+    // Find highest set bit position (0-indexed from LSB across all limbs)
+    uint32_t top_limb_idx = exp_limb_count - 1;
+    uint64_t top_limb = exp_lv.ptr[top_limb_idx];
+    int top_bit = 63 - __builtin_clzll(top_limb);  // bit within top limb
+    int total_bits = static_cast<int>(top_limb_idx) * 64 + top_bit;
+
+    // ── MSB-to-LSB sliding window exponentiation ──
+    // Process exponent bits from position total_bits down to 0.
+    int bit_pos = total_bits;
+    while (bit_pos >= 0) {
+        // Get current bit
+        uint32_t limb_idx = static_cast<uint32_t>(bit_pos) / 64;
+        uint32_t bit_idx = static_cast<uint32_t>(bit_pos) % 64;
+        uint64_t cur_bit = (exp_lv.ptr[limb_idx] >> bit_idx) & 1u;
+
+        if (cur_bit == 0) {
+            // Square and move on
+            detail::montgomery_sqr(
+                result_mont_buf, k, ctx.mod_limbs.data(), ctx.n0inv,
+                temp_buf, work_buf);
+            std::memcpy(result_mont_buf, temp_buf, k * sizeof(uint64_t));
+            --bit_pos;
+        } else {
+            // Collect a window of up to WINDOW bits starting at bit_pos.
+            // The window value is the integer formed by bits [bit_pos .. bit_pos - len + 1].
+            // We want the window to end with a 1 bit (odd value) for table lookup.
+            int window_len = WINDOW;
+            if (bit_pos < WINDOW - 1) window_len = bit_pos + 1;
+
+            // Extract window_len bits starting from bit_pos (MSB first)
+            uint32_t wval = 0;
+            for (int i = 0; i < window_len; ++i) {
+                int bp = bit_pos - i;
+                uint32_t li = static_cast<uint32_t>(bp) / 64;
+                uint32_t bi = static_cast<uint32_t>(bp) % 64;
+                uint32_t b = (exp_lv.ptr[li] >> bi) & 1u;
+                wval = (wval << 1) | b;
+            }
+
+            // Strip trailing zeros from window to ensure odd lookup
+            int trailing_zeros = 0;
+            while (window_len > 1 && (wval & 1u) == 0) {
+                wval >>= 1;
+                window_len--;
+                trailing_zeros++;
+            }
+
+            // Square window_len times
+            for (int i = 0; i < window_len; ++i) {
+                detail::montgomery_sqr(
+                    result_mont_buf, k, ctx.mod_limbs.data(), ctx.n0inv,
+                    temp_buf, work_buf);
+                std::memcpy(result_mont_buf, temp_buf, k * sizeof(uint64_t));
+            }
+
+            // Multiply by table[(wval-1)/2] (wval is odd)
+            uint32_t table_idx = (wval - 1) / 2;
+            detail::montgomery_mul(
+                result_mont_buf, table[table_idx],
+                k, ctx.mod_limbs.data(), ctx.n0inv,
+                temp_buf, work_buf);
+            std::memcpy(result_mont_buf, temp_buf, k * sizeof(uint64_t));
+
+            // Square for each trailing zero
+            for (int i = 0; i < trailing_zeros; ++i) {
+                detail::montgomery_sqr(
+                    result_mont_buf, k, ctx.mod_limbs.data(), ctx.n0inv,
+                    temp_buf, work_buf);
+                std::memcpy(result_mont_buf, temp_buf, k * sizeof(uint64_t));
+            }
+
+            bit_pos -= (window_len + trailing_zeros);
+        }
     }
 
     // Convert result back from Montgomery form
-    std::vector<uint64_t> result_limbs(k, 0);
-    ctx.from_montgomery(result_mont.data(),
-                        result_limbs.data(), work.data());
+    uint64_t result_limbs_buf[MAX_K];
+    std::memset(result_limbs_buf, 0, k * sizeof(uint64_t));
+    ctx.from_montgomery(result_mont_buf, result_limbs_buf, work_buf);
 
     // Trim and build Hydra
     uint32_t used = k;
-    while (used > 0 && result_limbs[used - 1] == 0) --used;
+    while (used > 0 && result_limbs_buf[used - 1] == 0) --used;
     if (used == 0) return Hydra{0u};
-    return Hydra::from_limbs(result_limbs.data(), used);
+    return Hydra::from_limbs(result_limbs_buf, used);
 }
 
 // ── Public dispatch ─────────────────────────────────────
@@ -2967,15 +3154,12 @@ struct EGCDResult {
     // Dispatch: odd modulus → Montgomery, even → naive fallback.
     //
     // Montgomery's advantage comes from replacing per-iteration
-    // division with multiplication-only reduction.  At small–medium
-    // widths (≤ 32 limbs / 2048 bits) this is a clear win (2–5×).
-    // Above that, the context-build cost and per-multiply vector
-    // allocations erode the benefit; benchmark-measured crossover
-    // is around 48 limbs (3072 bits).  We use 48 as the threshold.
-    //
-    // Threshold can be re-measured when arena-backed scratch lands
-    // for the Montgomery inner multiply.
-    constexpr uint32_t MONTGOMERY_MAX_LIMBS = 48;
+    // division with multiplication-only reduction.  With dedicated
+    // squaring, sliding-window exponentiation, and stack-based
+    // scratch buffers, Montgomery is a clear win at all sizes up to
+    // 64 limbs (4096 bits).  The threshold was raised from 48 to 64
+    // after eliminating per-call heap allocation.
+    constexpr uint32_t MONTGOMERY_MAX_LIMBS = 64;
 
     auto mod_lv = mod.limb_view();
     if (mod_lv.count > 0 && mod_lv.count <= MONTGOMERY_MAX_LIMBS

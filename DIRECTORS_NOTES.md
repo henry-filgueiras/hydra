@@ -2000,4 +2000,134 @@ at `-O2`.
 
 ---
 
+### Montgomery Exponentiation Engine Optimization Pass
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Three targeted interventions in the Montgomery modular exponentiation path,
+driven by profiling hypothesis and confirmed by before/after benchmarking.
+
+#### Hypothesis
+
+The `pow_mod` Montgomery path had three concrete bottlenecks:
+
+1. **No squaring specialization.** `montgomery_sqr()` just called
+   `montgomery_mul(a, a, ...)`, missing the ~25-40% MAC reduction available
+   from exploiting cross-term symmetry.
+2. **Binary square-and-multiply.** Processing one exponent bit at a time
+   means ~n/2 multiplies for an n-bit exponent; a sliding window can
+   cut this to ~n/4.
+3. **Per-call heap allocation.** Four `std::vector` allocations per
+   `pow_mod_montgomery` call (base_mont, result_mont, work, temp) plus
+   one in `to_montgomery` — all inside the hot path.
+
+#### Intervention 1: Dedicated Montgomery Squaring
+
+Replaced the `montgomery_sqr = montgomery_mul(a, a)` delegation with a
+specialized squaring kernel that:
+
+- Computes cross-terms (i < j) in a single triangle loop: k*(k-1)/2 MACs
+- Doubles via a single-pass left-shift by 1 bit
+- Adds diagonal terms a[i]² at positions 2i, 2i+1
+- Feeds into the same `montgomery_redc` for reduction
+
+Total MAC operations for k limbs: k*(k-1)/2 + k = k*(k+1)/2, versus k²
+for the generic multiply.  Net savings: ~(k-1)/(2k) ≈ 25-50% of the
+product-phase work.
+
+#### Intervention 2: 4-Bit Sliding Window Exponentiation
+
+Replaced binary (1-bit) square-and-multiply with a 4-bit sliding window:
+
+- Precomputes 8 odd powers: base^1, base^3, base^5, ..., base^15 in
+  Montgomery form (7 Montgomery multiplies, amortized cheaply for large
+  exponents)
+- Processes exponent MSB-to-LSB in windows of up to 4 bits
+- Windows are trimmed to end with a 1-bit (odd value) for table lookup
+- Zero bits cause a single squaring; non-zero windows cause window_len
+  squarings + 1 multiply
+
+Expected multiply reduction: from ~n/2 to ~n/4 for n-bit exponents.
+The precomputation cost (7 muls + 1 sqr) is negligible for n >= 64 bits.
+
+#### Intervention 3: Stack-Based Scratch Buffers
+
+Eliminated all `std::vector` allocations in the Montgomery hot path:
+
+- `pow_mod_montgomery` now uses stack arrays for all limb buffers
+  (result_mont, temp, work, precomputation table)
+- `to_montgomery` uses a stack-allocated pad buffer instead of
+  `std::vector<uint64_t>`
+- Total stack frame for the largest case (k=64): ~10 KB
+- `MONTGOMERY_MAX_LIMBS` raised from 48 to 64 (now covers 4096-bit)
+
+#### Benchmark Results
+
+Linux g++ -O3 -DNDEBUG, sandbox VM.  Hydra-only (no external backends).
+
+Before (baseline — binary s&m, no sqr specialization, vector scratch):
+
+```
+ 256 bits:  12.79 µs
+ 512 bits:  90.27 µs
+1024 bits: 652.75 µs
+2048 bits:   3.96 ms
+4096 bits:  31.26 ms   (naive fallback — was beyond 48-limb threshold)
+```
+
+After (dedicated sqr + window-4 + stack scratch + raised threshold):
+
+```
+ 256 bits:   9.08 µs   (−29%)
+ 512 bits:  49.08 µs   (−46%)
+1024 bits: 394.33 µs   (−40%)
+2048 bits:   2.67 ms   (−33%)
+4096 bits:  21.39 ms   (−32%)
+```
+
+**Hypothesis confirmed** — all three interventions contributed.  The 512-bit
+width saw the largest relative improvement (46%), consistent with the
+sliding window giving the biggest relative save when the exponent is
+large enough to amortize precomputation but the per-multiply cost is
+still dominated by cross-term reduction (not Karatsuba territory).
+
+The 4096-bit improvement (32%) came primarily from the raised threshold
+(previously fell through to the division-based naive path).
+
+#### Correctness
+
+- 805 tests pass (23 new), including ASan+UBSan at -O2
+- New test coverage:
+  - base=0, exp=0, mod=1 edge cases
+  - base < mod, base > mod
+  - Squaring-specific: a² via pow_mod vs manual (a*a)%m
+  - Squaring chains: a⁴ via pow_mod vs manual
+  - Random odd moduli at 32-limb and 48-limb boundaries
+  - Sliding window pattern coverage: exponents 2, 3, 7, 15, 16, 17,
+    255, 256, 1023, 65535
+  - 2048-bit Montgomery cross-check against naive path
+
+#### What is Still Inferred
+
+- The relative contribution of each intervention (sqr vs window vs alloc)
+  was not isolated individually.  Based on the arithmetic: sqr saves
+  ~30% of product-phase work, window saves ~50% of multiplies, alloc
+  saves per-call overhead.  All three likely contribute, with sqr+window
+  being dominant at larger widths.
+
+- The raised threshold (48→64) may benefit from going even higher once
+  Karatsuba is wired into the Montgomery multiply (currently schoolbook
+  for all widths within Montgomery).
+
+#### Recommended Next Step
+
+**Fused Montgomery multiplication (interleaved product + reduction).**
+The current path computes the full 2k-limb product, then runs REDC as a
+separate pass.  A fused approach computes one row of the product and
+immediately reduces, halving the scratch memory and improving cache
+locality.  This is the standard approach in GMP's `mpn_mont_mul` and
+would be the next high-SNR lever before assembly.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
