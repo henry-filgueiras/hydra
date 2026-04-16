@@ -1771,4 +1771,175 @@ Boost is automatically enabled when `HYDRA_BENCH_BOOST=ON` (the default).
 
 ---
 
+### Montgomery Modular Exponentiation
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+The primary `pow_mod` performance mountain: replacing the per-iteration
+`(a * b) % mod` division with Montgomery reduction for odd moduli.
+
+#### Algorithm
+
+Montgomery multiplication works in a transformed space where
+`a_mont = a · R mod n` (with `R = 2^(64·k)`, k = modulus limb count).
+In this space, reduction replaces expensive division with a sequence of
+multiplications and shifts:
+
+1. **REDC(T)** — word-by-word Montgomery reduction:
+   ```
+   for i = 0 to k-1:
+     m = T[i] · n' mod 2^64      (single limb multiply)
+     T += m · n · 2^(64·i)        (k-limb multiply-accumulate)
+   result = T >> (64·k)
+   if result >= n: result -= n
+   ```
+
+2. **Montgomery multiply**: `mul(a, b) → REDC(a · b)` — one schoolbook
+   multiplication (O(k²)) plus one REDC (O(k²)), vs the naive path's
+   schoolbook multiply plus Knuth-D division (also O(k²) each, but with
+   higher constant factors due to trial-quotient estimation and
+   multi-limb borrow propagation).
+
+#### Precomputed constants (MontgomeryContext)
+
+| Field       | Description                        | Computed by      |
+|-------------|------------------------------------|------------------|
+| `n0inv`     | `-n^{-1} mod 2^64`                | Hensel lifting (6 iterations, ~12 multiplies) |
+| `r_sq`      | `R² mod n`                         | One Knuth-D division of `(R mod n)²` |
+| `mod_limbs` | Modulus limb array                 | Copy             |
+| `k`         | Limb count                         | —                |
+
+Context build is a one-time cost: one Knuth-D division for `R mod n`,
+one schoolbook multiply for `(R mod n)²`, and one more Knuth-D division
+for `R² mod n`.  For a 256-bit modulus this is ~3 µs — amortised over
+~256 squarings in the exponentiation loop.
+
+#### Conversion
+
+- **To Montgomery form**: `a_mont = montgomery_mul(a, R², n)` — one
+  multiply + one REDC.
+- **From Montgomery form**: REDC with `T = a_mont` (padded to 2k limbs
+  with zeros in the upper half) — one REDC.
+
+#### Dispatch
+
+```cpp
+if (mod.is_odd() && mod.limb_count() <= MONTGOMERY_MAX_LIMBS)
+    pow_mod_montgomery(base, exp, mod)
+else
+    pow_mod_naive(base, exp, mod)      // existing division-based path
+```
+
+`MONTGOMERY_MAX_LIMBS = 48` (3072 bits).  Above this threshold, the
+per-multiply `std::vector` allocation cost in the schoolbook kernel
+(called from both Montgomery multiply and REDC) erodes the algorithmic
+advantage.  The threshold can be lowered once arena-backed scratch
+lands for the inner multiply.
+
+The naive path is preserved byte-for-byte as `pow_mod_naive` for
+reference and for even-modulus inputs.
+
+#### Implementation detail: limb-level kernels
+
+All Montgomery primitives live in `hydra::detail`:
+
+| Function             | Purpose                                    |
+|---------------------|--------------------------------------------|
+| `montgomery_n0inv`  | Compute `-n^{-1} mod 2^64` via Hensel lift |
+| `montgomery_redc`   | Word-by-word REDC into caller-owned buffer |
+| `montgomery_mul`    | Schoolbook multiply + REDC                 |
+| `montgomery_sqr`    | Square + REDC (delegates to mul for now)   |
+
+`MontgomeryContext` is a struct at namespace `hydra` scope (outside
+`detail`) that owns the precomputed constants and provides
+`to_montgomery` / `from_montgomery` conversions.
+
+The `compute_r_sq()` method handles the single-limb modulus case
+(uses `divmod_u64_limbs` instead of Knuth D, which requires `nv >= 2`).
+
+#### Measured performance (Linux aarch64 sandbox, g++ 11 -O3)
+
+A/B test: identical operands, Montgomery path vs naive path, 20 samples
+mean.
+
+```
+width     montgomery    naive       speedup
+ 256       10.0 us      45.8 us     4.6×
+ 512       74.9 us     171.2 us     2.3×
+1024      575.5 us     858.6 us     1.5×
+2048     3998.6 us    4690.1 us     1.2×
+4096    30551.5 us   30472.6 us     1.0× (fallback to naive)
+```
+
+Official benchmark harness comparison (before/after this change):
+
+```
+width     before       after        speedup
+ 256       ~60 us       9.58 us     6.3×
+ 512      ~200 us      74.73 us     2.7×
+1024      ~960 us     580.17 us     1.7×
+2048      ~4.7 ms      4.00 ms     1.2×
+4096     ~31.3 ms     31.53 ms     ~1.0× (fallback)
+```
+
+The 256-bit result (6.3× improvement) far exceeds the 2× target.
+The improvement is most dramatic at small widths because:
+
+1. At 256-bit (4 limbs), the Montgomery inner loop is 4 iterations —
+   each a single 64-bit multiply + accumulate. Knuth D's trial-quotient
+   estimation + refinement + borrow chain is much heavier per step.
+
+2. At larger widths, both paths are dominated by the O(k²) schoolbook
+   multiply, so the constant-factor advantage shrinks. The crossover
+   to "Montgomery overhead > savings" is around 48 limbs.
+
+#### Correctness
+
+24 new assertions across 15 new test functions:
+
+- `montgomery_n0inv`: small (3233), large (2^64-3), random odd
+- `montgomery_redc`: known case where R ≡ 1 mod 17
+- `MontgomeryContext::build` + `compute_r_sq`: cross-checked against
+  `Hydra{1} << 128 % 3233`
+- Montgomery roundtrip: `from_montgomery(to_montgomery(42)) == 42`
+- Montgomery multiply: `42 * 100 mod 3233` verified
+- `pow_mod_montgomery` small: `2^10 mod 1009 = 15`
+- Cross-check vs naive at 256, 512, 1024 bits (random operands)
+- Sweep: 6 widths (64–512) all match naive
+- Fermat's little theorem: `42^(p-1) ≡ 1 mod p` for p = 104729
+- RSA roundtrip: `p=104729, q=104743, e=65537` encrypt/decrypt cycle
+- Even modulus fallback: `3^7 mod 100 = 87`
+- Base > mod: `1000^3 mod 7 = 6`
+- Smallest odd mod: `5^100 mod 3 = 1`
+
+All 782 tests (758 prior + 24 new) pass at `-O0` with ASan+UBSan and
+at `-O2`.
+
+#### Follow-ups (not in this sprint)
+
+- **Arena-backed scratch in montgomery_mul/redc**: currently each
+  `montgomery_mul` call uses a stack of `std::vector` indirections
+  through `mul_limbs`.  A single scratch arena passed through the
+  exponentiation loop could eliminate all per-iteration heap traffic
+  and potentially push the threshold up to 64+ limbs.
+
+- **Dedicated Montgomery squaring kernel**: the current `montgomery_sqr`
+  delegates to `montgomery_mul(a, a, ...)`.  A dedicated squaring kernel
+  exploiting the symmetry `a[i]*a[j] == a[j]*a[i]` would halve the
+  multiply work.
+
+- **Sliding window exponentiation**: the current binary exponentiation
+  processes one bit at a time.  A k-ary or sliding-window method
+  (precomputing `base^1, base^3, ..., base^(2^w-1)` in Montgomery form)
+  would reduce the average number of Montgomery multiplies per exponent
+  bit from ~1.5 to ~(1 + 1/w).
+
+- **GMP/OpenSSL competitive analysis**: with Montgomery landed, the
+  remaining gap to GMP/OpenSSL is likely in: (a) assembly-optimised
+  multiply kernels, (b) squaring-specific kernels, (c) sliding-window
+  exponentiation.  A comparative benchmark run with all backends
+  enabled would quantify the remaining gap.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

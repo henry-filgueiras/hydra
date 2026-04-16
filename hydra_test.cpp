@@ -2139,6 +2139,237 @@ static void test_pow_mod_large_parsed() {
     CHECK(m2 == m, "RSA parsed decimal roundtrip");
 }
 
+// ─────────────────────────────────────────────────────────
+// Montgomery multiplication path tests
+// ─────────────────────────────────────────────────────────
+
+static void test_montgomery_n0inv() {
+    // n0inv * n0 ≡ -1 mod 2^64  →  (n0inv + 1) * n0 + (n0 - 1) ≡ 0 mod 2^64
+    // Actually: n0inv = -n^{-1} mod 2^64, so n0inv * n0 ≡ -1 mod 2^64.
+    uint64_t n0 = 3233;  // odd
+    uint64_t inv = hydra::detail::montgomery_n0inv(n0);
+    // Check: inv * n0 + 1 ≡ 0 mod 2^64
+    uint64_t product = inv * n0;
+    CHECK(product == static_cast<uint64_t>(-1), "n0inv * n0 == -1 mod 2^64 (small)");
+
+    // Larger odd number
+    uint64_t n1 = 0xFFFFFFFFFFFFFFFDull;  // 2^64-3
+    uint64_t inv1 = hydra::detail::montgomery_n0inv(n1);
+    uint64_t p1 = inv1 * n1;
+    CHECK(p1 == static_cast<uint64_t>(-1), "n0inv * n0 == -1 mod 2^64 (large)");
+
+    // Random odd
+    uint64_t n2 = 0xDEADBEEFCAFE0001ull;
+    uint64_t inv2 = hydra::detail::montgomery_n0inv(n2);
+    uint64_t p2 = inv2 * n2;
+    CHECK(p2 == static_cast<uint64_t>(-1), "n0inv * n0 == -1 mod 2^64 (random)");
+}
+
+static void test_montgomery_redc_basic() {
+    // Test REDC with a known small case.
+    // mod = 17 (single limb), k = 1, R = 2^64.
+    // n0inv = -17^{-1} mod 2^64.
+    uint64_t mod_arr[1] = { 17 };
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(17);
+
+    // REDC(T) = T * R^{-1} mod 17.
+    // T = 5 → should give 5 * R^{-1} mod 17.
+    // R = 2^64. R mod 17 = 2^64 mod 17.
+    // 2^4 = 16 ≡ -1 mod 17, so 2^8 ≡ 1 mod 17, ...,
+    // 2^64 = (2^8)^8 ≡ 1 mod 17. So R ≡ 1 mod 17, R^{-1} ≡ 1 mod 17.
+    // REDC(5) = 5 * 1 = 5 mod 17.
+    uint64_t work[3] = { 5, 0, 0 };  // 2k+1 = 3 limbs
+    uint64_t out[1];
+    hydra::detail::montgomery_redc(work, 1, mod_arr, n0inv, out);
+    CHECK(out[0] == 5, "REDC basic: T=5 mod 17 with R=2^64≡1");
+}
+
+static void test_montgomery_context_build() {
+    // Build context for mod=3233 (used in RSA toy)
+    uint64_t mod_arr[1] = { 3233 };
+    hydra::MontgomeryContext ctx = hydra::MontgomeryContext::build(mod_arr, 1);
+    ctx.compute_r_sq();
+
+    // Verify n0inv
+    uint64_t p = ctx.n0inv * 3233ull;
+    CHECK(p == static_cast<uint64_t>(-1), "MontCtx n0inv correct for 3233");
+
+    // Verify r_sq = R^2 mod n = (2^64)^2 mod 3233 = 2^128 mod 3233
+    // We can cross-check with Hydra: Hydra{1} << 128 then mod 3233
+    Hydra R128 = Hydra{1u} << 128;
+    Hydra expected = R128.mod(Hydra{3233u});
+    CHECK(ctx.r_sq[0] == expected.limb_view().ptr[0],
+          "MontCtx r_sq correct for 3233");
+}
+
+static void test_montgomery_roundtrip_small() {
+    // Test that to_montgomery → from_montgomery is identity for a value.
+    uint64_t mod_arr[1] = { 3233 };
+    hydra::MontgomeryContext ctx = hydra::MontgomeryContext::build(mod_arr, 1);
+    ctx.compute_r_sq();
+
+    uint64_t val = 42;
+    uint64_t mont[1], back[1];
+    uint64_t work[3];  // 2k+1
+
+    ctx.to_montgomery(&val, 1, mont, work);
+    ctx.from_montgomery(mont, back, work);
+
+    CHECK(back[0] == 42, "Montgomery roundtrip: 42 mod 3233");
+}
+
+static void test_montgomery_mul_basic() {
+    // Test montgomery_mul: a*b*R^{-1} mod n in Montgomery space.
+    // Use mod=3233, a=42, b=100.
+    // In Montgomery form: a_mont = 42*R mod 3233, b_mont = 100*R mod 3233
+    // mont_mul(a_mont, b_mont) = a*b*R mod 3233
+    // Converting back: a*b mod 3233 = 4200 mod 3233 = 967.
+    uint64_t mod_arr[1] = { 3233 };
+    hydra::MontgomeryContext ctx = hydra::MontgomeryContext::build(mod_arr, 1);
+    ctx.compute_r_sq();
+
+    uint64_t a_val = 42, b_val = 100;
+    uint64_t a_mont[1], b_mont[1], prod_mont[1], result[1];
+    uint64_t work[3];
+
+    ctx.to_montgomery(&a_val, 1, a_mont, work);
+    ctx.to_montgomery(&b_val, 1, b_mont, work);
+
+    hydra::detail::montgomery_mul(a_mont, b_mont, 1, mod_arr,
+                                  ctx.n0inv, prod_mont, work);
+
+    ctx.from_montgomery(prod_mont, result, work);
+
+    CHECK(result[0] == (42u * 100u) % 3233u,
+          "Montgomery mul basic: 42*100 mod 3233");
+}
+
+static void test_pow_mod_montgomery_small() {
+    // Same as existing pow_mod tests but explicitly routing through Montgomery
+    Hydra r = hydra::pow_mod(Hydra{2u}, Hydra{10u}, Hydra{1000u + 9u});
+    // 2^10 = 1024, 1024 mod 1009 = 15
+    CHECK(r == Hydra{15u}, "pow_mod Montgomery: 2^10 mod 1009 = 15");
+}
+
+static Hydra make_random_hydra(uint32_t n_bits, uint64_t seed) {
+    uint32_t n_limbs = (n_bits + 63) / 64;
+    std::mt19937_64 rng(seed);
+    std::vector<uint64_t> limbs(n_limbs);
+    for (auto& l : limbs) l = rng();
+    uint32_t top_bits = n_bits % 64;
+    if (top_bits != 0)
+        limbs.back() &= (1ull << top_bits) - 1;
+    if (top_bits != 0)
+        limbs.back() |= (1ull << (top_bits - 1));
+    else
+        limbs.back() |= (1ull << 63);
+    limbs[0] |= 1u;  // make odd
+    return Hydra::from_limbs(limbs.data(), n_limbs);
+}
+
+static void test_pow_mod_montgomery_256bit() {
+    Hydra base = make_random_hydra(256, 100);
+    Hydra exp  = make_random_hydra(256, 200);
+    Hydra mod  = make_random_hydra(256, 300);
+
+    Hydra result = hydra::pow_mod(base, exp, mod);
+    // Cross-check with naive path
+    Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+    CHECK(result == naive, "pow_mod Montgomery 256-bit cross-check");
+}
+
+static void test_pow_mod_montgomery_512bit() {
+    Hydra base = make_random_hydra(512, 400);
+    Hydra exp  = make_random_hydra(512, 500);
+    Hydra mod  = make_random_hydra(512, 600);
+
+    Hydra result = hydra::pow_mod(base, exp, mod);
+    Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+    CHECK(result == naive, "pow_mod Montgomery 512-bit cross-check");
+}
+
+static void test_pow_mod_montgomery_1024bit() {
+    Hydra base = make_random_hydra(1024, 700);
+    Hydra exp  = make_random_hydra(1024, 800);
+    Hydra mod  = make_random_hydra(1024, 900);
+
+    Hydra result = hydra::pow_mod(base, exp, mod);
+    Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+    CHECK(result == naive, "pow_mod Montgomery 1024-bit cross-check");
+}
+
+static void test_pow_mod_montgomery_vs_naive() {
+    // 10 random cases across various sizes
+    uint64_t seed = 42;
+    for (uint32_t bits : {64, 128, 192, 256, 384, 512}) {
+        Hydra base = make_random_hydra(bits, seed++);
+        Hydra exp  = make_random_hydra(bits, seed++);
+        Hydra mod  = make_random_hydra(bits, seed++);
+
+        Hydra mont = hydra::pow_mod(base, exp, mod);
+        Hydra naive = hydra::pow_mod_naive(base % mod, exp, mod);
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "pow_mod mont vs naive at %u bits", bits);
+        CHECK(mont == naive, msg);
+    }
+}
+
+static void test_pow_mod_montgomery_fermat() {
+    // Fermat's little theorem: a^(p-1) ≡ 1 mod p for prime p, gcd(a,p)=1
+    // p = 104729 (prime), a = 42
+    Hydra p{104729u};
+    Hydra a{42u};
+    Hydra result = hydra::pow_mod(a, p - 1, p);
+    CHECK(result == Hydra{1u}, "Fermat's little theorem: 42^(p-1) mod p = 1");
+}
+
+static void test_pow_mod_montgomery_rsa_256bit() {
+    // Generate RSA-like test with 128-bit primes (p, q)
+    // We'll use known primes and test encrypt/decrypt roundtrip.
+    // Small primes for tractability:
+    // p = 104729, q = 104743 → n = p*q = 10965066847
+    Hydra p{104729u}, q{104743u};
+    Hydra n = p * q;
+    Hydra phi = (p - 1) * (q - 1);
+    // e = 65537 (standard)
+    Hydra e{65537u};
+    // d = e^{-1} mod phi = modular inverse
+    auto eg = hydra::extended_gcd(e, phi);
+    Hydra d = eg.x;
+    if (d.is_negative()) d = d + phi;
+
+    // Verify e*d ≡ 1 mod phi
+    CHECK((e * d) % phi == Hydra{1u}, "RSA: e*d ≡ 1 mod phi");
+
+    // Encrypt and decrypt
+    Hydra msg{12345u};
+    Hydra cipher = hydra::pow_mod(msg, e, n);
+    Hydra decrypted = hydra::pow_mod(cipher, d, n);
+    CHECK(decrypted == msg, "RSA roundtrip: decrypt(encrypt(msg)) == msg");
+}
+
+static void test_pow_mod_even_mod_fallback() {
+    // Even modulus should use the naive fallback
+    Hydra result = hydra::pow_mod(Hydra{3u}, Hydra{7u}, Hydra{100u});
+    // 3^7 = 2187, 2187 mod 100 = 87
+    CHECK(result == Hydra{87u}, "pow_mod even mod fallback: 3^7 mod 100 = 87");
+}
+
+static void test_pow_mod_montgomery_base_larger_than_mod() {
+    // base > mod; should reduce first
+    Hydra result = hydra::pow_mod(Hydra{1000u}, Hydra{3u}, Hydra{7u});
+    // 1000 mod 7 = 6, 6^3 = 216, 216 mod 7 = 6
+    CHECK(result == Hydra{6u}, "pow_mod Montgomery: base > mod");
+}
+
+static void test_pow_mod_montgomery_mod_equals_3() {
+    // Smallest interesting odd modulus
+    Hydra result = hydra::pow_mod(Hydra{5u}, Hydra{100u}, Hydra{3u});
+    // 5 ≡ 2 mod 3, 2^1=2, 2^2=1, so 2^100 = (2^2)^50 = 1^50 = 1 mod 3
+    CHECK(result == Hydra{1u}, "pow_mod Montgomery: 5^100 mod 3 = 1");
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -2426,6 +2657,23 @@ int main() {
     test_rsa_toy();
     test_rsa_toy_all_messages();
     test_pow_mod_large_parsed();
+
+    // ── Montgomery multiplication path tests ──────────────
+    test_montgomery_n0inv();
+    test_montgomery_redc_basic();
+    test_montgomery_context_build();
+    test_montgomery_roundtrip_small();
+    test_montgomery_mul_basic();
+    test_pow_mod_montgomery_small();
+    test_pow_mod_montgomery_256bit();
+    test_pow_mod_montgomery_512bit();
+    test_pow_mod_montgomery_1024bit();
+    test_pow_mod_montgomery_vs_naive();
+    test_pow_mod_montgomery_fermat();
+    test_pow_mod_montgomery_rsa_256bit();
+    test_pow_mod_even_mod_fallback();
+    test_pow_mod_montgomery_base_larger_than_mod();
+    test_pow_mod_montgomery_mod_equals_3();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

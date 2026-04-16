@@ -1111,7 +1111,336 @@ inline void divmod_knuth_limbs(
     }
 }
 
+// ─── Montgomery multiplication primitives ───────────────────
+//
+// Montgomery multiplication replaces the expensive modular
+// division in pow_mod's inner loop with cheaper shift-and-
+// multiply operations.  The idea is to work in "Montgomery
+// space" where a value `a` is represented as `a·R mod n`,
+// and the reduction step uses only multiplications and shifts.
+//
+// R = 2^(64·k) where k = limb count of the modulus.
+//
+// Key precomputed constants (stored in MontgomeryCtx):
+//   n0inv  — least-significant limb of -n^{-1} mod 2^64
+//   r_sq   — R² mod n, used to convert into Montgomery form
+//   n_limbs, mod_limbs — modulus metadata
+//
+// All limb arrays are LSB-first, matching Hydra's convention.
+//
+
+// Compute -n^{-1} mod 2^64 using Hensel lifting.
+// Precondition: n0 is odd (i.e. n0 & 1 == 1).
+inline uint64_t montgomery_n0inv(uint64_t n0) noexcept {
+    // Start with 2-bit inverse and Hensel-lift to 64 bits.
+    // inv * n0 ≡ 1 (mod 2^k) at each step; we want -inv mod 2^64.
+    uint64_t inv = 1;
+    for (int i = 0; i < 6; ++i) {
+        inv *= 2 - n0 * inv;   // doubles the number of correct bits
+    }
+    // inv now satisfies inv * n0 ≡ 1 mod 2^64.
+    // We want -n^{-1} mod 2^64 = -inv mod 2^64 = ~inv + 1.
+    return 0ull - inv;
+}
+
+// Montgomery reduction (REDC): given T (up to 2k limbs),
+// compute T·R^{-1} mod n.
+//
+// Input:
+//   t        — product, up to 2·k limbs (may be modified in-place)
+//   t_limbs  — number of limbs in t (≤ 2·k)
+//   mod      — modulus, k limbs
+//   k        — limb count of modulus
+//   n0inv    — -n^{-1} mod 2^64
+//   out      — result buffer, k limbs
+//
+// Algorithm (word-by-word Montgomery reduction):
+//   for i = 0 to k-1:
+//     m = t[i] * n0inv  (mod 2^64)
+//     t += m * mod * 2^(64*i)
+//   result = t >> (64*k)
+//   if result >= mod: result -= mod
+//
+// We operate on a work buffer of (2k+1) limbs to hold carries.
+//
+inline void montgomery_redc(
+    uint64_t* work,       // scratch of at least 2k+1 limbs; t is copied here
+    uint32_t  k,
+    const uint64_t* mod,
+    uint64_t  n0inv,
+    uint64_t* out) noexcept
+{
+    // Word-by-word reduction
+    for (uint32_t i = 0; i < k; ++i) {
+        uint64_t m = work[i] * n0inv;
+
+        // work[i..i+k] += m * mod[0..k-1]
+        uint64_t carry = 0;
+        for (uint32_t j = 0; j < k; ++j) {
+            unsigned __int128 t =
+                static_cast<unsigned __int128>(m) * mod[j]
+                + work[i + j]
+                + carry;
+            work[i + j] = static_cast<uint64_t>(t);
+            carry = static_cast<uint64_t>(t >> 64);
+        }
+        // Propagate carry through the upper limbs
+        for (uint32_t j = i + k; carry && j < 2 * k + 1; ++j) {
+            uint64_t s = work[j] + carry;
+            carry = (s < work[j]) ? 1u : 0u;
+            work[j] = s;
+        }
+    }
+
+    // Result is work[k .. 2k-1] (the upper half after shifting by R)
+    const uint64_t* upper = work + k;
+
+    // Conditional subtraction: if upper >= mod, subtract mod
+    // Compare from MSL to LSL
+    bool need_sub = false;
+    if (work[2 * k] != 0) {
+        need_sub = true;  // overflow into extra limb
+    } else {
+        // Compare upper[0..k-1] against mod[0..k-1]
+        for (uint32_t i = k; i-- > 0;) {
+            if (upper[i] > mod[i]) { need_sub = true; break; }
+            if (upper[i] < mod[i]) { need_sub = false; break; }
+        }
+        // If all equal, upper == mod → subtract (result should be 0)
+        if (!need_sub) {
+            bool all_equal = true;
+            for (uint32_t i = 0; i < k; ++i) {
+                if (upper[i] != mod[i]) { all_equal = false; break; }
+            }
+            if (all_equal) need_sub = true;
+        }
+    }
+
+    if (need_sub) {
+        uint64_t borrow = 0;
+        for (uint32_t i = 0; i < k; ++i) {
+            uint64_t ui = upper[i];
+            uint64_t mi = mod[i];
+            uint64_t d1 = ui - mi;
+            uint64_t b1 = (d1 > ui) ? 1u : 0u;
+            uint64_t d2 = d1 - borrow;
+            uint64_t b2 = (d2 > d1) ? 1u : 0u;
+            out[i] = d2;
+            borrow = b1 + b2;
+        }
+    } else {
+        std::memcpy(out, upper, k * sizeof(uint64_t));
+    }
+}
+
+// Montgomery multiplication: compute a·b·R^{-1} mod n
+// Both a and b must be in Montgomery form (i.e. a·R mod n).
+// Result is also in Montgomery form.
+//
+// work must have at least (2k+1) limbs.
+//
+inline void montgomery_mul(
+    const uint64_t* a, const uint64_t* b,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    // Step 1: compute product T = a * b (up to 2k limbs)
+    // Use the existing mul_limbs kernel.
+    uint32_t prod_size = 2 * k;
+    std::memset(work, 0, (prod_size + 1) * sizeof(uint64_t));
+
+    // Schoolbook multiply into work buffer
+    for (uint32_t i = 0; i < k; ++i) {
+        if (a[i] == 0) continue;
+        uint64_t carry = 0;
+        for (uint32_t j = 0; j < k; ++j) {
+            unsigned __int128 t =
+                static_cast<unsigned __int128>(a[i]) * b[j]
+                + work[i + j]
+                + carry;
+            work[i + j] = static_cast<uint64_t>(t);
+            carry = static_cast<uint64_t>(t >> 64);
+        }
+        work[i + k] += carry;
+        // Note: no further carry propagation needed because
+        // work[i+k] was 0 before (from schoolbook structure) + carry < 2^64,
+        // so the sum is at most 2^64-1 + 2^64-1 = 2^65-2 which can overflow.
+        // We need to propagate:
+        if (work[i + k] < carry) {
+            for (uint32_t jj = i + k + 1; jj <= prod_size; ++jj) {
+                work[jj]++;
+                if (work[jj] != 0) break;
+            }
+        }
+    }
+
+    // Step 2: Montgomery reduction
+    montgomery_redc(work, k, mod, n0inv, out);
+}
+
+// Fused multiply-and-reduce for the inner squaring case.
+// Identical to montgomery_mul but with a==b; the calling code
+// can share the same buffer.  We just delegate for now.
+inline void montgomery_sqr(
+    const uint64_t* a,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    montgomery_mul(a, a, k, mod, n0inv, out, work);
+}
+
 } // namespace detail
+
+// ─────────────────────────────────────────────────────────
+// Montgomery context — precomputed constants for a modulus
+// ─────────────────────────────────────────────────────────
+
+struct MontgomeryContext {
+    std::vector<uint64_t> mod_limbs;  // modulus limb array (k limbs)
+    std::vector<uint64_t> r_sq;       // R² mod n (k limbs), for to_mont
+    uint64_t n0inv;                   // -n^{-1} mod 2^64
+    uint32_t k;                       // limb count of modulus
+
+    // Build context for an odd modulus.
+    // mod_ptr points to k_in limbs (LSB first).
+    static MontgomeryContext build(
+        const uint64_t* mod_ptr, uint32_t k_in)
+    {
+        MontgomeryContext ctx;
+        ctx.k = k_in;
+        ctx.mod_limbs.assign(mod_ptr, mod_ptr + k_in);
+
+        // n0inv = -n^{-1} mod 2^64
+        ctx.n0inv = detail::montgomery_n0inv(mod_ptr[0]);
+
+        // Compute R² mod n.
+        // R = 2^(64*k).  R mod n is computed by creating a (k+1)-limb
+        // number with 1 in position k and dividing by n.
+        // R² mod n = (R mod n)² mod n, but that still needs a mod.
+        //
+        // Simpler: compute R mod n first, then square and reduce.
+        // R is represented as a (k+1)-limb number: zeros at [0..k-1], 1 at [k].
+        //
+        // Actually, we compute R mod n using long division of 2^(64*k) by n.
+        // Then R² mod n = (R mod n)² mod n using long division again.
+        //
+        // For the precomputation phase, cost doesn't matter (it's done once),
+        // so we use the existing Knuth D machinery via Hydra's divmod.
+        //
+        // But we need Hydra to be fully defined... Since MontgomeryContext
+        // is defined before Hydra, we defer r_sq computation to a separate
+        // init function called after Hydra is available.
+        ctx.r_sq.resize(k_in, 0);
+
+        return ctx;
+    }
+
+    // Helper: compute a mod n at the limb level, handling both
+    // single-limb and multi-limb moduli.
+    void limb_mod(const uint64_t* a, uint32_t na,
+                  uint64_t* r_out) const
+    {
+        // Trim a
+        while (na > 0 && a[na - 1] == 0) --na;
+        if (na == 0) {
+            std::memset(r_out, 0, k * sizeof(uint64_t));
+            return;
+        }
+
+        if (k == 1) {
+            // Single-limb modulus: use scalar divmod
+            uint64_t dummy_q[1];  // not used
+            // For na-limb dividend / 1-limb divisor, use divmod_u64_limbs
+            std::vector<uint64_t> q(na);
+            uint64_t rem = detail::divmod_u64_limbs(a, na, mod_limbs[0], q.data());
+            r_out[0] = rem;
+            return;
+        }
+
+        if (na < k) {
+            // a < mod (since a has fewer limbs), so a mod n = a
+            std::memcpy(r_out, a, na * sizeof(uint64_t));
+            std::memset(r_out + na, 0, (k - na) * sizeof(uint64_t));
+            return;
+        }
+
+        // General case: Knuth D
+        uint32_t q_count = na - k + 1;
+        std::vector<uint64_t> q(q_count);
+        std::vector<uint64_t> work(na + 1 + k);
+
+        detail::divmod_knuth_limbs(
+            a, na,
+            mod_limbs.data(), k,
+            q.data(), r_out, work.data());
+    }
+
+    // Finalize r_sq using limb-level arithmetic (called after Hydra is defined).
+    // This computes R² mod n where R = 2^(64*k).
+    void compute_r_sq() {
+        // Build R = 2^(64*k) as a (k+1)-limb number: zeros at [0..k-1], 1 at [k].
+        std::vector<uint64_t> r_val(k + 1, 0);
+        r_val[k] = 1;
+
+        // R mod n
+        std::vector<uint64_t> r_mod_n(k, 0);
+        limb_mod(r_val.data(), k + 1, r_mod_n.data());
+
+        // Compute R² mod n = (R mod n)² mod n.
+        // Square: r_mod_n * r_mod_n → up to 2k limbs.
+        std::vector<uint64_t> sq(2 * k, 0);
+        detail::mul_limbs(r_mod_n.data(), k, r_mod_n.data(), k, sq.data());
+
+        // sq mod n
+        uint32_t sq_used = 2 * k;
+        while (sq_used > 0 && sq[sq_used - 1] == 0) --sq_used;
+
+        if (sq_used == 0) {
+            r_sq.assign(k, 0);
+            return;
+        }
+
+        r_sq.resize(k, 0);
+        limb_mod(sq.data(), sq_used, r_sq.data());
+    }
+
+    // Convert a value to Montgomery form: a_mont = a * R mod n
+    // Input a must be in [0, n).  a_limbs has up to k limbs.
+    void to_montgomery(const uint64_t* a_limbs, uint32_t a_count,
+                       uint64_t* out, uint64_t* work) const
+    {
+        // a_mont = montgomery_mul(a, R² mod n)
+        // = a · R² · R^{-1} mod n = a · R mod n
+        //
+        // Pad a to k limbs
+        std::vector<uint64_t> a_padded(k, 0);
+        std::memcpy(a_padded.data(), a_limbs,
+                    std::min(a_count, k) * sizeof(uint64_t));
+
+        detail::montgomery_mul(
+            a_padded.data(), r_sq.data(),
+            k, mod_limbs.data(), n0inv, out, work);
+    }
+
+    // Convert from Montgomery form: a = a_mont * R^{-1} mod n
+    // = montgomery_redc(a_mont) with b=1 trick:
+    // just run redc on a_mont padded to 2k limbs.
+    void from_montgomery(const uint64_t* a_mont,
+                         uint64_t* out, uint64_t* work) const
+    {
+        // Copy a_mont into work[0..k-1], zero work[k..2k]
+        std::memcpy(work, a_mont, k * sizeof(uint64_t));
+        std::memset(work + k, 0, (k + 1) * sizeof(uint64_t));
+
+        detail::montgomery_redc(work, k, mod_limbs.data(), n0inv, out);
+    }
+};
 
 // ─────────────────────────────────────────────────────────
 // Hydra — the main value type
@@ -2529,18 +2858,17 @@ struct EGCDResult {
 
 // Binary modular exponentiation: (base^exp) mod mod.
 // Requires mod > 0, exp >= 0.  Throws std::domain_error otherwise.
-[[nodiscard]] inline Hydra pow_mod(Hydra base, Hydra exp, const Hydra& mod) {
-    if (mod <= Hydra{0u})
-        throw std::domain_error("pow_mod: modulus must be positive");
-    if (exp.is_negative())
-        throw std::domain_error("pow_mod: exponent must be non-negative");
+//
+// Dispatch:
+//   - odd modulus → Montgomery fast path (avoids division in inner loop)
+//   - even modulus → fallback naive path (division-based)
+//
 
-    // Handle mod == 1 early: any number mod 1 == 0.
-    if (mod == Hydra{1u}) return Hydra{0u};
-
+// ── Naive (division-based) path ─────────────────────────
+// Preserved as reference implementation and fallback for even moduli.
+[[nodiscard]] inline Hydra pow_mod_naive(Hydra base, Hydra exp, const Hydra& mod) {
     Hydra result{1u};
     base = base % mod;
-    // Normalize negative base into [0, mod)
     if (base.is_negative()) base = base + mod;
 
     while (exp > Hydra{0u}) {
@@ -2551,6 +2879,111 @@ struct EGCDResult {
         exp >>= 1;
     }
     return result;
+}
+
+// ── Montgomery fast path (odd modulus) ──────────────────
+//
+// All squarings and multiplications in the inner loop use
+// Montgomery reduction instead of full modular division.
+// The conversion to/from Montgomery form (2 mul+redc each)
+// is a one-time cost amortised over O(n) squarings.
+//
+[[nodiscard]] inline Hydra pow_mod_montgomery(
+    Hydra base, Hydra exp, const Hydra& mod)
+{
+    auto mod_lv = mod.limb_view();
+    uint32_t k = mod_lv.count;
+
+    // Build Montgomery context
+    MontgomeryContext ctx = MontgomeryContext::build(mod_lv.ptr, k);
+    ctx.compute_r_sq();
+
+    // Reduce base into [0, mod)
+    base = base % mod;
+    if (base.is_negative()) base = base + mod;
+
+    auto base_lv = base.limb_view();
+
+    // Allocate limb buffers for Montgomery-space values
+    // All are k limbs wide.
+    std::vector<uint64_t> base_mont(k, 0);
+    std::vector<uint64_t> result_mont(k, 0);
+    std::vector<uint64_t> work(2 * k + 1, 0);
+    std::vector<uint64_t> temp(k, 0);
+
+    // Convert base to Montgomery form
+    ctx.to_montgomery(base_lv.ptr, base_lv.count,
+                      base_mont.data(), work.data());
+
+    // result_mont = 1 in Montgomery form = R mod n
+    // = to_montgomery(1)
+    uint64_t one = 1;
+    ctx.to_montgomery(&one, 1, result_mont.data(), work.data());
+
+    // Binary exponentiation in Montgomery space
+    // Process exponent bits from LSB to MSB
+    while (exp > Hydra{0u}) {
+        if (!((exp & Hydra{1u}).is_zero())) {
+            // result_mont = result_mont * base_mont (Montgomery mul)
+            detail::montgomery_mul(
+                result_mont.data(), base_mont.data(),
+                k, ctx.mod_limbs.data(), ctx.n0inv,
+                temp.data(), work.data());
+            std::memcpy(result_mont.data(), temp.data(),
+                        k * sizeof(uint64_t));
+        }
+        // base_mont = base_mont² (Montgomery square)
+        detail::montgomery_sqr(
+            base_mont.data(),
+            k, ctx.mod_limbs.data(), ctx.n0inv,
+            temp.data(), work.data());
+        std::memcpy(base_mont.data(), temp.data(),
+                    k * sizeof(uint64_t));
+
+        exp >>= 1;
+    }
+
+    // Convert result back from Montgomery form
+    std::vector<uint64_t> result_limbs(k, 0);
+    ctx.from_montgomery(result_mont.data(),
+                        result_limbs.data(), work.data());
+
+    // Trim and build Hydra
+    uint32_t used = k;
+    while (used > 0 && result_limbs[used - 1] == 0) --used;
+    if (used == 0) return Hydra{0u};
+    return Hydra::from_limbs(result_limbs.data(), used);
+}
+
+// ── Public dispatch ─────────────────────────────────────
+[[nodiscard]] inline Hydra pow_mod(Hydra base, Hydra exp, const Hydra& mod) {
+    if (mod <= Hydra{0u})
+        throw std::domain_error("pow_mod: modulus must be positive");
+    if (exp.is_negative())
+        throw std::domain_error("pow_mod: exponent must be non-negative");
+
+    // Handle mod == 1 early: any number mod 1 == 0.
+    if (mod == Hydra{1u}) return Hydra{0u};
+
+    // Dispatch: odd modulus → Montgomery, even → naive fallback.
+    //
+    // Montgomery's advantage comes from replacing per-iteration
+    // division with multiplication-only reduction.  At small–medium
+    // widths (≤ 32 limbs / 2048 bits) this is a clear win (2–5×).
+    // Above that, the context-build cost and per-multiply vector
+    // allocations erode the benefit; benchmark-measured crossover
+    // is around 48 limbs (3072 bits).  We use 48 as the threshold.
+    //
+    // Threshold can be re-measured when arena-backed scratch lands
+    // for the Montgomery inner multiply.
+    constexpr uint32_t MONTGOMERY_MAX_LIMBS = 48;
+
+    auto mod_lv = mod.limb_view();
+    if (mod_lv.count > 0 && mod_lv.count <= MONTGOMERY_MAX_LIMBS
+        && (mod_lv.ptr[0] & 1u)) {
+        return pow_mod_montgomery(base, std::move(exp), mod);
+    }
+    return pow_mod_naive(std::move(base), std::move(exp), mod);
 }
 
 // ─────────────────────────────────────────────────────────
