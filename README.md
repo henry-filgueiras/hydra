@@ -164,41 +164,56 @@ Large head layout:
 
 ## 📊 Performance Snapshot
 
-Benchmarks run with Google Benchmark on a single core (Apple M2, clang-18 `-O2`).
+Benchmarks run with Google Benchmark on a single core (Apple Silicon, clang release build).
 Numbers are wall-time per operation; lower is better.
 This is a living benchmark diary — figures will shift as kernels mature.
 
-| Operation      | Hydra        | Reference                      | Δ vs reference |
-| -------------- | ------------ | ------------------------------ | -------------- |
-| small add      | 3.03 ns      | `uint64_t` 2.47 ns             | +22.4%         |
-| small mul      | 4.02 ns      | `uint64_t` 3.44 ns             | +16.8%         |
-| medium add     | 6.49 ns      | Boost.Multiprecision 9.27 ns   | −30.0%         |
-| medium mul     | 21.53 ns     | Boost.Multiprecision 27.07 ns  | −20.4%         |
-| large add 256  | 2.69 µs      | Boost.Multiprecision 23.89 ns  | ⚠️ see note    |
+| Operation             | Hydra      | Reference                      | Δ vs reference |
+| --------------------- | ---------- | ------------------------------ | -------------- |
+| small add             | 3.20 ns    | `uint64_t` 2.49 ns             | +28.1%         |
+| small mul             | 4.25 ns    | `uint64_t` 3.55 ns             | +19.9%         |
+| widening add          | 3.17 ns    | Boost 11.49 ns                 | −72.4%         |
+| widening mul 128-bit  | 0.78 ns    | Boost 9.31 ns                  | −91.6%         |
+| medium add            | 5.99 ns    | Boost 13.10 ns                 | −54.3%         |
+| medium mul            | 15.30 ns   | Boost 15.55 ns                 | −1.6%          |
+| large add 128-bit     | 5.50 ns    | Boost 13.10 ns                 | −58.0%         |
+| large add 256-bit     | 13.44 ns   | Boost 13.01 ns                 | +3.3%          |
+| large add 512-bit     | 13.55 ns   | Boost 23.98 ns                 | −43.5%         |
+| large mul 128-bit     | 15.39 ns   | Boost 15.55 ns                 | −1.0%          |
+| large mul 256-bit     | 19.69 ns   | Boost 19.28 ns                 | +2.1%          |
+| large mul 512-bit     | 37.13 ns   | Boost 31.43 ns                 | +18.1%         |
+| chain large add 64-limb | 394.5 ns | Boost 426.5 ns                 | −7.5%          |
 
-The small-path overhead (~20%) reflects the one-time kind-check dispatch that sits in front of native arithmetic; that cost is expected to shrink as the compiler gets more visibility into the inline representation.
-The medium-path results are the early encouraging signal: both add and multiply already beat Boost.Multiprecision by a meaningful margin, which validates the tiered design even at this prototype stage.
+The small-path overhead (~20–28%) reflects the kind-check dispatch in front of native arithmetic; that cost is expected to shrink as the compiler gets more visibility into the inline representation.
 
-> **⚠️ Large-add regression — under active investigation.**
-> The 256-bit addition path is currently ~112× slower than Boost.Multiprecision.
-> This is a known, severe regression believed to originate in the large-head construction or normalization path rather than the arithmetic kernel itself.
-> No performance claims are made for the large path until the root cause is identified and fixed.
+The widening and medium paths are the headline results: widening add and widening mul are 72% and 92% ahead of Boost respectively, and medium add beats Boost by 54%. Medium mul sits at rough parity (−2%).
+
+Large-width arithmetic is mixed but largely competitive. Large add wins decisively at 128-bit (−58%) and 512-bit (−44%), with 256-bit at near-parity (+3%). Large mul is at parity for 128- and 256-bit widths (within ±2%), while 512-bit is currently 18% behind Boost. Chained large addition shows a similar mixed profile: near-parity at 8 limbs, behind at 16 limbs (+27%), ahead at 64 limbs (−8%). No severe regressions remain in any measured path.
 
 ---
 
 ## 🚧 Status
 
-Early design / prototype phase.
+Active development — core arithmetic is implemented and benchmarked.
 
-Current focus areas:
+Completed:
 
-* [ ] representation contract
-* [ ] move / copy correctness
-* [ ] normalization rules
-* [ ] addition / subtraction kernels
-* [ ] multiplication widening path
-* [ ] division strategy
-* [ ] benchmarking vs `boost::multiprecision::cpp_int`
+* [x] representation contract (three-tier Small / Medium / Large)
+* [x] move / copy correctness
+* [x] normalization rules
+* [x] addition / subtraction kernels
+* [x] multiplication (widening, hand-unrolled 256-bit and 512-bit kernels)
+* [x] bit-shift operators (`<<` / `>>`)
+* [x] full Hydra÷Hydra division via Knuth Algorithm D (`divmod` / `div` / `mod`)
+* [x] benchmarking vs `boost::multiprecision::cpp_int`
+
+Active roadmap:
+
+* [ ] signed arithmetic (sign bit allocated; semantics TBD)
+* [ ] Karatsuba multiplication for very large operands (schoolbook is fine up to ~200 limbs)
+* [ ] `to_string()` base-10⁹ extraction (currently slow at large sizes)
+* [ ] `std::hash<Hydra>` specialisation
+* [ ] PMR-style allocator hook
 
 ---
 
