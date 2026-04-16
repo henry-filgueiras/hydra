@@ -1,5 +1,36 @@
 # Hydra Benchmark Report
 
+Generated: `2026-04-16`  Machine: sandbox VM (aarch64)  Build: `release`
+
+### pow_mod — Modular Exponentiation
+
+_Updated 2026-04-16: Karatsuba-backed Montgomery multiply at k ≥ 32 (with pad guard)_
+
+| Width | Before (fused CIOS) | After (Karatsuba+REDC at k≥32) | Delta |
+|------:|-------------------:|-------------------------------:|------:|
+|   256 |                  — |                       ~14 µs   |   — (same backend) |
+|   512 |                  — |                       ~78 µs   |   — (same backend) |
+|  1024 |                  — |                      ~420 µs   |   — (same backend, k=16) |
+|  2048 |           ~2.80 ms |                     ~2.85 ms   |  flat (noise) |
+|  4096 |          ~24.8 ms  |                     ~21.9 ms   | **−12%** |
+
+_Note: 256–1024 use fused CIOS in both builds (k < 32). 2048 is at the threshold (k=32);
+the ~9% kernel-level win is absorbed by REDC overhead and noise. 4096 (k=64) shows a clean win._
+
+Montgomery kernel-level comparison (single mul, ns/op):
+
+| k (limbs) | Fused CIOS | Karatsuba+REDC | K/F delta | Notes |
+|----------:|----------:|---------------:|----------:|-------|
+|         8 |    177 ns |          70 ns |     −61%* | *fused loses to schoolbook here |
+|        16 |    278 ns |         268 ns |      −3%  | |
+|        32 |   1.24 µs |        1.13 µs |      −9%  | Karatsuba wins |
+|        48 |   2.86 µs |        3.49 µs |     +22%  | pad-to-64 penalty, guarded out |
+|        64 |   5.33 µs |        4.45 µs |     −16%  | Karatsuba wins |
+
+---
+
+_Previous micro-benchmarks below (generated 2026-04-15 on MacBook Pro)_
+
 Generated: `2026-04-15 17:25`  Machine: `Henrys-MacBook-Pro.local`  CPUs: `18 × 24 MHz`  Build: `release`
 
 > Source: `bench_results.json`  Metric: `cpu_time`

@@ -2693,6 +2693,252 @@ static void test_fused_pow_mod_boundary_widths() {
     }
 }
 
+// ── Karatsuba-backed Montgomery multiply tests ──────────────
+
+// Direct kernel test: montgomery_mul_karatsuba vs montgomery_mul_fused
+static void test_karatsuba_mont_mul_vs_fused() {
+    // Test at k=32 (2048-bit), exactly the KARATSUBA_MONT_THRESHOLD
+    std::mt19937_64 rng(0xCA4A0001ull);
+    const uint32_t k = 32;
+    std::vector<uint64_t> mod(k), a(k), b(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;  // odd modulus
+    mod[k-1] |= (1ull << 63);  // ensure k limbs used
+
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    // Random operands in [0, mod)
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+
+    // Compute via fused CIOS
+    std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(a.data(), b.data(), k, mod.data(),
+                                         n0inv, out_fused.data(), work_fused.data());
+
+    // Compute via Karatsuba + REDC
+    uint32_t n_padded = 1;
+    while (n_padded < k) n_padded <<= 1;
+    std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
+    std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
+    std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::montgomery_mul_karatsuba(
+        a.data(), b.data(), k, mod.data(), n0inv,
+        out_kara.data(), work_kara.data(),
+        pa.data(), pb.data(), kbuf.data(), n_padded);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_fused[i] != out_kara[i]) { match = false; break; }
+    }
+    CHECK(match, "karatsuba mont mul vs fused at k=32");
+}
+
+// Direct kernel test at k=64 (4096-bit)
+static void test_karatsuba_mont_mul_vs_fused_4096() {
+    std::mt19937_64 rng(0xCA4A0002ull);
+    const uint32_t k = 64;
+    std::vector<uint64_t> mod(k), a(k), b(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;
+    mod[k-1] |= (1ull << 63);
+
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+
+    std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(a.data(), b.data(), k, mod.data(),
+                                         n0inv, out_fused.data(), work_fused.data());
+
+    uint32_t n_padded = 64;
+    std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
+    std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
+    std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::montgomery_mul_karatsuba(
+        a.data(), b.data(), k, mod.data(), n0inv,
+        out_kara.data(), work_kara.data(),
+        pa.data(), pb.data(), kbuf.data(), n_padded);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_fused[i] != out_kara[i]) { match = false; break; }
+    }
+    CHECK(match, "karatsuba mont mul vs fused at k=64");
+}
+
+// Non-power-of-2 k (e.g. k=33, padded to 64)
+static void test_karatsuba_mont_mul_non_pow2() {
+    std::mt19937_64 rng(0xCA4A0003ull);
+    const uint32_t k = 33;
+    std::vector<uint64_t> mod(k), a(k), b(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;
+    mod[k-1] |= (1ull << 63);
+
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+
+    // Fused CIOS reference
+    std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(a.data(), b.data(), k, mod.data(),
+                                         n0inv, out_fused.data(), work_fused.data());
+
+    // Karatsuba + REDC
+    uint32_t n_padded = 64;  // next pow2 >= 33
+    std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
+    std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
+    std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::montgomery_mul_karatsuba(
+        a.data(), b.data(), k, mod.data(), n0inv,
+        out_kara.data(), work_kara.data(),
+        pa.data(), pb.data(), kbuf.data(), n_padded);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_fused[i] != out_kara[i]) { match = false; break; }
+    }
+    CHECK(match, "karatsuba mont mul non-pow2 k=33");
+}
+
+// End-to-end pow_mod at 2048-bit (k=32, should use Karatsuba backend)
+static void test_karatsuba_pow_mod_2048bit() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    Hydra base = make(128, 0xAA01);
+    Hydra exp_val = make(64, 0xBB01);
+    Hydra mod_val = make(2048, 0xCC01);
+
+    Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+    Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+    CHECK(result == naive, "karatsuba pow_mod 2048-bit vs naive");
+}
+
+// End-to-end pow_mod at 4096-bit (k=64, should use Karatsuba backend)
+static void test_karatsuba_pow_mod_4096bit() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    Hydra base = make(128, 0xAA02);
+    Hydra exp_val = make(32, 0xBB02);  // smaller exp for 4096 to keep test fast
+    Hydra mod_val = make(4096, 0xCC02);
+
+    Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+    Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+    CHECK(result == naive, "karatsuba pow_mod 4096-bit vs naive");
+}
+
+// Random odd moduli sweep at widths crossing the Karatsuba threshold
+static void test_karatsuba_pow_mod_random_sweep() {
+    std::mt19937_64 rng(0xCA4A5EE9ull);
+    // Test at k = 32, 40, 48, 56, 64 (all >= KARATSUBA_MONT_THRESHOLD=32)
+    for (uint32_t k : {32u, 40u, 48u, 56u, 64u}) {
+        uint32_t bits = k * 64;
+        for (int trial = 0; trial < 5; ++trial) {
+            // Random odd modulus
+            std::vector<uint64_t> mod_limbs(k);
+            for (auto& l : mod_limbs) l = rng();
+            mod_limbs[0] |= 1u;
+            mod_limbs[k-1] |= (1ull << 63);
+            Hydra mod_val = Hydra::from_limbs(mod_limbs.data(), k);
+
+            // Random base (small, to keep naive fast) and exp
+            Hydra base{rng() % 1000000 + 2};
+            Hydra exp_val{rng() % 256 + 1};
+
+            Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+            Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+
+            std::string label = "karatsuba pow_mod random k=" +
+                std::to_string(k) + " trial=" + std::to_string(trial);
+            CHECK(result == naive, label.c_str());
+        }
+    }
+}
+
+// Karatsuba Montgomery squaring cross-check
+static void test_karatsuba_mont_sqr_cross() {
+    std::mt19937_64 rng(0xCA4A5041ull);
+    const uint32_t k = 32;
+    std::vector<uint64_t> mod(k), a(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;
+    mod[k-1] |= (1ull << 63);
+
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+    for (auto& l : a) l = rng();
+
+    // Squaring via fused CIOS (mul with a=b)
+    std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(a.data(), a.data(), k, mod.data(),
+                                         n0inv, out_fused.data(), work_fused.data());
+
+    // Squaring via Karatsuba + REDC
+    uint32_t n_padded = 32;
+    std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
+    std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
+    std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::montgomery_sqr_karatsuba(
+        a.data(), k, mod.data(), n0inv,
+        out_kara.data(), work_kara.data(),
+        pa.data(), pb.data(), kbuf.data(), n_padded);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_fused[i] != out_kara[i]) { match = false; break; }
+    }
+    CHECK(match, "karatsuba mont sqr vs fused at k=32");
+}
+
+// Boundary: k=31 should NOT use Karatsuba (stays on fused CIOS)
+// k=32 should use Karatsuba.  Both must produce same pow_mod result.
+static void test_karatsuba_threshold_boundary() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    // k=31 (below threshold — uses fused CIOS)
+    {
+        Hydra base = make(64, 0xB0D1ull);
+        Hydra exp_val = make(32, 0xB0D2ull);
+        Hydra mod_val = make(31 * 64, 0xB0D3ull);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "threshold boundary k=31 (fused CIOS)");
+    }
+    // k=32 (at threshold — uses Karatsuba)
+    {
+        Hydra base = make(64, 0xB0D4ull);
+        Hydra exp_val = make(32, 0xB0D5ull);
+        Hydra mod_val = make(32 * 64, 0xB0D6ull);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "threshold boundary k=32 (Karatsuba)");
+    }
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -3019,6 +3265,16 @@ int main() {
     test_fused_pow_mod_single_limb();
     test_fused_montgomery_mul_sweep();
     test_fused_pow_mod_boundary_widths();
+
+    // Karatsuba-backed Montgomery tests
+    test_karatsuba_mont_mul_vs_fused();
+    test_karatsuba_mont_mul_vs_fused_4096();
+    test_karatsuba_mont_mul_non_pow2();
+    test_karatsuba_pow_mod_2048bit();
+    test_karatsuba_pow_mod_4096bit();
+    test_karatsuba_pow_mod_random_sweep();
+    test_karatsuba_mont_sqr_cross();
+    test_karatsuba_threshold_boundary();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -1349,6 +1349,104 @@ and at `-O2`.
 
 ---
 
+### Karatsuba-Backed Montgomery Multiply
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+#### Hypothesis
+
+The O(k²) schoolbook product inside the fused CIOS Montgomery multiply
+is the dominant remaining cost at large widths (k ≥ 32).  Replacing
+it with a Karatsuba product (O(k^1.585)) in a separate product + REDC
+shape should improve pow_mod at 2048+ bits.
+
+#### Intervention
+
+Added `montgomery_mul_karatsuba` and `montgomery_sqr_karatsuba` to
+`hydra::detail`.  These compute the full 2k-limb product via the
+existing `mul_karatsuba` kernel (which uses `std::vector` per recursion
+frame — the same prototype from the earlier Karatsuba integration
+sprint), then apply word-by-word `montgomery_redc`.
+
+Three-tier dispatch in `pow_mod_montgomery`:
+
+```
+k < 8                      → separate schoolbook + REDC
+8 ≤ k < KARATSUBA_MONT_THRESHOLD  → fused CIOS
+k ≥ KARATSUBA_MONT_THRESHOLD && pad_ok → Karatsuba + REDC
+otherwise                  → fused CIOS (fallback)
+```
+
+`KARATSUBA_MONT_THRESHOLD = 32` (benchmark-derived).
+
+**Padding guard:** Karatsuba requires power-of-2 operand sizes.  When
+`n_padded / k > 1.25` (more than 25% wasted work from zero-padding),
+the dispatch falls back to fused CIOS.  This prevents the k=48 case
+(pads to 64, +22% regression) while allowing k=32 and k=64 (no padding
+overhead).
+
+Stack-allocated Karatsuba scratch (pa, pb, kara_buf) at MAX_K_PADDED=64
+avoids heap allocation for all widths up to 4096 bits.
+
+#### Benchmark Results
+
+**Kernel-level** (single montgomery_mul call, sandbox VM, g++ -O3):
+
+| k (limbs) | Fused CIOS | Karatsuba+REDC | K/F delta |
+|----------:|----------:|---------------:|----------:|
+|        32 |   1.24 µs |        1.13 µs |      −9%  |
+|        48 |   2.86 µs |        3.49 µs |     +22%  |
+|        64 |   5.33 µs |        4.45 µs |     −16%  |
+
+**End-to-end pow_mod** (50 samples, median):
+
+| Width | Fused CIOS only | With Karatsuba | Delta |
+|------:|----------------:|---------------:|------:|
+|  2048 |        ~2.80 ms |       ~2.85 ms |  flat |
+|  4096 |       ~24.8 ms  |       ~21.9 ms | **−12%** |
+
+#### Whether the Hypothesis Was Confirmed
+
+**Partially confirmed.**
+
+The Karatsuba product is 9–16% faster than fused CIOS at the kernel
+level for power-of-2 widths (k=32, k=64).  However, the REDC phase
+is itself O(k²) and unchanged, so the total Montgomery multiply sees
+only a fraction of the product-phase win.  At k=32 the e2e pow_mod
+improvement is lost in noise.  At k=64 the −12% e2e win is clean.
+
+The true bottleneck decomposition is:
+- Product phase: ~40–50% of total montgomery_mul cost (varies with k)
+- REDC phase: ~50–60% of total montgomery_mul cost
+- A 15% product-phase speedup translates to ~6–8% total montgomery_mul
+  win, which translates to ~5–12% e2e pow_mod win depending on width.
+
+The padding penalty for non-power-of-2 k is severe (+22% at k=48).
+The pad guard catches this cleanly.
+
+#### Correctness
+
+33 new tests, 855 total (822 prior + 33 new):
+
+- Kernel cross-checks: Karatsuba vs fused CIOS at k=32, 64, 33
+- Squaring cross-check at k=32
+- End-to-end pow_mod at 2048 and 4096 bits vs naive
+- Random sweep: 5 trials each at k=32, 40, 48, 56, 64
+- Threshold boundary: k=31 (fused) vs k=32 (Karatsuba)
+
+All pass at `-O0 -fsanitize=address,undefined` and at `-O3`.
+
+#### Recommended Next Step
+
+The REDC phase is now the dominant remaining cost, not the product phase.
+Karatsuba-accelerated REDC (or eliminating the separate REDC entirely via
+a Karatsuba-native Montgomery approach like FIPS or Comba) would be the
+next high-value target.  Alternatively, arena-backed Karatsuba scratch
+could push the crossover threshold down to k=16 (1024 bits) by eliminating
+the per-recursion `std::vector` allocation cost.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_

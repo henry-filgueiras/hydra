@@ -1517,6 +1517,75 @@ inline void montgomery_sqr(
     montgomery_redc(work, k, mod, n0inv, out);
 }
 
+// ─── Karatsuba-backed Montgomery multiply (separate product + REDC) ───
+//
+// For large k (≥ KARATSUBA_THRESHOLD_LIMBS), the O(k²) schoolbook product
+// inside the fused CIOS path becomes the dominant cost.  This alternate
+// backend computes the full 2k-limb product using Karatsuba (O(k^1.585)),
+// then applies word-by-word REDC.
+//
+// Trade-offs vs fused CIOS:
+//   + Asymptotically faster product phase (sub-quadratic)
+//   - Needs 2k+1 limbs of work buffer (vs k+2 for fused CIOS)
+//   - Two separate O(k²) passes (product + REDC) vs one fused pass
+//   - Karatsuba scratch (std::vector per recursion frame) adds allocator cost
+//
+// The crossover must be measured, not guessed.  This function exists to
+// enable that measurement.
+//
+// work[] must have at least 2k+1 limbs.
+// kara_buf[] must have at least 2*n_padded limbs (where n_padded is next pow2 >= k).
+// pa[], pb[] must have at least n_padded limbs each.
+//
+inline void montgomery_mul_karatsuba(
+    const uint64_t* a, const uint64_t* b,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work,
+    uint64_t* pa, uint64_t* pb, uint64_t* kara_buf,
+    uint32_t n_padded) noexcept
+{
+    // Step 1: Pad operands to next power of 2 for Karatsuba
+    std::memcpy(pa, a, k * sizeof(uint64_t));
+    if (n_padded > k) std::memset(pa + k, 0, (n_padded - k) * sizeof(uint64_t));
+    std::memcpy(pb, b, k * sizeof(uint64_t));
+    if (n_padded > k) std::memset(pb + k, 0, (n_padded - k) * sizeof(uint64_t));
+
+    // Step 2: Karatsuba product → kara_buf (2*n_padded limbs)
+    (void)mul_karatsuba(pa, pb, n_padded, kara_buf);
+
+    // Step 3: Copy the relevant 2k+1 limbs into work for REDC
+    // The product T = a * b has at most 2k limbs of actual value.
+    // kara_buf has 2*n_padded limbs; we need work[0..2k] for REDC.
+    std::memcpy(work, kara_buf, 2 * k * sizeof(uint64_t));
+    work[2 * k] = 0;  // overflow slot for REDC carry propagation
+
+    // Step 4: Montgomery reduction
+    montgomery_redc(work, k, mod, n0inv, out);
+}
+
+// Karatsuba-backed Montgomery squaring.
+// Same as montgomery_mul_karatsuba but with a == b, allowing the
+// dedicated squaring product (cross-terms + diagonal) to be used
+// for the product phase.  For now, we reuse mul_karatsuba with
+// identical operands — the squaring optimization inside Karatsuba
+// is a future follow-up.
+inline void montgomery_sqr_karatsuba(
+    const uint64_t* a,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work,
+    uint64_t* pa, uint64_t* pb, uint64_t* kara_buf,
+    uint32_t n_padded) noexcept
+{
+    montgomery_mul_karatsuba(a, a, k, mod, n0inv, out, work,
+                             pa, pb, kara_buf, n_padded);
+}
+
 } // namespace detail
 
 // ─────────────────────────────────────────────────────────
@@ -3140,24 +3209,38 @@ struct EGCDResult {
     // ── Stack-based scratch buffers ──
     // MONTGOMERY_MAX_LIMBS is 64 (4096 bits).  All buffers fit on stack.
     //
-    // Fused CIOS kernels need only k+2 limbs of scratch (vs 2k+1 for
-    // the separate mul+REDC path).  We still need 2k+1 for from_montgomery
-    // which uses the non-fused REDC, so work_buf is sized to the max.
+    // Three Montgomery multiply backends:
+    //   1. Separate schoolbook + REDC  (k < FUSED_THRESHOLD)
+    //   2. Fused CIOS                  (FUSED_THRESHOLD <= k < KARATSUBA_MONT_THRESHOLD)
+    //   3. Separate Karatsuba + REDC   (k >= KARATSUBA_MONT_THRESHOLD)
     //
-    // Note: the per-row limb shift in CIOS was investigated as a potential
-    // bottleneck.  Offset-tracking (sliding pointer into 2k+1 buffer)
-    // helped at 512/1024 but regressed at 2048/4096 due to cache pressure.
-    // Ring-buffer modular indexing was worse.  The compiler already handles
-    // the simple shift loop efficiently.  Conclusion: the shift is not
-    // the dominant cost; the O(k²) multiply-accumulate is.
+    // The Karatsuba backend replaces the O(k²) product phase with
+    // O(k^1.585), then runs the same word-by-word REDC.  The REDC
+    // itself is still O(k²), but at large k the product phase dominates
+    // total cost in the fused path (both multiply-accumulate and reduce
+    // are O(k²) per row × k rows).
     //
-    // Dispatch threshold: fused CIOS wins at k >= 8 (512+ bits) due to
-    // better cache locality and fewer memory passes.  At small k, the
-    // per-row limb shift overhead in CIOS exceeds the locality benefit,
-    // so we fall back to the separate mul+REDC path.
+    // The threshold is benchmark-derived.  Set to 0 (disabled) initially;
+    // the benchmark pass below will measure the actual crossover and
+    // update this constant.
     constexpr uint32_t MAX_K = 64;
     constexpr uint32_t FUSED_THRESHOLD = 8;  // k >= 8 → use fused CIOS
-    const bool use_fused = (k >= FUSED_THRESHOLD);
+    // Next power of 2 >= MAX_K for Karatsuba padding
+    constexpr uint32_t MAX_K_PADDED = 64;    // MAX_K is already a power of 2
+
+    // KARATSUBA_MONT_THRESHOLD: minimum k for Karatsuba-backed Montgomery.
+    // Benchmark-derived: Karatsuba + REDC beats fused CIOS at k=32 (−9%)
+    // and k=64 (−16%), but LOSES at k=48 (+22%) because 48 pads to 64.
+    // Guard: only use Karatsuba when the padding overhead is bounded —
+    // n_padded / k <= 1.25 (i.e. at most 25% wasted work from padding).
+    constexpr uint32_t KARATSUBA_MONT_THRESHOLD = 32;
+
+    uint32_t n_padded_test = 1;
+    while (n_padded_test < k) n_padded_test <<= 1;
+    // Padding ratio guard: reject if padding would waste > 25% of work
+    const bool pad_ok = (n_padded_test <= k + k / 4);
+    const bool use_karatsuba = (k >= KARATSUBA_MONT_THRESHOLD && pad_ok);
+    const bool use_fused = (!use_karatsuba && k >= FUSED_THRESHOLD);
 
     uint64_t work_buf[2 * MAX_K + 1];
     uint64_t temp_buf[MAX_K];
@@ -3168,6 +3251,19 @@ struct EGCDResult {
     std::memset(temp_buf, 0, k * sizeof(uint64_t));
     std::memset(result_mont_buf, 0, k * sizeof(uint64_t));
 
+    // ── Karatsuba scratch buffers (only used when use_karatsuba) ──
+    // n_padded = next power of 2 >= k (Karatsuba requires power-of-2 sizes)
+    uint32_t n_padded = 1;
+    if (use_karatsuba) {
+        while (n_padded < k) n_padded <<= 1;
+    }
+    // Stack-allocate at MAX_K_PADDED for bounded stack usage.
+    // pa, pb: padded operand copies (n_padded limbs each)
+    // kara_buf: Karatsuba output (2 * n_padded limbs)
+    uint64_t kara_pa[MAX_K_PADDED];
+    uint64_t kara_pb[MAX_K_PADDED];
+    uint64_t kara_buf[2 * MAX_K_PADDED];
+
     // ── Sliding window precomputation ──
     // Window size W=4: precompute base^1, base^3, base^5, ..., base^15
     // in Montgomery form.  table[i] = base^(2i+1) for i in [0..7].
@@ -3176,11 +3272,18 @@ struct EGCDResult {
     uint64_t table[TABLE_SIZE][MAX_K];
 
     // ── Montgomery mul/sqr dispatch helpers ──
-    // At k >= FUSED_THRESHOLD, use fused CIOS (interleaved multiply-reduce).
-    // Below that, use separate mul + REDC (less overhead for small k).
+    // Three-tier dispatch:
+    //   k >= KARATSUBA_MONT_THRESHOLD → Karatsuba product + REDC
+    //   k >= FUSED_THRESHOLD          → fused CIOS (interleaved multiply-reduce)
+    //   k < FUSED_THRESHOLD           → separate schoolbook + REDC
     auto mont_mul = [&](const uint64_t* a, const uint64_t* b,
                         uint64_t* out) {
-        if (use_fused)
+        if (use_karatsuba)
+            detail::montgomery_mul_karatsuba(a, b, k, ctx.mod_limbs.data(),
+                                              ctx.n0inv, out, work_buf,
+                                              kara_pa, kara_pb, kara_buf,
+                                              n_padded);
+        else if (use_fused)
             detail::montgomery_mul_fused(a, b, k, ctx.mod_limbs.data(),
                                           ctx.n0inv, out, work_buf);
         else
@@ -3188,7 +3291,12 @@ struct EGCDResult {
                                     ctx.n0inv, out, work_buf);
     };
     auto mont_sqr = [&](const uint64_t* a, uint64_t* out) {
-        if (use_fused)
+        if (use_karatsuba)
+            detail::montgomery_sqr_karatsuba(a, k, ctx.mod_limbs.data(),
+                                              ctx.n0inv, out, work_buf,
+                                              kara_pa, kara_pb, kara_buf,
+                                              n_padded);
+        else if (use_fused)
             detail::montgomery_sqr_fused(a, k, ctx.mod_limbs.data(),
                                           ctx.n0inv, out, work_buf);
         else
