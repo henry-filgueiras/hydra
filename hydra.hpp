@@ -212,6 +212,245 @@ inline uint32_t mul_limbs(
     return used;
 }
 
+// ── Row-based multiply-accumulate macro ────────────────────
+//
+// Accumulates a[i] * b[j] + out[i+j] + carry into __int128.
+// This never overflows because:
+//   max(out[k]) = 2^64-1, max(carry) = 2^64-1,
+//   max(a*b) = (2^64-1)^2 = 2^128 - 2^65 + 1
+//   Total ≤ 2^128 - 1, which fits in unsigned __int128.
+//
+// After the MAC: out[k] = low 64 bits, carry = high 64 bits.
+//
+#define HYDRA_ROW_MAC(out_k, carry, ai, bj) \
+    do { \
+        unsigned __int128 _t = \
+            static_cast<unsigned __int128>(ai) * (bj) \
+            + (out_k) + (carry); \
+        (out_k) = static_cast<uint64_t>(_t); \
+        (carry) = static_cast<uint64_t>(_t >> 64); \
+    } while (0)
+
+// ── Hand-unrolled 3×3 multiply (up to 6-limb result) ──────
+//
+// Row-based unrolling: for each a[i], multiply by all b[j] and
+// accumulate into out[i+j]. Each row is a 3-step chain.
+// The __int128 accumulator never overflows (proof above).
+//
+inline uint32_t mul_3x3(
+    const uint64_t* a, uint32_t na,
+    const uint64_t* b, uint32_t nb,
+    uint64_t* out) noexcept
+{
+    // Pad with zero for inputs smaller than 3 limbs.
+    uint64_t a0 = a[0], a1 = (na > 1) ? a[1] : 0, a2 = (na > 2) ? a[2] : 0;
+    uint64_t b0 = b[0], b1 = (nb > 1) ? b[1] : 0, b2 = (nb > 2) ? b[2] : 0;
+    uint64_t carry;
+
+    // Zero output
+    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0;
+
+    // Row 0: a0 * b[0..2]
+    carry = 0;
+    HYDRA_ROW_MAC(out[0], carry, a0, b0);
+    HYDRA_ROW_MAC(out[1], carry, a0, b1);
+    HYDRA_ROW_MAC(out[2], carry, a0, b2);
+    out[3] = carry;
+
+    // Row 1: a1 * b[0..2]
+    carry = 0;
+    HYDRA_ROW_MAC(out[1], carry, a1, b0);
+    HYDRA_ROW_MAC(out[2], carry, a1, b1);
+    HYDRA_ROW_MAC(out[3], carry, a1, b2);
+    out[4] = carry;
+
+    // Row 2: a2 * b[0..2]
+    carry = 0;
+    HYDRA_ROW_MAC(out[2], carry, a2, b0);
+    HYDRA_ROW_MAC(out[3], carry, a2, b1);
+    HYDRA_ROW_MAC(out[4], carry, a2, b2);
+    out[5] = carry;
+
+    // Trim
+    uint32_t used = 6;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
+// ── Hand-unrolled 4×4 multiply (up to 8-limb result) ──────
+//
+// Targets 256-bit × 256-bit (large_mul_256).
+// 4 rows × 4 MACs = 16 multiply-accumulates, fully unrolled.
+//
+inline uint32_t mul_4x4(
+    const uint64_t* a, const uint64_t* b,
+    uint64_t* out) noexcept
+{
+    uint64_t carry;
+
+    // Zero output
+    out[0] = out[1] = out[2] = out[3] = 0;
+    out[4] = out[5] = out[6] = out[7] = 0;
+
+    // Row 0: a[0] * b[0..3]
+    carry = 0;
+    HYDRA_ROW_MAC(out[0], carry, a[0], b[0]);
+    HYDRA_ROW_MAC(out[1], carry, a[0], b[1]);
+    HYDRA_ROW_MAC(out[2], carry, a[0], b[2]);
+    HYDRA_ROW_MAC(out[3], carry, a[0], b[3]);
+    out[4] = carry;
+
+    // Row 1: a[1] * b[0..3]
+    carry = 0;
+    HYDRA_ROW_MAC(out[1], carry, a[1], b[0]);
+    HYDRA_ROW_MAC(out[2], carry, a[1], b[1]);
+    HYDRA_ROW_MAC(out[3], carry, a[1], b[2]);
+    HYDRA_ROW_MAC(out[4], carry, a[1], b[3]);
+    out[5] = carry;
+
+    // Row 2: a[2] * b[0..3]
+    carry = 0;
+    HYDRA_ROW_MAC(out[2], carry, a[2], b[0]);
+    HYDRA_ROW_MAC(out[3], carry, a[2], b[1]);
+    HYDRA_ROW_MAC(out[4], carry, a[2], b[2]);
+    HYDRA_ROW_MAC(out[5], carry, a[2], b[3]);
+    out[6] = carry;
+
+    // Row 3: a[3] * b[0..3]
+    carry = 0;
+    HYDRA_ROW_MAC(out[3], carry, a[3], b[0]);
+    HYDRA_ROW_MAC(out[4], carry, a[3], b[1]);
+    HYDRA_ROW_MAC(out[5], carry, a[3], b[2]);
+    HYDRA_ROW_MAC(out[6], carry, a[3], b[3]);
+    out[7] = carry;
+
+    // Trim
+    uint32_t used = 8;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
+// ── Hand-unrolled 8×8 multiply (up to 16-limb result) ─────
+//
+// Targets 512-bit × 512-bit (large_mul_512).
+// 8 rows × 8 MACs = 64 multiply-accumulates, fully unrolled.
+// Row-based approach: each row multiplies a[i] by all of b[0..7],
+// accumulating into out[i..i+7]. The __int128 accumulator never
+// overflows (see proof at HYDRA_ROW_MAC).
+//
+inline uint32_t mul_8x8(
+    const uint64_t* a, const uint64_t* b,
+    uint64_t* out) noexcept
+{
+    uint64_t carry;
+
+    // Zero output (128 bytes)
+    for (int i = 0; i < 16; ++i) out[i] = 0;
+
+    // Row 0: a[0] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[0], carry, a[0], b[0]);
+    HYDRA_ROW_MAC(out[1], carry, a[0], b[1]);
+    HYDRA_ROW_MAC(out[2], carry, a[0], b[2]);
+    HYDRA_ROW_MAC(out[3], carry, a[0], b[3]);
+    HYDRA_ROW_MAC(out[4], carry, a[0], b[4]);
+    HYDRA_ROW_MAC(out[5], carry, a[0], b[5]);
+    HYDRA_ROW_MAC(out[6], carry, a[0], b[6]);
+    HYDRA_ROW_MAC(out[7], carry, a[0], b[7]);
+    out[8] = carry;
+
+    // Row 1: a[1] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[1], carry, a[1], b[0]);
+    HYDRA_ROW_MAC(out[2], carry, a[1], b[1]);
+    HYDRA_ROW_MAC(out[3], carry, a[1], b[2]);
+    HYDRA_ROW_MAC(out[4], carry, a[1], b[3]);
+    HYDRA_ROW_MAC(out[5], carry, a[1], b[4]);
+    HYDRA_ROW_MAC(out[6], carry, a[1], b[5]);
+    HYDRA_ROW_MAC(out[7], carry, a[1], b[6]);
+    HYDRA_ROW_MAC(out[8], carry, a[1], b[7]);
+    out[9] = carry;
+
+    // Row 2: a[2] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[2], carry, a[2], b[0]);
+    HYDRA_ROW_MAC(out[3], carry, a[2], b[1]);
+    HYDRA_ROW_MAC(out[4], carry, a[2], b[2]);
+    HYDRA_ROW_MAC(out[5], carry, a[2], b[3]);
+    HYDRA_ROW_MAC(out[6], carry, a[2], b[4]);
+    HYDRA_ROW_MAC(out[7], carry, a[2], b[5]);
+    HYDRA_ROW_MAC(out[8], carry, a[2], b[6]);
+    HYDRA_ROW_MAC(out[9], carry, a[2], b[7]);
+    out[10] = carry;
+
+    // Row 3: a[3] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[3], carry, a[3], b[0]);
+    HYDRA_ROW_MAC(out[4], carry, a[3], b[1]);
+    HYDRA_ROW_MAC(out[5], carry, a[3], b[2]);
+    HYDRA_ROW_MAC(out[6], carry, a[3], b[3]);
+    HYDRA_ROW_MAC(out[7], carry, a[3], b[4]);
+    HYDRA_ROW_MAC(out[8], carry, a[3], b[5]);
+    HYDRA_ROW_MAC(out[9], carry, a[3], b[6]);
+    HYDRA_ROW_MAC(out[10], carry, a[3], b[7]);
+    out[11] = carry;
+
+    // Row 4: a[4] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[4], carry, a[4], b[0]);
+    HYDRA_ROW_MAC(out[5], carry, a[4], b[1]);
+    HYDRA_ROW_MAC(out[6], carry, a[4], b[2]);
+    HYDRA_ROW_MAC(out[7], carry, a[4], b[3]);
+    HYDRA_ROW_MAC(out[8], carry, a[4], b[4]);
+    HYDRA_ROW_MAC(out[9], carry, a[4], b[5]);
+    HYDRA_ROW_MAC(out[10], carry, a[4], b[6]);
+    HYDRA_ROW_MAC(out[11], carry, a[4], b[7]);
+    out[12] = carry;
+
+    // Row 5: a[5] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[5], carry, a[5], b[0]);
+    HYDRA_ROW_MAC(out[6], carry, a[5], b[1]);
+    HYDRA_ROW_MAC(out[7], carry, a[5], b[2]);
+    HYDRA_ROW_MAC(out[8], carry, a[5], b[3]);
+    HYDRA_ROW_MAC(out[9], carry, a[5], b[4]);
+    HYDRA_ROW_MAC(out[10], carry, a[5], b[5]);
+    HYDRA_ROW_MAC(out[11], carry, a[5], b[6]);
+    HYDRA_ROW_MAC(out[12], carry, a[5], b[7]);
+    out[13] = carry;
+
+    // Row 6: a[6] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[6], carry, a[6], b[0]);
+    HYDRA_ROW_MAC(out[7], carry, a[6], b[1]);
+    HYDRA_ROW_MAC(out[8], carry, a[6], b[2]);
+    HYDRA_ROW_MAC(out[9], carry, a[6], b[3]);
+    HYDRA_ROW_MAC(out[10], carry, a[6], b[4]);
+    HYDRA_ROW_MAC(out[11], carry, a[6], b[5]);
+    HYDRA_ROW_MAC(out[12], carry, a[6], b[6]);
+    HYDRA_ROW_MAC(out[13], carry, a[6], b[7]);
+    out[14] = carry;
+
+    // Row 7: a[7] * b[0..7]
+    carry = 0;
+    HYDRA_ROW_MAC(out[7], carry, a[7], b[0]);
+    HYDRA_ROW_MAC(out[8], carry, a[7], b[1]);
+    HYDRA_ROW_MAC(out[9], carry, a[7], b[2]);
+    HYDRA_ROW_MAC(out[10], carry, a[7], b[3]);
+    HYDRA_ROW_MAC(out[11], carry, a[7], b[4]);
+    HYDRA_ROW_MAC(out[12], carry, a[7], b[5]);
+    HYDRA_ROW_MAC(out[13], carry, a[7], b[6]);
+    HYDRA_ROW_MAC(out[14], carry, a[7], b[7]);
+    out[15] = carry;
+
+    // Trim
+    uint32_t used = 16;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
+#undef HYDRA_ROW_MAC
+
 // Lexicographic compare of two limb arrays (MSB first logically, LSB stored first).
 // Returns -1, 0, +1.
 inline int cmp_limbs(
@@ -654,8 +893,39 @@ struct Hydra {
 
         if (lv.count == 0 || rv.count == 0) return Hydra{};
 
-        uint32_t out_size = lv.count + rv.count;
+        // ── Specialized fast paths for common widths ─────────
+        //
+        // Dispatch to hand-unrolled kernels when both operands
+        // fit within a known width. These avoid memset, branch
+        // overhead, and separate carry loops.
 
+        uint32_t max_limbs = std::max(lv.count, rv.count);
+        uint32_t out_size  = lv.count + rv.count;
+
+        // 3-limb kernel: covers Medium×Medium and any pair where
+        // both operands are ≤ 3 limbs (up to 192-bit × 192-bit).
+        if (max_limbs <= 3) {
+            uint64_t out[6];
+            uint32_t used = detail::mul_3x3(
+                lv.ptr, lv.count, rv.ptr, rv.count, out);
+            return from_limbs(out, used);
+        }
+
+        // 4-limb kernel: covers 256-bit × 256-bit exactly.
+        if (lv.count == 4 && rv.count == 4) {
+            uint64_t out[8];
+            uint32_t used = detail::mul_4x4(lv.ptr, rv.ptr, out);
+            return from_limbs(out, used);
+        }
+
+        // 8-limb kernel: covers 512-bit × 512-bit exactly.
+        if (lv.count == 8 && rv.count == 8) {
+            uint64_t out[16];
+            uint32_t used = detail::mul_8x8(lv.ptr, rv.ptr, out);
+            return from_limbs(out, used);
+        }
+
+        // ── Generic fallback ─────────────────────────────────
         if (out_size <= 6) {
             uint64_t out[6];
             uint32_t used = detail::mul_limbs(

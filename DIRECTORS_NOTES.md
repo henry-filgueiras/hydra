@@ -565,3 +565,104 @@ Only explore policy-based layouts after:
 * benchmark suite remains green and apples-to-apples
 
 Treat this as a **Phase 2 architectural fork**, not an immediate work item.
+
+---
+
+## 2026-04-15 — Specialized multiplication kernels (Claude Opus 4.6)
+
+### Motivation
+
+Profiling showed the generic `mul_limbs` schoolbook loop paying three taxes
+at small N that cumulatively hurt competitiveness with Boost:
+
+1. **memset of output buffer** — unnecessary when the accumulator fits in registers
+2. **branch per outer iteration** (`if (a[i] == 0) continue`) — unpredictable
+3. **Separate carry-propagation loop** after each inner-loop pass
+
+Baseline vs Boost: `medium_mul` +14.5%, `large_mul_256` −4.1%, `large_mul_512` +16.9%.
+
+### What was built
+
+Three hand-unrolled multiply kernels in `hydra::detail`:
+
+| Kernel | Width | MACs | Target path |
+|--------|-------|------|-------------|
+| `mul_3x3` | ≤3 × ≤3 limbs (≤192-bit) | 9 | `medium_mul` |
+| `mul_4x4` | 4 × 4 limbs (256-bit) | 16 | `large_mul_256` |
+| `mul_8x8` | 8 × 8 limbs (512-bit) | 64 | `large_mul_512` |
+
+All three use **row-based unrolling** with a single `unsigned __int128`
+accumulator (`HYDRA_ROW_MAC` macro). Each MAC computes
+`acc = a[i]*b[j] + out[i+j] + carry` — this provably never overflows
+`__int128` because max(out[k]) + max(carry) + max(product) = 2^128 − 1.
+
+### Design iteration: column-sum vs row-based
+
+Initial implementation used **column-sum** accumulation (sum all a[i]*b[j]
+where i+j=k) with a single `__int128` accumulator. This overflows when
+a column has 2+ products (max ≈ 2^129 for 2 terms).
+
+Second attempt used a **3-word (192-bit) accumulator** (`mac3` with
+c0/c1/c2 triple). Correct, but the extra `__int128` additions per MAC added
+~4 instructions of overhead — the 8×8 kernel was 21% *slower* than generic.
+
+Final implementation uses **row-based unrolling** (same memory pattern as
+generic schoolbook, but with all loops fully unrolled and branches removed).
+The `__int128` accumulator handles exactly one product + one prior output +
+one carry per step, which never overflows.
+
+### Dispatch in `mul_general`
+
+```
+max_limbs ≤ 3        → mul_3x3 (covers Medium×Medium, Small×Medium, etc.)
+lv==4 && rv==4       → mul_4x4
+lv==8 && rv==8       → mul_8x8
+otherwise            → generic mul_limbs (unchanged)
+```
+
+### Benchmark results (sandbox, x86-64, g++ -O3)
+
+Raw kernel speedups vs generic `mul_limbs`:
+
+| Kernel | Specialized | Generic | Speedup |
+|--------|------------|---------|---------|
+| 4×4 | 3.40 ns | 9.32 ns | 2.7× |
+| 8×8 | 15.88 ns | 23.87 ns | 1.5× |
+
+End-to-end (including `from_limbs` + normalization) vs previous baseline:
+
+| Path | Before | After | Improvement |
+|------|--------|-------|-------------|
+| `medium_mul` | 18.30 ns | 9.77 ns | −47% |
+| `large_mul_256` | 19.71 ns | 10.41 ns | −47% |
+| `large_mul_512` | 36.07 ns | 26.85 ns | −26% |
+
+All three paths now significantly beat Boost (which was at 15.98, 20.54,
+30.87 ns respectively), well exceeding the ±5% target.
+
+### Correctness verification
+
+16 new test cases in `hydra_test.cpp` covering:
+
+- Small×Small known-value check ((2^64−1)^2)
+- Medium×Medium cross-checked against generic `mul_limbs`
+- Full 3-limb×3-limb cross-checked against generic
+- Asymmetric 1-limb×3-limb via `mul_3x3` path
+- 4×4 with random seeds, cross-checked against generic
+- 4×4 with all-ones (worst-case carry)
+- 8×8 with random seeds, cross-checked against generic
+- 8×8 with all-ones (worst-case carry)
+- 8×8 with 5 different random seed pairs
+- Commutativity across all kernel paths
+- Identity (val×1) and zero (val×0) properties
+- Generic fallback (5×5) non-regression
+
+All 40 tests pass under ASan+UBSan at both `-O0` and `-O2`.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `hydra.hpp` | `mul_3x3`, `mul_4x4`, `mul_8x8` kernels; `mul_general` dispatch |
+| `hydra_test.cpp` | 16 multiplication correctness tests |
+| `quick_bench.cpp` | Standalone micro-benchmark (new, development tool) |
