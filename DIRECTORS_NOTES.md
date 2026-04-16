@@ -1643,4 +1643,50 @@ Fix: same fixed-operand approach as `large_add_cmp` (see Bug 3).
 
 ---
 
+### README First-Scroll Conversion Pass
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Documentation UX pass treating the README as a conversion funnel.  Goal:
+visitor lands → instantly understands capability → wants to scroll further.
+
+#### Placement decision
+
+The new "Quick Example" section is placed between the intro blockquote
+and the Visual Performance Story SVG.  This position was chosen over
+alternatives (after the perf story, or after Design Goals) because:
+
+1. It's the first content after the tagline — within the initial viewport
+   on both desktop and mobile GitHub rendering.
+2. The RSA showcase is a concrete, verifiable proof of capability that
+   answers "what can I build with this?" before any architecture theory.
+3. The performance story SVG then provides the "why is this fast?" visual
+   payoff, creating a natural intro→proof→explanation flow.
+
+#### Content
+
+Primary snippet: toy RSA (encrypt + decrypt + verify roundtrip) using
+`pow_mod`, `Hydra` string constructor, and ostream formatting.  Six lines
+of user code, output block with verified values.
+
+Secondary snippet: two-line arbitrary-precision arithmetic + `gcd` call.
+Included because it demonstrates developer ergonomics (signed literals,
+operator overloading, free functions) without cluttering — the visual
+weight is light enough to complement rather than compete with the RSA
+block.
+
+Both snippets include `using namespace hydra;` for copy-paste correctness.
+All output values were verified by compiling and running against the
+current `hydra.hpp`.
+
+#### Status section refresh
+
+The Completed/Active roadmap lists were updated to reflect all features
+landed during Phase 2 (signed arithmetic, native interop, string
+parse/format, Karatsuba production dispatch, number theory primitives).
+Stale roadmap items were replaced with current follow-ups (Toom-Cook,
+arena-backed Karatsuba scratch).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

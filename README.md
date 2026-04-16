@@ -20,6 +20,49 @@ In other words:
 
 ---
 
+## Quick Example
+
+Toy RSA in six lines — encrypt, decrypt, verify:
+
+```cpp
+#include <iostream>
+#include "hydra.hpp"
+using namespace hydra;
+
+int main() {
+    Hydra n("3233");
+    Hydra e(17);
+    Hydra d(2753);
+
+    Hydra message(65);
+
+    Hydra ciphertext = pow_mod(message, e, n);
+    Hydra recovered  = pow_mod(ciphertext, d, n);
+
+    std::cout << "message:    " << message    << "\n";
+    std::cout << "ciphertext: " << ciphertext << "\n";
+    std::cout << "recovered:  " << recovered  << "\n";
+}
+```
+
+```text
+message:    65
+ciphertext: 2790
+recovered:  65
+```
+
+Arbitrary-precision arithmetic just works:
+
+```cpp
+Hydra a("123456789012345678901234567890");
+Hydra b("-18446744073709551616");
+
+std::cout << a + b << "\n";   // 123456788993898934827525016274
+std::cout << gcd(a, b) << "\n";  // 2
+```
+
+---
+
 ## Visual Hydra Performance Story
 
 <p align="center">
@@ -205,13 +248,17 @@ Completed:
 * [x] multiplication (widening, hand-unrolled 256-bit and 512-bit kernels)
 * [x] bit-shift operators (`<<` / `>>`)
 * [x] full Hydra÷Hydra division via Knuth Algorithm D (`divmod` / `div` / `mod`)
+* [x] signed arithmetic (sign-magnitude representation)
+* [x] native interop (implicit conversion from all integral types)
+* [x] string parse / format with chunked base-10¹⁸ extraction
+* [x] Karatsuba multiplication (production-dispatched at ≥32 limbs)
+* [x] number theory primitives (`gcd`, `extended_gcd`, `pow_mod`)
 * [x] benchmarking vs `boost::multiprecision::cpp_int`
 
 Active roadmap:
 
-* [ ] signed arithmetic (sign bit allocated; semantics TBD)
-* [ ] Karatsuba multiplication for very large operands (schoolbook is fine up to ~200 limbs)
-* [ ] `to_string()` base-10⁹ extraction (currently slow at large sizes)
+* [ ] Toom-Cook multiplication for ≥128-limb operands
+* [ ] arena-backed Karatsuba scratch (may lower threshold to 16 limbs)
 * [ ] `std::hash<Hydra>` specialisation
 * [ ] PMR-style allocator hook
 
