@@ -265,14 +265,16 @@ static TimingResult bench_boost(Operands& ops) {
     TimingResult r;
     r.samples_ns.reserve(SAMPLE_COUNT);
 
+    // Force evaluation of expression template into cpp_int.
+    // Without this, powm() returns a lazy expression that is never computed.
     for (int i = 0; i < WARMUP_ITERS; ++i) {
-        auto result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
+        bmp::cpp_int result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
         asm volatile("" : : "g"(&result) : "memory");
     }
 
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
         auto t0 = clk::now();
-        auto result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
+        bmp::cpp_int result = bmp::powm(ops.b_base, ops.b_exp, ops.b_mod);
         auto t1 = clk::now();
         asm volatile("" : : "g"(&result) : "memory");
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
