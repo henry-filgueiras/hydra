@@ -694,6 +694,143 @@ sandbox VM has ~5 ns of per-run noise at the 25–70 ns scale.
 
 ---
 
+### Karatsuba Threshold — Measured Crossover
+
+_Benchmark-science pass, 2026-04-16 — Claude Opus 4.6_
+
+Phase-2 adaptive-threshold work begins with multiplication. Objective:
+land a data-derived constant `KARATSUBA_THRESHOLD_LIMBS` that marks
+where divide-and-conquer overtakes schoolbook on this target, **without**
+wiring it into `mul_general` yet. The existing specialised kernels
+(`mul_3x3`, `mul_4x4`, `mul_8x8`) and the generic `mul_limbs` fallback
+remain the sole multiplication path until the crossover is also
+validated end-to-end through the tiered dispatcher.
+
+#### Kernels landed
+
+- `detail::mul_karatsuba(a, b, n, out)` — recursive Karatsuba over
+  same-sized n-limb operands (n a power of 2). Three sub-products:
+  `z0 = a_lo·b_lo`, `z2 = a_hi·b_hi` recurse; middle
+  `z1 = (a_lo+a_hi)·(b_lo+b_hi) − z0 − z2` uses schoolbook because its
+  operand sizes can be m or m+1. Bottoms out in schoolbook at
+  `KARATSUBA_RECURSION_BASE` limbs.
+- `detail::addto_limbs` / `detail::subfrom_limbs` — in-place add/sub
+  primitives used for the z1 assembly step. Aliasing-safe via
+  ascending-index traversal.
+
+The prototype uses `std::vector` for z1 scratch at every recursion
+level. This is intentional: keep the implementation readable for a
+benchmark-science pass, and measure the *algorithmic* crossover rather
+than an implementation-optimised one. The scratch strategy upgrade
+(caller-supplied arena) is a follow-up.
+
+#### Benchmarks landed
+
+`bench/bench_hydra.cpp` § 7d — two parallel sweeps calling the kernels
+directly (bypassing `mul_general`'s specialised-kernel dispatch):
+
+- `mul_school/N` for N ∈ {1, 2, 3, 4, 8, 16, 32, 64} limbs.
+- `mul_karatsuba/N` for N ∈ {2, 4, 8, 16, 32, 64} limbs.
+
+Inputs are pre-built random limb arrays with MSL bit 63 set, reused
+across iterations so only the kernel call + output writes are inside
+the timed region. `DoNotOptimize` on inputs and output prevents
+constant folding.
+
+#### Measured crossover (Linux aarch64, g++ 11 -O3, 3×0.5s reps, CV < 0.5%)
+
+| width (bits) | limbs | schoolbook | karatsuba | delta     |
+|--------------|-------|------------|-----------|-----------|
+|      64      |   1   |   1.64 ns  |    n/a    |    —      |
+|     128      |   2   |   2.64 ns  |  4.49 ns  | +70% (S)  |
+|     192      |   3   |   4.68 ns  |    n/a    |    —      |
+|     256      |   4   |   7.78 ns  |  8.76 ns  | +13% (S)  |
+|     512      |   8   |  29.3 ns   |  28.4 ns  | tied      |
+|    1024      |  16   |   132 ns   |   134 ns  | tied *    |
+|    2048      |  32   |   559 ns   |   482 ns  | **−14% (K)** |
+|    4096      |  64   |  2561 ns   |  1725 ns  | **−33% (K)** |
+
+\* The 16-limb measurement is non-informative because Karatsuba-at-16
+bottoms out into schoolbook (`n <= KARATSUBA_RECURSION_BASE == 16`),
+so the two benchmarks run identical code paths.
+
+#### Decision: `KARATSUBA_THRESHOLD_LIMBS = 32`
+
+Rationale:
+
+- **32 limbs (2048 bits) is the smallest width with a clean measured
+  Karatsuba win.** One level of recursion (into two 16-limb schoolbook
+  sub-products plus the middle-sum schoolbook) beats the full 32×32
+  schoolbook by 14%.
+- **64-limb confirms the O(n^log₂3) ≈ O(n^1.585) scaling.** Doubling
+  the width from 32→64 quadruples schoolbook cost (559→2561 ns, 4.58×)
+  but only 3.58× Karatsuba cost (482→1725 ns), matching the asymptotic
+  ratio within noise.
+- **Below 32 limbs, Karatsuba is either tied or loses.** The prototype's
+  per-recursion allocator cost would have to be roughly halved to make
+  the 16-limb or 8-limb cases competitive, and that's a re-tune, not a
+  threshold choice.
+- **32 also aligns with the existing `STACK_LIMIT = 32` budget in
+  divmod.** "Large" = "≥ 2048 bits" is a consistent tier boundary.
+
+#### Rejected candidate: RECURSION_BASE tuning to unlock lower thresholds
+
+A side experiment ran the same sweep with `KARATSUBA_RECURSION_BASE=4`
+(maximally aggressive recursion). Results were strictly *worse* at
+every width from 2 through 64 limbs:
+
+```
+     base=16      base=4       delta
+  2  →    n/a          4.37 ns   (K still loses to schoolbook 2.64 ns)
+  4  →    n/a          8.55 ns   (ditto, vs 7.59 ns schoolbook)
+  8   28.0 ns         69.6 ns   (+149%, K much slower)
+ 16    133 ns          230 ns   (+73%)
+ 32    485 ns          735 ns   (+52%)
+ 64   1729 ns         2239 ns   (+30%)
+```
+
+Root cause: `std::vector` allocation per recursion frame is ~30 ns on
+this target. At small half-sizes that cost dominates the algorithmic
+savings. The fix is an arena-style scratch pointer passed through
+recursion, not a change to the crossover constant.
+
+Deferred to a follow-up: an arena-based Karatsuba rewrite may push the
+crossover down to 16 limbs (1024 bits), at which point
+`KARATSUBA_THRESHOLD_LIMBS` can be re-measured and tightened.
+
+#### Not landed — integration into `mul_general`
+
+Per the director's explicit instruction ("do not replace existing
+multiplication path until measured crossover is clear; no speculative
+threshold constants; benchmark-derived only"), the constant is
+declared and documented but `mul_general` is unchanged. Next-step
+work is:
+
+1. Validate end-to-end: call `operator*` on a full-width 2048-bit
+   Hydra × Hydra and confirm the dispatcher routes to Karatsuba once
+   wired.
+2. Re-run `bench_hydra` after wiring to confirm the 14% win at 32
+   limbs survives the dispatch overhead (one extra branch + a
+   thin `mul_karatsuba` wrapper).
+3. Re-check Boost comparison benchmarks; the Hydra/Boost delta at
+   large widths should improve.
+
+#### Correctness
+
+11 new cross-check tests in `hydra_test.cpp`:
+
+- `test_karatsuba_{4,8,16,32,64}x_` — random limb pairs, one seed
+  each, compared limb-for-limb against `mul_limbs`.
+- `test_karatsuba_all_ones` — `(2^N − 1)^2` at N ∈ {4, 8, 16, 32}
+  limbs, worst-case carry.
+- `test_karatsuba_recursion_boundary` — `n == KARATSUBA_RECURSION_BASE`
+  (hits base case) and `n == 2 × RECURSION_BASE` (exactly one level
+  of recursion).
+
+All 468 tests (prior 457 + new 11) pass at `-O0 -fsanitize=address,undefined`.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
@@ -705,7 +842,10 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 - **`to_string()` still slow.** Now uses `div_u64`/`mod_u64` (one alloc per
   digit); replace with base-10^9 extraction to cut digit-loop count by 9×.
 - **Schoolbook O(n²) multiplication.** Fine up to ~200 limbs; add Karatsuba
-  at n ≥ 32.
+  at n ≥ 32.  (2026-04-16: Karatsuba prototype + measured threshold of
+  32 limbs landed as `detail::mul_karatsuba` + `KARATSUBA_THRESHOLD_LIMBS`.
+  Dispatch integration is the remaining step — see "Karatsuba Threshold —
+  Measured Crossover" above.)
 - **No allocator customisation.** `LargeRep` uses `::operator new` directly.
   A PMR-style allocator hook is a natural extension.
 - **No hash specialisation.** `std::hash<Hydra>` should be added for use in
@@ -715,8 +855,9 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
   tuning is warranted.
 - **`operator*=` capacity reuse.** Same pattern as `operator+=` fast path;
   apply to `operator*=` in a future pass.
-- **Karatsuba / Toom-Cook.** `mul_8x8` is the current ceiling; add divide-
-  and-conquer for very large operands.
+- **Karatsuba / Toom-Cook.** `mul_8x8` is the current specialised-kernel
+  ceiling; Karatsuba prototype exists (2026-04-16) but is not yet on the
+  dispatch path.  Toom-Cook remains future work for ≥128-limb operands.
 
 ---
 

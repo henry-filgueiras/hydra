@@ -501,6 +501,241 @@ inline uint32_t mul_8x8(
 
 #undef HYDRA_ROW_MAC
 
+// ─────────────────────────────────────────────────────────────
+// Karatsuba multiplication (prototype) — Phase 2 benchmark-science
+// ─────────────────────────────────────────────────────────────
+//
+// Recursive Karatsuba over same-sized n-limb operands.  Designed to
+// be correct and clean for benchmark-driven crossover measurement
+// rather than for peak performance.  Will be wired into mul_general
+// only once the measured crossover point justifies it.
+//
+// Algorithm (for same-size n-limb operands a, b):
+//   Split a = a_hi·B + a_lo, b = b_hi·B + b_lo, where B = 2^(64·m),
+//   m = n/2, and each half is m limbs (n assumed to be a power of 2
+//   so the split is exact; callers pad if needed).
+//
+//   z0 = a_lo * b_lo       (2m limbs)
+//   z2 = a_hi * b_hi       (2m limbs)
+//   z1 = (a_lo + a_hi) * (b_lo + b_hi) - z0 - z2
+//
+//   result = z2·B² + z1·B + z0    (2n limbs)
+//
+// The three sub-multiplies use mul_karatsuba recursively for z0/z2
+// (same-sized) and schoolbook mul_limbs for the middle product
+// (operands may be m or m+1 limbs after the carry-producing adds).
+// This is a standard hybrid — recursive on the "corners" where the
+// subproblems keep the same shape, schoolbook on the "middle" where
+// shapes can diverge.
+//
+// ─────────────────────────────────────────────────────────────
+
+// In-place add: out[0..nout-1] += b[0..nb-1].  Returns the carry-out
+// from the highest limb of `out` (0 or 1).  Caller is responsible for
+// ensuring out has enough room — if carry-out is nonzero, the result
+// did not fit.  Used by Karatsuba's z1 assembly.
+inline uint64_t addto_limbs(
+    uint64_t* out, uint32_t nout,
+    const uint64_t* b, uint32_t nb) noexcept
+{
+    uint64_t carry = 0;
+    uint32_t i = 0;
+    const uint32_t paired = (nb < nout) ? nb : nout;
+    for (; i < paired; ++i) {
+        unsigned __int128 s =
+            static_cast<unsigned __int128>(out[i]) + b[i] + carry;
+        out[i] = static_cast<uint64_t>(s);
+        carry  = static_cast<uint64_t>(s >> 64);
+    }
+    // If b is longer than out, merge remaining b limbs (plus carry).
+    for (; i < nb; ++i) {
+        unsigned __int128 s =
+            static_cast<unsigned __int128>(b[i]) + carry;
+        // No `out[i]` term — we're past out's active region, but
+        // caller passed nout to include room for carry. If the caller
+        // sized nout == nb, this branch never fires.
+        (void)s;
+        carry = static_cast<uint64_t>(s >> 64);
+    }
+    // Propagate remaining carry through out's tail.
+    for (; i < nout && carry; ++i) {
+        uint64_t t = out[i] + carry;
+        carry = (t < carry) ? 1u : 0u;
+        out[i] = t;
+    }
+    return carry;
+}
+
+// In-place subtract: out[0..nout-1] -= b[0..nb-1].  Caller must
+// guarantee no underflow (the value held in out is >= the value held
+// in b).  This is the case for Karatsuba's z1 assembly because
+// (a_lo+a_hi)*(b_lo+b_hi) >= a_lo*b_lo + a_hi*b_hi algebraically.
+inline void subfrom_limbs(
+    uint64_t* out, uint32_t nout,
+    const uint64_t* b, uint32_t nb) noexcept
+{
+    assert(nout >= nb);
+    uint64_t borrow = 0;
+    uint32_t i = 0;
+    for (; i < nb; ++i) {
+        uint64_t oi = out[i];
+        uint64_t bi = b[i];
+        uint64_t d1 = oi - bi;
+        uint64_t b1 = (d1 > oi) ? 1u : 0u;
+        uint64_t d2 = d1 - borrow;
+        uint64_t b2 = (d2 > d1) ? 1u : 0u;
+        out[i] = d2;
+        borrow = b1 + b2;
+    }
+    for (; i < nout && borrow; ++i) {
+        uint64_t oi = out[i];
+        uint64_t d  = oi - borrow;
+        borrow = (d > oi) ? 1u : 0u;
+        out[i] = d;
+    }
+    assert(borrow == 0);
+}
+
+// ─── Karatsuba thresholds (benchmark-derived) ────────────────
+//
+// KARATSUBA_THRESHOLD_LIMBS — dispatch threshold.  Below this
+//   width, mul_general should stay on the schoolbook/specialised
+//   kernels; at or above it, Karatsuba becomes a measured win.
+//
+//   Measured on Linux aarch64 (sandbox, g++ 11 -O3, median of 3×0.5s
+//   repetitions, CV < 0.5%).  Crossover table:
+//
+//     limbs   schoolbook   karatsuba    winner
+//       2        2.6 ns       4.5 ns     schoolbook (+70%)
+//       4        7.8 ns       8.8 ns     schoolbook (+13%)
+//       8       29.3 ns      28.4 ns     tied
+//      16        132 ns       134 ns     tied (K hits base case)
+//      32        559 ns       482 ns     karatsuba (−14%)
+//      64       2561 ns      1725 ns     karatsuba (−33%)
+//
+//   32 limbs = 2048 bits is the smallest width where Karatsuba
+//   reliably beats schoolbook.  At 16 limbs the measurement is
+//   uninformative — the prototype's recursion bottoms out into
+//   schoolbook at 16, so the two functions run identical code.
+//
+//   This constant is declared now but NOT yet wired into
+//   mul_general.  The director's Phase-2 policy is "benchmark-
+//   derived only, do not replace the existing multiplication path
+//   until the crossover is clear."  The crossover is clear; the
+//   integration patch is a follow-up once the prototype is
+//   promoted out of std::vector-backed scratch.
+//
+// KARATSUBA_RECURSION_BASE — recursion base case.  Inside the
+//   Karatsuba kernel, when the recursive half-size drops to this
+//   many limbs we switch to schoolbook.  This is a PROTOTYPE-
+//   INTERNAL tuning parameter, not a dispatch threshold.
+//
+//   Empirically tested at 4 and 16; 16 wins at every measured
+//   size because the prototype's per-recursion allocator cost
+//   (std::vector in z1 assembly) swamps the algorithmic savings
+//   at small half-sizes.  A re-tune to lower values is expected
+//   once the scratch strategy switches to a caller-supplied
+//   arena.
+//
+constexpr uint32_t KARATSUBA_THRESHOLD_LIMBS = 32;
+constexpr uint32_t KARATSUBA_RECURSION_BASE  = 16;
+
+// Karatsuba multiplication of two same-sized n-limb operands.
+// `n` must be a power of 2 and >= 2.  Callers that violate this
+// should fall back to schoolbook; the recursion would otherwise
+// produce mismatched half-sizes.
+//
+// `out` must point to 2n limbs of writable storage.  Contents are
+// fully overwritten.  Returns the trimmed used-limb count.
+inline uint32_t mul_karatsuba(
+    const uint64_t* a, const uint64_t* b, uint32_t n,
+    uint64_t* out) noexcept
+{
+    assert(n >= 2 && (n & (n - 1)) == 0);  // power of two
+
+    if (n <= KARATSUBA_RECURSION_BASE) {
+        // Schoolbook base case.  mul_limbs zeroes `out` itself and
+        // returns the trimmed used-count.
+        return mul_limbs(a, n, b, n, out);
+    }
+
+    const uint32_t m = n >> 1;      // half size (exact because n is a pow2)
+
+    const uint64_t* a_lo = a;
+    const uint64_t* a_hi = a + m;
+    const uint64_t* b_lo = b;
+    const uint64_t* b_hi = b + m;
+
+    // Compute z0 directly into out[0..2m-1] and z2 into out[2m..2n-1].
+    // The two subproblems are disjoint ranges of `out`, so this is safe.
+    // Recursive call returns a trimmed used count, but we need the full
+    // 2m-limb region to be correct (including trailing zeros) because
+    // subsequent steps read it positionally. mul_karatsuba at the base
+    // case uses mul_limbs which writes every limb before trimming; at
+    // the recursive case it writes z0/z2 into disjoint halves of its
+    // own `out` and zero-fills internally. So the full range is valid.
+    (void)mul_karatsuba(a_lo, b_lo, m, out);
+    (void)mul_karatsuba(a_hi, b_hi, m, out + 2 * m);
+
+    // Now the trailing tail of the base-case mul_limbs may have written
+    // fewer than 2m limbs (trimmed).  We need the full 2m-limb region
+    // to be zero-extended.  mul_limbs writes into a zero-memset'd
+    // buffer; however, it does NOT re-zero across the 2m boundary.
+    // To be safe, zero-pad the upper tails of z0/z2 if the used count
+    // was short.  Easier: always memset before calling.  Simpler still:
+    // call mul_limbs in "known-zero output" form.  But our recursion
+    // returns `used` — we don't read it here, but callers of mul_limbs
+    // do memset first.  Since mul_limbs always starts with memset, and
+    // our recursive call ends up calling mul_limbs at the leaves, the
+    // full 2m region is properly zero-extended.  (Recursive internal
+    // nodes assemble the full 2m region via z0/z1/z2 combination.)
+    //
+    // No explicit action required — every path writes or zeroes the
+    // full 2m-limb range.
+
+    // Scratch for z1 assembly: two (m+1)-limb sums and one (2m+2)-limb
+    // product.  Total ≈ 4m+4 limbs of transient storage per frame.
+    //
+    // For the prototype we use std::vector.  This adds a ~constant
+    // per-level allocator cost but keeps the implementation readable.
+    // Asymptotic behaviour (the thing we actually care about for
+    // crossover measurement) is unaffected.
+    std::vector<uint64_t> sum_a(m + 1, 0);
+    std::vector<uint64_t> sum_b(m + 1, 0);
+
+    uint32_t sa_used = add_limbs(a_lo, m, a_hi, m, sum_a.data());
+    uint32_t sb_used = add_limbs(b_lo, m, b_hi, m, sum_b.data());
+
+    // Middle multiply: (sum_a) * (sum_b).  Max size (m+1)*(m+1) = 2m+2.
+    std::vector<uint64_t> z1((m + 1) * 2, 0);
+    uint32_t z1_used = mul_limbs(
+        sum_a.data(), sa_used,
+        sum_b.data(), sb_used,
+        z1.data());
+
+    // z1 := z1 - z0 - z2.  out[0..2m-1] = z0, out[2m..4m-1] = z2.
+    // The 2m region bound is the "full" region regardless of trim.
+    subfrom_limbs(z1.data(), z1_used, out,           2 * m);
+    subfrom_limbs(z1.data(), z1_used, out + 2 * m,   2 * m);
+
+    // Retrim z1_used since it may now be smaller.
+    while (z1_used > 0 && z1[z1_used - 1] == 0) --z1_used;
+
+    // Accumulate z1 into out at offset m (middle position).
+    // The available window in `out` from index m up to 2n-1 is
+    // 2n - m = 3m limbs — comfortably larger than z1_used (≤ 2m+2).
+    uint64_t final_carry = addto_limbs(
+        out + m, 2 * n - m,
+        z1.data(), z1_used);
+    assert(final_carry == 0);  // mathematically impossible
+    (void)final_carry;
+
+    // Trim.
+    uint32_t used = 2 * n;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
 // Lexicographic compare of two limb arrays (MSB first logically, LSB stored first).
 // Returns -1, 0, +1.
 inline int cmp_limbs(

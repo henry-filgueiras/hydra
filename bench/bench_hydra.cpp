@@ -787,6 +787,105 @@ static void BM_div_1024_512(benchmark::State& state) {
 BENCHMARK(BM_div_1024_512)->Name("div/1024_512");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// § 7d  Multiplication crossover benchmarks  (schoolbook vs Karatsuba)
+//
+// Goal: measure the exact limb-width where Karatsuba overtakes schoolbook
+// on this target.  The threshold that mul_general eventually hard-codes
+// (KARATSUBA_THRESHOLD_LIMBS) must be data-derived — these benches are
+// the data.
+//
+// Design choices:
+//
+//   • Both sides call the kernels DIRECTLY (detail::mul_limbs and
+//     detail::mul_karatsuba) — not through operator*.  This bypasses
+//     the existing specialized kernel dispatch (mul_3x3 / mul_4x4 /
+//     mul_8x8) so the comparison is a clean kernel-vs-kernel race at
+//     every width.  Once we pick a threshold we can discuss whether
+//     the specialized kernels still beat Karatsuba at the lower widths.
+//
+//   • Inputs are pre-constructed random limb arrays, timed region
+//     covers only the kernel call + output buffer writes (the writes
+//     are necessary for the kernel to do useful work; the buffer is
+//     reused across iterations so allocation is out-of-loop).
+//
+//   • Widths: 64, 128, 192, 256, 512, 1024, 2048, 4096 bits
+//     = 1, 2, 3, 4, 8, 16, 32, 64 limbs.
+//
+//   • Karatsuba is invoked only for widths that satisfy its prototype
+//     preconditions (n >= 2, power of 2).  That means we run it at
+//     2, 4, 8, 16, 32, 64 limbs.  1 and 3 limbs would require padding
+//     + a fallback to schoolbook inside the kernel — we don't model
+//     that path because it's not the shape the crossover will fire at.
+//
+//   • All schoolbook benches zero their output buffer inside mul_limbs
+//     each iteration.  That matches real usage — mul_general always
+//     sees a freshly-allocated (zeroed) scratch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pre-built random input pair of `n` non-zero limbs.  MSL bit 63 is set
+// so the operand is a full-width n-limb number (no leading zeros).
+struct MulInput {
+    std::vector<uint64_t> a;
+    std::vector<uint64_t> b;
+    std::vector<uint64_t> out;   // reused scratch, 2n limbs
+    explicit MulInput(uint32_t n, uint64_t seed = 0xBADDCAFE)
+        : a(n), b(n), out(2 * n)
+    {
+        XorShift64 rng{seed};
+        for (uint32_t i = 0; i < n; ++i) a[i] = rng.next() | 1u;
+        for (uint32_t i = 0; i < n; ++i) b[i] = rng.next() | 1u;
+        a.back() |= (1ull << 63);
+        b.back() |= (1ull << 63);
+    }
+};
+
+// ── Schoolbook (detail::mul_limbs) across all 8 widths ─────────────────────
+static void BM_mul_school(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    MulInput in{n, 0xA11CE};
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(in.a.data());
+        benchmark::DoNotOptimize(in.b.data());
+        uint32_t used = hydra::detail::mul_limbs(
+            in.a.data(), n, in.b.data(), n, in.out.data());
+        benchmark::DoNotOptimize(used);
+        benchmark::DoNotOptimize(in.out.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.counters["limbs"] = n;
+}
+BENCHMARK(BM_mul_school)->Name("mul_school")
+    ->Arg(1)->Arg(2)->Arg(3)->Arg(4)->Arg(8)
+    ->Arg(16)->Arg(32)->Arg(64);
+
+// ── Karatsuba (detail::mul_karatsuba) across Large-tier power-of-2 widths ──
+//
+// The prototype requires n >= 2 and n is a power of 2.  That covers
+// every benchmark width at or above 2 limbs except 3 (192-bit), which
+// the schoolbook kernel still handles natively.  The 4-limb case (256
+// bits) is included as a lower-bound sanity check — it's almost
+// certainly below the crossover, but we want the data point.
+static void BM_mul_karatsuba(benchmark::State& state) {
+    const auto n = static_cast<uint32_t>(state.range(0));
+    MulInput in{n, 0xBE11A};
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(in.a.data());
+        benchmark::DoNotOptimize(in.b.data());
+        uint32_t used = hydra::detail::mul_karatsuba(
+            in.a.data(), in.b.data(), n, in.out.data());
+        benchmark::DoNotOptimize(used);
+        benchmark::DoNotOptimize(in.out.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.counters["limbs"] = n;
+}
+BENCHMARK(BM_mul_karatsuba)->Name("mul_karatsuba")
+    ->Arg(2)->Arg(4)->Arg(8)
+    ->Arg(16)->Arg(32)->Arg(64);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // § 8  Boost.Multiprecision comparison  (opt-in: -DHYDRA_BENCH_BOOST=ON)
 //
 // Compile with:

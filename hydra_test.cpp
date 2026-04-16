@@ -357,6 +357,68 @@ static void test_mul_generic_fallback() {
     CHECK(c == expected, "5x5 (generic fallback) matches");
 }
 
+// ── Karatsuba prototype correctness ───────────────────────────────────
+//
+// Cross-check mul_karatsuba against mul_limbs at every power-of-2 width
+// the prototype supports.  Also probe worst-case carry behaviour
+// (all-ones operands) and the boundary between base case and first
+// recursive split (n == KARATSUBA_RECURSION_BASE vs n == 2× that).
+
+static void test_karatsuba_matches_school_random(uint32_t n, uint64_t seed) {
+    auto next = [v = seed]() mutable {
+        v ^= v << 13; v ^= v >> 7; v ^= v << 17;
+        return v;
+    };
+    std::vector<uint64_t> a(n), b(n);
+    for (uint32_t i = 0; i < n; ++i) a[i] = next() | 1u;
+    for (uint32_t i = 0; i < n; ++i) b[i] = next() | 1u;
+    a.back() |= (1ull << 63);
+    b.back() |= (1ull << 63);
+
+    std::vector<uint64_t> out_k(2 * n), out_s(2 * n);
+    hydra::detail::mul_karatsuba(a.data(), b.data(), n, out_k.data());
+    hydra::detail::mul_limbs(a.data(), n, b.data(), n, out_s.data());
+
+    bool eq = std::memcmp(out_k.data(), out_s.data(), 2 * n * sizeof(uint64_t)) == 0;
+    std::string msg = "karatsuba " + std::to_string(n) + "x" + std::to_string(n)
+                    + " matches schoolbook (seed " + std::to_string(seed) + ")";
+    CHECK(eq, msg.c_str());
+}
+
+static void test_karatsuba_4x4()   { test_karatsuba_matches_school_random(4,  0xA11CE); }
+static void test_karatsuba_8x8()   { test_karatsuba_matches_school_random(8,  0xB0B);   }
+static void test_karatsuba_16x16() { test_karatsuba_matches_school_random(16, 0xC0FFEE);}
+static void test_karatsuba_32x32() { test_karatsuba_matches_school_random(32, 0xD00DAD); }
+static void test_karatsuba_64x64() { test_karatsuba_matches_school_random(64, 0xE41C);  }
+
+static void test_karatsuba_all_ones() {
+    // Worst-case carry propagation: operands are 2^(64n) - 1.
+    // (2^N - 1)^2 = 2^(2N) - 2^(N+1) + 1, which has a specific limb pattern:
+    //   limbs [0..n-1] == 1, 0, 0, ..., 0
+    //   limbs [n..2n-1] == -2, -1, -1, ..., -1   (i.e. 0xFFFF...FE, then all-ones)
+    // But rather than hard-code the structure, just cross-check against mul_limbs.
+    for (uint32_t n : {4u, 8u, 16u, 32u}) {
+        std::vector<uint64_t> a(n, UINT64_MAX), b(n, UINT64_MAX);
+        std::vector<uint64_t> out_k(2 * n), out_s(2 * n);
+        hydra::detail::mul_karatsuba(a.data(), b.data(), n, out_k.data());
+        hydra::detail::mul_limbs(a.data(), n, b.data(), n, out_s.data());
+        bool eq = std::memcmp(out_k.data(), out_s.data(), 2 * n * sizeof(uint64_t)) == 0;
+        std::string msg = "karatsuba all-ones " + std::to_string(n) + "x" + std::to_string(n);
+        CHECK(eq, msg.c_str());
+    }
+}
+
+static void test_karatsuba_recursion_boundary() {
+    // n == KARATSUBA_RECURSION_BASE triggers the base case (schoolbook).
+    // n == 2× that triggers exactly one level of recursion.
+    // Both must produce the same result as schoolbook.
+    for (uint32_t n : {
+            hydra::detail::KARATSUBA_RECURSION_BASE,
+            hydra::detail::KARATSUBA_RECURSION_BASE * 2 }) {
+        test_karatsuba_matches_school_random(n, 0x900D1DEA);
+    }
+}
+
 // ── medium / small path regression tests ─────────────────────────────
 
 static void test_medium_add_inplace() {
@@ -986,6 +1048,15 @@ int main() {
     test_mul_commutativity();
     test_mul_identity_and_zero();
     test_mul_generic_fallback();
+
+    // Karatsuba prototype cross-checks (vs schoolbook mul_limbs)
+    test_karatsuba_4x4();
+    test_karatsuba_8x8();
+    test_karatsuba_16x16();
+    test_karatsuba_32x32();
+    test_karatsuba_64x64();
+    test_karatsuba_all_ones();
+    test_karatsuba_recursion_boundary();
 
     // Bit-shift tests
     test_shl_zero_shift();
