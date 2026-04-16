@@ -350,13 +350,140 @@ operands still isolate the add measurement from shift cost.
 
 ---
 
+### Full Hydra÷Hydra Division (Knuth Algorithm D)
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Phase 2's headline feature: `Hydra::divmod` (plus `div`/`mod` delegates)
+produces quotient + remainder in a single pass for any two positive Hydras.
+
+#### Algorithm choice: Knuth D over Burnikel-Ziegler
+
+BZ was considered and deferred. It only amortises above ~128 limbs and its
+inner multiply must be sub-quadratic for the asymptotic win to materialise.
+Hydra's current multiply ceiling is schoolbook O(n²) (8×8 kernel); wiring
+BZ on top would produce exactly the same asymptotic cost as Knuth D with
+more complexity. Knuth D is the right fit until Karatsuba lands.
+
+#### Public API shape
+
+```cpp
+struct Hydra::DivModResult { Hydra quotient; Hydra remainder; };
+
+Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const;
+Hydra               Hydra::div   (const Hydra& divisor) const;   // delegates
+Hydra               Hydra::mod   (const Hydra& divisor) const;   // delegates
+```
+
+`DivModResult` is declared as a nested struct, but defined **out-of-line**
+at namespace scope because its fields have type `Hydra` — which is
+incomplete at the point of the forward declaration inside the class body.
+The three methods are forward-declared inside the class and defined after
+`Hydra` closes. This is invisible to callers.
+
+Division by zero throws `std::domain_error`. Negative operands are
+undefined (signed arithmetic is still Phase 2 roadmap). Zero dividend,
+`divisor > dividend`, and `divisor == dividend` are all handled without
+entering the Knuth D kernel.
+
+#### Scratch buffer policy: stack ≤32 limbs, heap above
+
+```cpp
+constexpr uint32_t STACK_LIMIT = 32;  // 2048-bit operands
+uint64_t q_stack[STACK_LIMIT + 1];          // 33 × 8 = 264 B
+uint64_t r_stack[STACK_LIMIT];              //       256 B
+uint64_t work_stack[(STACK_LIMIT + 1) + STACK_LIMIT]; // 520 B
+```
+
+Total stack frame for the divmod call ≈ 1 KiB — well within any reasonable
+budget. Operands larger than 2048 bits fall through to `std::vector` scratch.
+This matches the same threshold we use for `mul_general` sizing.
+
+#### Kernel: `detail::divmod_knuth_limbs`
+
+Located in `hydra.hpp` adjacent to `divmod_u64_limbs`. Structure:
+
+1. **Normalize.** `shift = __builtin_clzll(v[nv-1])` so the divisor's
+   most-significant bit is set. Apply to both `u` (with carry out, hence
+   the `nu+1` slot) and `v` via the same sliding-window pattern used by
+   `shl_limbs`. Zero-shift path is a `memcpy`.
+
+2. **Main loop.** For `jj` from `nu-nv` down to `0`:
+   - Estimate `q_hat` from the top two dividend limbs divided by the
+     top divisor limb. Clamp to `~0ull` when the top dividend limb
+     equals the top divisor limb (the edge case Knuth explicitly calls out).
+   - Refine via the three-limb check
+     `q_hat*v[nv-2] > (r_hat<<64 | u[j+nv-2])`. An `r_hat_overflowed`
+     boolean short-circuits the refinement when `r_hat + v[nv-1]`
+     exceeds 64 bits — cleaner than a `goto` out of the loop.
+   - Multiply-subtract `q_hat * v` from `u[j..j+nv]`. Borrow propagation
+     uses the two-step unsigned pattern
+     `d1 = ui - p_lo; b1 = (d1 > ui); d2 = d1 - borrow; b2 = (d2 > d1);`
+     to avoid signed-integer UB entirely.
+   - Add-back step (rare: fires only when `q_hat` was over by 1 after
+     refinement): decrement `q_hat`, add `v` back into `u[j..j+nv]`,
+     discard the final carry (it cancels the earlier underflow).
+   - Store `q_hat` at `q[jj]`.
+
+3. **De-normalize.** Right-shift the remainder in `u[0..nv]` by `shift`.
+   Zero-shift path is a `memcpy`.
+
+Aliasing safety is guaranteed by the two-step borrow pattern: every read
+of `u[j+i]` completes before `u[j+i]` is written.
+
+#### Correctness coverage
+
+`hydra_test.cpp` adds **18** divmod tests covering the shape of the
+algorithm, not just random sweeps:
+
+- Zero dividend, divisor > dividend, equal values, divisor == 0 (throws)
+- Exact divisibility round-trip (`(q*b)/b == q`)
+- Power-of-two divisors cross-checked against `>>`
+- Single-limb delegation (`nv == 1` falls back to `div_u64`/`mod_u64`)
+- Pre-normalized divisor (top bit already set → `shift == 0` path)
+- Worst-case `q_hat` overestimate
+  (`v = [FFFF…, FFFF…, 8000…01]`) — exercises the refinement loop
+- 200 random pairs targeting add-back frequency
+- Stack-boundary (32/16 limbs) and heap path (40/20 limbs)
+- 128/64, 192/128, 512/256, 1024/512 (match the benchmark shapes)
+- Delegate consistency (`div == divmod.quotient`, `mod == divmod.remainder`)
+
+All 457 tests pass at `-O0` with ASan+UBSan and at `-O2`.
+
+#### Representative numbers (Linux g++ -O3, sandbox VM)
+
+```
+div/128_64         17.1 ns    (single-limb divisor → div_u64 delegation)
+div/192_128        18.3 ns    (minimum Knuth D shape, nv=2)
+div/512_256        65.5 ns    (nv=4, matches large_mul_256 width)
+div/1024_512        133 ns    (nv=8, matches large_mul_512 width)
+```
+
+The 128/64 case routes through `div_u64` so its 17 ns baseline reflects
+one allocation plus the scalar div path. The 192/128 → 1024/512 walk
+confirms roughly O(n²) scaling with small constant factors — consistent
+with Knuth D's expected cost when the outer loop runs `nu - nv + 1` times
+and the inner multiply-subtract is linear in `nv`.
+
+#### What this unlocks
+
+- `to_string` no longer has to loop through `mod_u64(10)` — a future
+  refactor can use `divmod(1_000_000_000)` to chunk 9 decimal digits at
+  a time.
+- Modular reduction for number-theoretic workloads (no longer limited
+  to 64-bit moduli).
+- GCD via Euclidean reduction directly on Hydras.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
-_Catalogued 2026-04-15 — Claude Sonnet 4.6_
+_Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 
 - **No signed arithmetic.** Sign bit (meta bit 2) is allocated but ignored.
-- **No full Hydra÷Hydra division.** The substrate is in place; implement
-  Knuth Algorithm D next using `shl_limbs`, `shr_limbs`, and `divmod_u64_limbs`.
+- ~~**No full Hydra÷Hydra division.**~~ **Landed 2026-04-16** as Knuth
+  Algorithm D in `detail::divmod_knuth_limbs` with `Hydra::divmod`/`div`/`mod`
+  public API. See "Full Hydra÷Hydra Division" above.
 - **`to_string()` still slow.** Now uses `div_u64`/`mod_u64` (one alloc per
   digit); replace with base-10^9 extraction to cut digit-loop count by 9×.
 - **Schoolbook O(n²) multiplication.** Fine up to ~200 limbs; add Karatsuba

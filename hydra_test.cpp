@@ -716,6 +716,214 @@ static void test_divmod_identity_exhaustive() {
     }
 }
 
+// ── Hydra ÷ Hydra (Knuth Algorithm D) tests ──────────────────────────
+//
+// Each test verifies the fundamental invariant:
+//   a == q * b + r,  0 ≤ r < b
+// using Hydra's own multiply and add.  Because mul+add are already
+// covered by earlier tests, this is a closed-loop check independent
+// of any reference implementation.
+
+static bool divmod_identity(const Hydra& a, const Hydra& b) {
+    auto qr = a.divmod(b);
+    Hydra reconstruct = qr.quotient * b + qr.remainder;
+    if (reconstruct != a) return false;
+    // Remainder must be strictly less than divisor (positive integers).
+    if (b.limb_count() > 0 && !(qr.remainder < b)) return false;
+    return true;
+}
+
+static void test_divmod_zero_dividend() {
+    Hydra a{0u};
+    Hydra b = make_large(4, 0x1111);
+    auto qr = a.divmod(b);
+    CHECK(qr.quotient  == Hydra{}, "0 / large: quotient = 0");
+    CHECK(qr.remainder == Hydra{}, "0 / large: remainder = 0");
+}
+
+static void test_divmod_divisor_greater_than_dividend() {
+    Hydra a = make_large(2, 0x1111);
+    Hydra b = make_large(4, 0x2222);
+    // b > a → quotient 0, remainder a.
+    auto qr = a.divmod(b);
+    CHECK(qr.quotient  == Hydra{}, "small / large: q = 0");
+    CHECK(qr.remainder == a,       "small / large: r = dividend");
+}
+
+static void test_divmod_equal_values() {
+    Hydra a = make_large(4, 0xCAFE);
+    auto qr = a.divmod(a);
+    CHECK(qr.quotient  == Hydra{1u}, "a / a: q = 1");
+    CHECK(qr.remainder == Hydra{},   "a / a: r = 0");
+}
+
+static void test_divmod_throws_on_zero_divisor() {
+    bool threw = false;
+    try { (void)make_large(4, 0xDEAD).divmod(Hydra{}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "divmod by 0 throws domain_error");
+}
+
+static void test_divmod_exact_divisibility() {
+    // q * b should divide cleanly with remainder 0.
+    Hydra b = make_large(3, 0x1111);
+    Hydra q = make_large(4, 0x2222);
+    Hydra a = q * b;
+    auto qr = a.divmod(b);
+    CHECK(qr.quotient  == q,      "(q*b) / b: quotient matches q");
+    CHECK(qr.remainder == Hydra{},"(q*b) / b: remainder = 0");
+}
+
+static void test_divmod_power_of_two_divisor() {
+    // For b = 2^k, division should match right-shift quotient and
+    // (a & (2^k - 1)) remainder.  Use Hydra-native operations only.
+    Hydra a = make_large(8, 0xBEEF);
+    for (unsigned k : {64u, 128u, 192u, 256u, 320u}) {
+        Hydra two_k = Hydra{1u} << k;
+        auto qr = a.divmod(two_k);
+        Hydra q_expected = a >> k;
+        CHECK(qr.quotient == q_expected, "a / 2^k == a >> k");
+        // a - q*2^k must equal the low-k-bit residue.
+        Hydra reconstruct = qr.quotient * two_k + qr.remainder;
+        CHECK(reconstruct == a, "a / 2^k: q*b+r == a");
+    }
+}
+
+static void test_divmod_small_divisor_same_as_div_u64() {
+    // Single-limb divisor path should agree with div_u64 / mod_u64.
+    Hydra a = make_large(8, 0xF00D);
+    const uint64_t divisors[] = {3ull, 7ull, 1000000007ull, UINT64_MAX};
+    for (uint64_t d : divisors) {
+        Hydra b{d};
+        auto qr = a.divmod(b);
+        CHECK(qr.quotient  == a.div_u64(d),       "divmod(1-limb) ≡ div_u64");
+        CHECK(qr.remainder == Hydra{a.mod_u64(d)},"divmod(1-limb).r ≡ mod_u64");
+    }
+}
+
+static void test_divmod_two_limb_divisor() {
+    // Multi-limb divisor exercising Knuth D directly.
+    // Two-limb divisor just barely normalised.
+    uint64_t d_limbs[2] = {0xDEAD'BEEFull, 0x1u}; // small high limb
+    Hydra b = Hydra::from_limbs(d_limbs, 2);
+    Hydra a = make_large(6, 0xABCD);
+    CHECK(divmod_identity(a, b), "2-limb divisor, 6-limb dividend");
+}
+
+static void test_divmod_v_top_bit_already_set() {
+    // Divisor already normalised: d == 0 shift path.
+    uint64_t d_limbs[2] = {0x1234ull, 0x8000'0000'0000'0000ull};
+    Hydra b = Hydra::from_limbs(d_limbs, 2);
+    Hydra a = make_large(4, 0xBEEF);
+    CHECK(divmod_identity(a, b), "pre-normalised divisor (d=0 path)");
+}
+
+static void test_divmod_worst_case_q_hat() {
+    // Construct inputs that historically triggered q_hat overestimate
+    // by 2 in naive implementations: divisor with v[nv-1] just above
+    // 2^63 and v[nv-2] large, and dividend whose top limb equals
+    // v[nv-1] so the initial q_hat = B-1.
+    //
+    // Build: v = [0xFFFF...FF, 0xFFFF...FF, 0x8000...01]
+    uint64_t v_limbs[3] = {
+        0xFFFF'FFFF'FFFF'FFFFull,
+        0xFFFF'FFFF'FFFF'FFFFull,
+        0x8000'0000'0000'0001ull,
+    };
+    Hydra v = Hydra::from_limbs(v_limbs, 3);
+    // u = v * q + r for some chosen q and r.
+    Hydra q_chosen = make_large(3, 0x4242);
+    Hydra r_chosen = Hydra{0x12345ull};  // small remainder; ensure r < v
+    Hydra u = v * q_chosen + r_chosen;
+    auto qr = u.divmod(v);
+    CHECK(qr.quotient  == q_chosen, "worst-case q_hat: quotient");
+    CHECK(qr.remainder == r_chosen, "worst-case q_hat: remainder");
+}
+
+static void test_divmod_add_back_scenario() {
+    // Try many random pairs to exercise the rare add-back correction
+    // path (~2/B chance per step — rare but must be correct when it
+    // fires).  200 random pairs × up to 10 steps = 2000 opportunities;
+    // at B = 2^64 the expected hit count is tiny but each iteration
+    // still runs the full multiply-subtract-correct path.
+    uint64_t seed = 0xC0DE;
+    for (int i = 0; i < 200; ++i) {
+        // Pseudo-random seed advance (same xorshift as make_large).
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        uint32_t nu = 2 + (seed % 7);           // 2..8 limbs
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        uint32_t nv = 2 + (seed % (nu - 1));    // 2..(nu-1) limbs
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        uint64_t sa = seed;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        uint64_t sb = seed;
+
+        Hydra a = make_large(nu, sa);
+        Hydra b = make_large(nv, sb);
+        // If b > a, divmod_identity still works: q=0, r=a.
+        CHECK(divmod_identity(a, b), "random large / large identity");
+    }
+}
+
+static void test_divmod_large_dividend_forces_heap_scratch() {
+    // nu > STACK_LIMIT (=32) forces the std::vector scratch path.
+    // Stress with 40-limb dividend, 20-limb divisor.
+    Hydra a = make_large(40, 0xF00D'BEEFull);
+    Hydra b = make_large(20, 0xDEAD'C0DEull);
+    CHECK(divmod_identity(a, b), "40/20-limb (heap scratch path)");
+}
+
+static void test_divmod_divisor_equals_stack_limit() {
+    // Exactly at the stack/heap boundary: 32-limb dividend.
+    Hydra a = make_large(32, 0xA5A5);
+    Hydra b = make_large(16, 0x5A5A);
+    CHECK(divmod_identity(a, b), "32/16-limb (stack scratch boundary)");
+}
+
+static void test_divmod_128_over_64() {
+    // Classic 128-bit ÷ 64-bit: dividend is 2-limb, divisor is 1-limb
+    // (routes through div_u64 path internally; sanity-check API).
+    uint64_t a_limbs[2] = {0xFEDC'BA98'7654'3210ull, 0x0123'4567'89ABull};
+    Hydra a = Hydra::from_limbs(a_limbs, 2);
+    Hydra b{0xDEAD'BEEFull};
+    auto qr = a.divmod(b);
+    Hydra reconstruct = qr.quotient * b + qr.remainder;
+    CHECK(reconstruct == a,                "128/64: q*b+r == a");
+    CHECK(qr.remainder < b,                "128/64: r < b");
+}
+
+static void test_divmod_192_over_128() {
+    // 3-limb ÷ 2-limb.
+    Hydra a = make_large(3, 0xAB01);
+    uint64_t b_limbs[2] = {0x1234'5678'9ABC'DEF0ull, 0x0000'FEDC'BA98'7654ull};
+    Hydra b = Hydra::from_limbs(b_limbs, 2);
+    CHECK(divmod_identity(a, b), "192/128");
+}
+
+static void test_divmod_512_over_256() {
+    // 8-limb ÷ 4-limb — the Knuth D "shape" at the ceiling of the
+    // existing hand-unrolled multiply kernels.
+    Hydra a = make_large(8, 0xBADC);
+    Hydra b = make_large(4, 0xD00D);
+    CHECK(divmod_identity(a, b), "512/256");
+}
+
+static void test_divmod_1024_over_512() {
+    // 16-limb ÷ 8-limb.
+    Hydra a = make_large(16, 0xDEAF);
+    Hydra b = make_large(8,  0xBEAD);
+    CHECK(divmod_identity(a, b), "1024/512");
+}
+
+static void test_div_mod_delegate_consistency() {
+    // div(v) and mod(v) must agree with divmod(v).
+    Hydra a = make_large(8, 0x9999);
+    Hydra b = make_large(4, 0xAAAA);
+    auto qr = a.divmod(b);
+    CHECK(a.div(b) == qr.quotient,  "div ≡ divmod.quotient");
+    CHECK(a.mod(b) == qr.remainder, "mod ≡ divmod.remainder");
+}
+
 // ── normalization / demotion from shift/div ───────────────────────────
 
 static void test_shift_result_normalized() {
@@ -819,6 +1027,26 @@ int main() {
     // Normalization / demotion
     test_shift_result_normalized();
     test_div_u64_result_normalized_to_small();
+
+    // Full Hydra ÷ Hydra (Knuth Algorithm D)
+    test_divmod_zero_dividend();
+    test_divmod_divisor_greater_than_dividend();
+    test_divmod_equal_values();
+    test_divmod_throws_on_zero_divisor();
+    test_divmod_exact_divisibility();
+    test_divmod_power_of_two_divisor();
+    test_divmod_small_divisor_same_as_div_u64();
+    test_divmod_two_limb_divisor();
+    test_divmod_v_top_bit_already_set();
+    test_divmod_worst_case_q_hat();
+    test_divmod_add_back_scenario();
+    test_divmod_large_dividend_forces_heap_scratch();
+    test_divmod_divisor_equals_stack_limit();
+    test_divmod_128_over_64();
+    test_divmod_192_over_128();
+    test_divmod_512_over_256();
+    test_divmod_1024_over_512();
+    test_div_mod_delegate_consistency();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

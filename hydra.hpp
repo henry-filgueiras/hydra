@@ -572,6 +572,211 @@ inline uint64_t divmod_u64_limbs(
     return rem;
 }
 
+// ── Knuth Algorithm D (multi-precision long division) ────
+//
+// Computes quotient = u / v and remainder = u % v for
+// unsigned, positive-integer operands.  Implementation
+// follows Knuth TAOCP Vol. 2 §4.3.1 Algorithm D.
+//
+// Input:
+//   u_in : dividend,  nu limbs (LSB first), nu >= nv
+//   v_in : divisor,   nv limbs (LSB first), nv >= 2,
+//                     v_in[nv-1] != 0
+//
+// Output:
+//   q    : quotient,  exactly (nu - nv + 1) limbs (LSB first).
+//                     Caller must provide this buffer.
+//                     The high limb may be 0 — trim at the API layer.
+//   r    : remainder, exactly nv limbs (LSB first).
+//                     Caller must provide this buffer.
+//                     May have leading zeros — trim at the API layer.
+//
+// Scratch:
+//   work : at least (nu + 1) + nv limbs.  Layout is
+//          [ u_norm : nu+1 limbs | v_norm : nv limbs ].
+//          Caller owns the buffer; this function zeroes what
+//          it needs.
+//
+// Algorithm:
+//   D1.  Normalize: left-shift v until v[nv-1] has bit 63 set.
+//        Apply the same shift to u (gains one extra high limb).
+//   D2.  For j from (nu-nv) down to 0:
+//      D3. Estimate q_hat from the top 2 limbs of u divided
+//          by the top limb of v.  Correct q_hat with a 2-step
+//          back-off loop using v[nv-2] and u[j+nv-2].
+//      D4. Multiply-subtract: u[j..j+nv] -= q_hat * v.
+//      D5/D6. If multiply-subtract underflowed, q_hat was too
+//          large by exactly 1.  Correct by decrementing q_hat
+//          and adding v back (the add's final carry cancels
+//          the subtract's borrow — discarded by design).
+//      D7. Store q_hat into q[j].
+//   D8.  Denormalize: right-shift u[0..nv-1] back into r.
+//
+// Worst-case q_hat overestimate is 2 before correction; with
+// the v[nv-2]/u[j+nv-2] refinement, the add-back case is hit
+// at most once per step and — per Knuth's analysis — occurs
+// on only ~2/B of inputs (negligible in practice).
+//
+inline void divmod_knuth_limbs(
+    const uint64_t* u_in, uint32_t nu,
+    const uint64_t* v_in, uint32_t nv,
+    uint64_t* q,
+    uint64_t* r,
+    uint64_t* work) noexcept
+{
+    assert(nv >= 2);
+    assert(nu >= nv);
+    assert(v_in[nv - 1] != 0);
+
+    uint64_t* u = work;                    // nu+1 limbs
+    uint64_t* v = work + (nu + 1);         // nv limbs
+
+    // ── D1. Normalize ───────────────────────────────────────
+    // Left-shift so the MSL of v has its top bit set.
+    const unsigned d = static_cast<unsigned>(
+        __builtin_clzll(v_in[nv - 1]));
+
+    if (d == 0) {
+        std::memcpy(u, u_in, nu * sizeof(uint64_t));
+        u[nu] = 0;
+        std::memcpy(v, v_in, nv * sizeof(uint64_t));
+    } else {
+        // Shift v left by d bits.
+        {
+            uint64_t carry = 0;
+            for (uint32_t i = 0; i < nv; ++i) {
+                v[i] = (v_in[i] << d) | carry;
+                carry = v_in[i] >> (64 - d);
+            }
+            // carry must be 0 because clz chose d exactly to land
+            // the top bit at position 63.
+            assert(carry == 0);
+        }
+        // Shift u left by d bits; high carry stored in u[nu].
+        {
+            uint64_t carry = 0;
+            for (uint32_t i = 0; i < nu; ++i) {
+                u[i] = (u_in[i] << d) | carry;
+                carry = u_in[i] >> (64 - d);
+            }
+            u[nu] = carry;
+        }
+    }
+
+    const uint64_t v_hi = v[nv - 1];   // leading limb, top bit set
+    const uint64_t v_lo = v[nv - 2];   // second-from-top limb
+
+    // ── D2–D7. Main loop ────────────────────────────────────
+    // Iterate from the top quotient position down to 0.
+    const uint32_t m = nu - nv;
+    for (int64_t jj = static_cast<int64_t>(m); jj >= 0; --jj) {
+        const uint32_t j = static_cast<uint32_t>(jj);
+
+        const uint64_t u_top = u[j + nv];
+        const uint64_t u_mid = u[j + nv - 1];
+
+        // ── D3. Estimate q_hat ──────────────────────────────
+        uint64_t q_hat;
+        uint64_t r_hat;
+        bool     r_hat_overflowed = false;
+
+        if (u_top >= v_hi) {
+            // q_hat would be ≥ B; clamp to B-1 = 2^64-1.
+            // After clamp, r_hat = u_top*B + u_mid - (B-1)*v_hi.
+            // Since u_top ≤ v_hi (invariant post-correction; at
+            // the first iteration u_top is the shift carry, which
+            // is < 2^d ≤ 2^63 ≤ v_hi), u_top == v_hi here — so:
+            //   r_hat = v_hi*B + u_mid - B*v_hi + v_hi
+            //         = u_mid + v_hi
+            // which may overflow one limb, signalling r_hat ≥ B
+            // (the correction loop must be skipped in that case).
+            q_hat = ~uint64_t{0};
+            const uint64_t r_tmp = u_mid + v_hi;
+            r_hat_overflowed = (r_tmp < u_mid);
+            r_hat = r_tmp;
+        } else {
+            unsigned __int128 num =
+                (static_cast<unsigned __int128>(u_top) << 64) | u_mid;
+            q_hat = static_cast<uint64_t>(num / v_hi);
+            r_hat = static_cast<uint64_t>(num % v_hi);
+        }
+
+        // Correction loop: refine q_hat using v[nv-2] and u[j+nv-2].
+        // Terminates in at most 2 iterations (Knuth §4.3.1 Thm B).
+        if (!r_hat_overflowed) {
+            const uint64_t u_low = u[j + nv - 2];
+            while (true) {
+                unsigned __int128 lhs =
+                    static_cast<unsigned __int128>(q_hat) * v_lo;
+                unsigned __int128 rhs =
+                    (static_cast<unsigned __int128>(r_hat) << 64) | u_low;
+                if (lhs <= rhs) break;
+                --q_hat;
+                uint64_t new_r = r_hat + v_hi;
+                if (new_r < r_hat) break;  // r_hat now ≥ B; stop
+                r_hat = new_r;
+            }
+        }
+
+        // ── D4. Multiply-subtract: u[j..j+nv] -= q_hat * v ─
+        uint64_t borrow = 0;
+        uint64_t carry  = 0;
+        for (uint32_t i = 0; i < nv; ++i) {
+            unsigned __int128 prod =
+                static_cast<unsigned __int128>(q_hat) * v[i] + carry;
+            const uint64_t p_lo = static_cast<uint64_t>(prod);
+            carry = static_cast<uint64_t>(prod >> 64);
+
+            const uint64_t ui = u[j + i];
+            const uint64_t d1 = ui - p_lo;
+            const uint64_t b1 = (d1 > ui) ? 1u : 0u;
+            const uint64_t d2 = d1 - borrow;
+            const uint64_t b2 = (d2 > d1) ? 1u : 0u;
+            u[j + i] = d2;
+            borrow = b1 + b2;           // provably ≤ 1
+        }
+        // Top limb: subtract final carry and the loop's borrow.
+        {
+            const uint64_t ui = u[j + nv];
+            const uint64_t d1 = ui - carry;
+            const uint64_t b1 = (d1 > ui) ? 1u : 0u;
+            const uint64_t d2 = d1 - borrow;
+            const uint64_t b2 = (d2 > d1) ? 1u : 0u;
+            u[j + nv] = d2;
+            const bool need_add_back = (b1 + b2) != 0;
+
+            // ── D5/D6. Add-back correction ──────────────────
+            // Triggered when q_hat was too high by exactly 1.
+            // Decrement q_hat and add v back; the final carry
+            // cancels the subtract's borrow (discarded).
+            if (need_add_back) {
+                --q_hat;
+                uint64_t c = 0;
+                for (uint32_t i = 0; i < nv; ++i) {
+                    unsigned __int128 s =
+                        static_cast<unsigned __int128>(u[j + i]) + v[i] + c;
+                    u[j + i] = static_cast<uint64_t>(s);
+                    c = static_cast<uint64_t>(s >> 64);
+                }
+                u[j + nv] += c;   // overflow cancels subtract-borrow
+            }
+        }
+
+        // ── D7. Store quotient digit ───────────────────────
+        q[j] = q_hat;
+    }
+
+    // ── D8. Denormalize: r = u[0..nv-1] >> d ───────────────
+    if (d == 0) {
+        std::memcpy(r, u, nv * sizeof(uint64_t));
+    } else {
+        for (uint32_t i = 0; i + 1 < nv; ++i) {
+            r[i] = (u[i] >> d) | (u[i + 1] << (64 - d));
+        }
+        r[nv - 1] = u[nv - 1] >> d;
+    }
+}
+
 } // namespace detail
 
 // ─────────────────────────────────────────────────────────
@@ -1283,6 +1488,55 @@ struct Hydra {
     }
 
     // ─────────────────────────────────────────────────────
+    // Full Hydra ÷ Hydra division (Knuth Algorithm D)
+    //
+    //   divmod(v) → { quotient, remainder } in one pass
+    //   div(v)    → delegates to divmod(v).quotient
+    //   mod(v)    → delegates to divmod(v).remainder
+    //
+    // All three preserve the normalization invariant — every
+    // returned Hydra occupies the smallest valid tier.
+    //
+    // Algorithm choice: classical Knuth D over Burnikel–Ziegler.
+    // BZ is asymptotically O(n^log2(3)) via recursive halving
+    // but its speedup only materialises when the base-case
+    // multiply is sub-quadratic (Karatsuba/Toom).  Hydra's
+    // current multiplier is schoolbook O(n²) up to 8 limbs
+    // with hand-unrolled kernels, so BZ would pay its
+    // recursion + allocation overhead without a compensating
+    // asymptotic win.  Revisit once Karatsuba lands (Phase 2
+    // roadmap item: "Karatsuba / Toom-Cook").
+    //
+    // Dispatch:
+    //   divisor == 0   → std::domain_error
+    //   dividend == 0  → { 0, 0 }
+    //   dividend < div → { 0, dividend }
+    //   div == 1 limb  → delegate to div_u64 / mod_u64
+    //   otherwise      → Knuth D via detail::divmod_knuth_limbs
+    //
+    // Scratch buffer policy:
+    //   nu ≤ 32 limbs  → stack buffers (zero heap)
+    //   nu >  32 limbs → std::vector (one allocation for
+    //                    scratch, plus whatever
+    //                    from_limbs() needs for the result)
+    //
+    // Phase-2 scope: positive integers only.  Signed division
+    // (Euclidean vs. truncated) is a separate design decision
+    // reserved for when signed arithmetic lands.
+    // ─────────────────────────────────────────────────────
+
+    // DivModResult is defined at namespace scope (immediately after
+    // this class) because a nested struct cannot contain full Hydra
+    // members while Hydra's own definition is still incomplete.
+    // The three member functions are declared here and defined
+    // out-of-line below DivModResult.
+    struct DivModResult;
+
+    [[nodiscard]] inline DivModResult divmod(const Hydra& divisor) const;
+    [[nodiscard]] inline Hydra        div   (const Hydra& divisor) const;
+    [[nodiscard]] inline Hydra        mod   (const Hydra& divisor) const;
+
+    // ─────────────────────────────────────────────────────
     // Debug / inspection
     // ─────────────────────────────────────────────────────
 
@@ -1315,6 +1569,105 @@ struct Hydra {
         return digits.empty() ? "0" : digits;
     }
 };
+
+// ─────────────────────────────────────────────────────────
+// DivModResult (nested-but-out-of-line)
+//
+// Declared inside Hydra as a forward declaration; defined
+// here now that Hydra is complete.  Keeps the API pair
+// (quotient, remainder) returned in a single call without
+// forcing callers to pattern-match on an optional.
+// ─────────────────────────────────────────────────────────
+
+struct Hydra::DivModResult {
+    Hydra quotient;
+    Hydra remainder;
+};
+
+// ─────────────────────────────────────────────────────────
+// Out-of-line definitions for divmod / div / mod
+// ─────────────────────────────────────────────────────────
+
+inline Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const {
+    // ── Divisor == 0: throw ─────────────────────────────
+    auto dv = divisor.limb_view();
+    if (dv.count == 0)
+        throw std::domain_error("Hydra::divmod: division by zero");
+
+    // ── Dividend == 0: trivially { 0, 0 } ──────────────
+    auto uv = limb_view();
+    if (uv.count == 0)
+        return { Hydra{}, Hydra{} };
+
+    // ── Ordering short-circuits ─────────────────────────
+    const int cmp = compare(divisor);
+    if (cmp < 0)  return { Hydra{}, *this };      // q = 0, r = self
+    if (cmp == 0) return { Hydra{1u}, Hydra{} };  // q = 1, r = 0
+
+    // ── Single-limb divisor: delegate to scalar path ───
+    if (dv.count == 1) {
+        const uint64_t d = dv.ptr[0];
+        return { div_u64(d), Hydra{ mod_u64(d) } };
+    }
+
+    // ── General multi-limb case: Knuth Algorithm D ─────
+    const uint32_t nu = uv.count;
+    const uint32_t nv = dv.count;
+    const uint32_t nq = nu - nv + 1;
+
+    // Scratch sizing:
+    //   q_buf:    nq      limbs  (quotient)
+    //   r_buf:    nv      limbs  (remainder)
+    //   work_buf: nu+1+nv limbs  (u_norm | v_norm scratch)
+    //
+    // Stack budget: nu ≤ 32 → q ≤ 32, r ≤ 32, work ≤ 65.
+    // Total ~1032 bytes — well within frame budget, zero
+    // heap activity for the common case.
+    constexpr uint32_t STACK_LIMIT = 32;
+
+    uint64_t  q_stack[STACK_LIMIT + 1];
+    uint64_t  r_stack[STACK_LIMIT];
+    uint64_t  work_stack[(STACK_LIMIT + 1) + STACK_LIMIT];
+
+    uint64_t* q_buf    = nullptr;
+    uint64_t* r_buf    = nullptr;
+    uint64_t* work_buf = nullptr;
+
+    std::vector<uint64_t> q_heap, r_heap, work_heap;
+
+    if (nu <= STACK_LIMIT) {
+        q_buf    = q_stack;
+        r_buf    = r_stack;
+        work_buf = work_stack;
+    } else {
+        q_heap.resize(nq);
+        r_heap.resize(nv);
+        work_heap.resize(static_cast<size_t>(nu) + 1u + nv);
+        q_buf    = q_heap.data();
+        r_buf    = r_heap.data();
+        work_buf = work_heap.data();
+    }
+
+    detail::divmod_knuth_limbs(
+        uv.ptr, nu,
+        dv.ptr, nv,
+        q_buf, r_buf, work_buf);
+
+    // from_limbs trims trailing zeros and picks the smallest
+    // valid tier — no explicit normalize() needed.
+    return {
+        Hydra::from_limbs(q_buf, nq),
+        Hydra::from_limbs(r_buf, nv),
+    };
+}
+
+inline Hydra Hydra::div(const Hydra& divisor) const {
+    return divmod(divisor).quotient;
+}
+
+inline Hydra Hydra::mod(const Hydra& divisor) const {
+    return divmod(divisor).remainder;
+}
 
 // ─────────────────────────────────────────────────────────
 // Convenience literals

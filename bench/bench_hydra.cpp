@@ -698,6 +698,95 @@ static void BM_chain_shift_large(benchmark::State& state) {
 BENCHMARK(BM_chain_shift_large)->Name("chain/shift_large_10");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// § 7c  Division benchmarks  (Phase 2 — Knuth Algorithm D)
+//
+// Goal: measure full Hydra ÷ Hydra at the canonical operand shapes used to
+// validate Knuth D's correctness (128/64, 192/128, 512/256, 1024/512).  These
+// widths cover the entire dispatch surface:
+//
+//   • 128/64   — nv == 1: delegates to div_u64 (single-limb divisor path)
+//   • 192/128  — nv == 2: Knuth D kicks in; stack scratch path
+//   • 512/256  — nv == 4: stack scratch path
+//   • 1024/512 — nv == 8: stack scratch path (nu == 16 ≤ STACK_LIMIT == 32)
+//
+// Inputs are pre-constructed outside the loop so the timed region captures
+// only: compare(), scratch setup, the Knuth D kernel, and from_limbs on
+// quotient + remainder.  DoNotOptimize on inputs and result prevents
+// constant-folding; ClobberMemory is not strictly needed (no aliasing heap
+// mutation) but matches the pattern in §7b.
+//
+// Absolute numbers are less interesting here than the shape of the curve:
+// Knuth D is O((nu − nv) × nv), so 1024/512 should cost roughly
+// (16−8)×8 = 64× the 192/128 step count of (3−2)×2 = 2.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── 128 / 64 — single-limb divisor (delegates to div_u64 internally) ────────
+static void BM_div_128_64(benchmark::State& state) {
+    // 2-limb dividend, 1-limb divisor.
+    uint64_t u_limbs[2] = { 0xFEDC'BA98'7654'3210ull,
+                            0x0123'4567'89AB'CDEFull };
+    Hydra u = Hydra::from_limbs(u_limbs, 2);
+    Hydra v{ 0xDEAD'BEEF'CAFE'BABEull };
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(u);
+        benchmark::DoNotOptimize(v);
+        auto qr = u.divmod(v);
+        benchmark::DoNotOptimize(qr.quotient);
+        benchmark::DoNotOptimize(qr.remainder);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_div_128_64)->Name("div/128_64");
+
+// ── 192 / 128 — minimum Knuth D shape ───────────────────────────────────────
+static void BM_div_192_128(benchmark::State& state) {
+    // 3-limb dividend, 2-limb divisor.
+    Hydra u = make_large(3, 0xAB01);
+    uint64_t v_limbs[2] = { 0x1234'5678'9ABC'DEF0ull,
+                            0x0000'FEDC'BA98'7654ull };
+    Hydra v = Hydra::from_limbs(v_limbs, 2);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(u);
+        benchmark::DoNotOptimize(v);
+        auto qr = u.divmod(v);
+        benchmark::DoNotOptimize(qr.quotient);
+        benchmark::DoNotOptimize(qr.remainder);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_div_192_128)->Name("div/192_128");
+
+// ── 512 / 256 — matches the existing large_mul_256 width ────────────────────
+static void BM_div_512_256(benchmark::State& state) {
+    Hydra u = make_large(8, 0xBADC);
+    Hydra v = make_large(4, 0xD00D);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(u);
+        benchmark::DoNotOptimize(v);
+        auto qr = u.divmod(v);
+        benchmark::DoNotOptimize(qr.quotient);
+        benchmark::DoNotOptimize(qr.remainder);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_div_512_256)->Name("div/512_256");
+
+// ── 1024 / 512 — matches the existing large_mul_512 width ───────────────────
+static void BM_div_1024_512(benchmark::State& state) {
+    Hydra u = make_large(16, 0xDEAF);
+    Hydra v = make_large(8,  0xBEAD);
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(u);
+        benchmark::DoNotOptimize(v);
+        auto qr = u.divmod(v);
+        benchmark::DoNotOptimize(qr.quotient);
+        benchmark::DoNotOptimize(qr.remainder);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_div_1024_512)->Name("div/1024_512");
+
+// ─────────────────────────────────────────────────────────────────────────────
 // § 8  Boost.Multiprecision comparison  (opt-in: -DHYDRA_BENCH_BOOST=ON)
 //
 // Compile with:
