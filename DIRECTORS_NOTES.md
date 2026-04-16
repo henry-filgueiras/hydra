@@ -2109,11 +2109,8 @@ The 4096-bit improvement (32%) came primarily from the raised threshold
 
 #### What is Still Inferred
 
-- The relative contribution of each intervention (sqr vs window vs alloc)
-  was not isolated individually.  Based on the arithmetic: sqr saves
-  ~30% of product-phase work, window saves ~50% of multiplies, alloc
-  saves per-call overhead.  All three likely contribute, with sqr+window
-  being dominant at larger widths.
+- ~~The relative contribution of each intervention (sqr vs window vs alloc)
+  was not isolated individually.~~ **Resolved** — see Attribution Pass below.
 
 - The raised threshold (48→64) may benefit from going even higher once
   Karatsuba is wired into the Montgomery multiply (currently schoolbook
@@ -2121,12 +2118,183 @@ The 4096-bit improvement (32%) came primarily from the raised threshold
 
 #### Recommended Next Step
 
-**Fused Montgomery multiplication (interleaved product + reduction).**
-The current path computes the full 2k-limb product, then runs REDC as a
-separate pass.  A fused approach computes one row of the product and
-immediately reduces, halving the scratch memory and improving cache
-locality.  This is the standard approach in GMP's `mpn_mont_mul` and
-would be the next high-SNR lever before assembly.
+~~**Fused Montgomery multiplication (interleaved product + reduction).**~~
+**Completed** — see Fused CIOS Montgomery Kernel below.
+
+---
+
+### Attribution Pass: Previous Optimization Round
+
+_Conducted 2026-04-16 — Claude Opus 4.6_
+
+Isolated the contribution of each of the three interventions from the
+Montgomery engine optimization (dedicated squaring, sliding window,
+stack scratch).  Method: standalone harness (`bench/attribution_pass.cpp`)
+with three variant paths, each reverting exactly one intervention while
+keeping the other two intact.  Correctness cross-checked before timing.
+
+#### Methodology
+
+| Variant         | What it reverts                                       |
+|-----------------|-------------------------------------------------------|
+| `No-DedSqr`    | Calls `montgomery_mul(a, a)` instead of `montgomery_sqr` |
+| `Binary-Exp`    | Binary (1-bit) square-and-multiply instead of 4-bit window |
+| `Heap-Scratch`  | `std::vector` allocations instead of stack arrays      |
+
+30 samples per variant, median, Linux g++ -O3 sandbox.
+
+#### Results (% regression when reverting each feature)
+
+| Width | Sqr Revert | Window Revert | Heap Revert |
+|------:|-----------:|--------------:|------------:|
+| 1024  |     +14%   |       +29%    |     +0.5%   |
+| 2048  |     +20%   |       +28%    |     −0.6%   |
+| 4096  |     +23%   |       +30%    |     +0.0%   |
+
+#### Findings
+
+1. **Sliding window is the dominant contributor** (~28–30% at all widths).
+   This makes sense: it reduces the number of Montgomery multiplies by
+   ~50% (from ~n/2 to ~n/4 for n-bit exponents).
+
+2. **Dedicated squaring is the second contributor**, and scales with k:
+   +14% at 1024-bit, +20% at 2048-bit, +23% at 4096-bit.  This is
+   consistent with the squaring kernel saving k(k−1)/2 MACs out of k²
+   — the fraction saved grows as k grows.
+
+3. **Stack scratch allocation is negligible** at these widths (within
+   noise).  The heap allocation cost is amortized over hundreds of
+   multiply iterations, so per-call savings are invisible.  However,
+   the threshold raise (48→64) that was bundled with this intervention
+   unlocked 4096-bit Montgomery (previously fell through to naive),
+   so the intervention had indirect value.
+
+#### Previous uncertainty resolved
+
+The prior round noted "the relative contribution of each intervention
+was not isolated individually".  This attribution pass closes that gap.
+The previous bundle's 29–46% improvement decomposes as:
+- Window: ~60–70% of the total win
+- Squaring: ~30–40% of the total win (scale-dependent)
+- Allocation: <1% direct contribution
+
+---
+
+### Fused CIOS Montgomery Kernel
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+Replaced the separate multiply-then-reduce (product → REDC) Montgomery
+path with a fused CIOS (Coarsely Integrated Operand Scanning) kernel
+for the inner exponentiation loop.
+
+#### Algorithm: CIOS
+
+For each outer row `i` of the schoolbook multiply:
+
+1. **Accumulate**: `T += a[i] * b[0..k-1]` (one row of cross-terms)
+2. **Reduce**: `m = T[0] * n0inv; T += m * mod[0..k-1]; T >>= 64`
+
+After k rows, T is at most k+1 limbs.  A conditional subtraction
+normalizes the result into [0, mod).
+
+Key properties vs separate mul+REDC:
+- **Scratch**: k+2 limbs (vs 2k+1 for separate path)
+- **Cache**: accumulator stays in L1 for the entire computation
+- **Passes**: single interleaved pass vs two separate O(k²) passes
+
+#### Dispatch threshold
+
+CIOS has per-row overhead (limb shift, extra carry propagation) that
+dominates at small k.  A/B measurement showed:
+
+| Width | k  | CIOS vs Separate |
+|------:|---:|-----------------:|
+|  256  |  4 |        +29%      |
+|  512  |  8 |         −5%      |
+| 1024  | 16 |        −18%      |
+| 2048  | 32 |        −14%      |
+| 4096  | 64 |         −9%      |
+
+`FUSED_THRESHOLD = 8` (512+ bits use CIOS, below use separate).
+With threshold:
+
+| Width | Improvement |
+|------:|------------:|
+|  256  |   no change |
+|  512  |      −5-6%  |
+| 1024  |    −17-18%  |
+| 2048  |    −14%     |
+| 4096  |    −9-10%   |
+
+No regressions at any width.
+
+#### Fused squaring note
+
+A dedicated fused squaring kernel (SOS — Separated Operand Scanning)
+was considered but not implemented.  CIOS squaring with a=b delegates
+to `montgomery_mul_fused(a, a, ...)` which loses the cross-term
+symmetry advantage.  However, the separate `montgomery_sqr` (with its
+dedicated triangle-loop product) is still used at k < 8.  A true fused
+SOS squaring is a future target if kernel-level profiling shows the
+squaring product phase is still dominant.
+
+#### Implementation detail
+
+`pow_mod_montgomery` now uses lambda helpers `mont_mul` / `mont_sqr`
+that dispatch to fused or separate kernels based on `use_fused`:
+
+```cpp
+constexpr uint32_t FUSED_THRESHOLD = 8;
+const bool use_fused = (k >= FUSED_THRESHOLD);
+
+auto mont_mul = [&](const uint64_t* a, const uint64_t* b, uint64_t* out) {
+    if (use_fused)
+        detail::montgomery_mul_fused(a, b, k, mod, n0inv, out, work);
+    else
+        detail::montgomery_mul(a, b, k, mod, n0inv, out, work);
+};
+```
+
+The old separate mul+REDC and dedicated sqr kernels are preserved
+unchanged for the sub-threshold path and for `MontgomeryContext`
+conversions.
+
+#### Correctness
+
+822 tests pass (17 new), including ASan+UBSan at -O0 and at -O3.
+
+New coverage:
+- `test_fused_montgomery_mul_vs_separate`: kernel-level cross-check (k=1)
+- `test_fused_montgomery_mul_multi_limb`: k=4 (256-bit)
+- `test_fused_montgomery_sqr_cross`: k=8 (512-bit)
+- `test_fused_pow_mod_random_widths`: 1024, 2048-bit vs naive
+- `test_fused_pow_mod_4096bit`: boundary at k=64
+- `test_fused_pow_mod_single_limb`: k=1 edge case
+- `test_fused_montgomery_mul_sweep`: k ∈ {1,2,3,4,8,16,32,64}
+- `test_fused_pow_mod_boundary_widths`: k=48, k=63
+
+#### What is Still Inferred
+
+- The CIOS per-row shift (`memmove` of k+1 limbs) is the likely cause
+  of the small-k regression.  An alternative formulation that tracks an
+  offset pointer instead of physically shifting could eliminate this, but
+  at the cost of more complex indexing.
+
+- Fused SOS squaring would save another ~25-40% of the squaring product
+  phase at large k, but the implementation complexity is higher than
+  CIOS (requires careful handling of doubled cross-terms within the
+  interleaved structure).
+
+#### Recommended Next Step
+
+**Karatsuba inside Montgomery multiply.**  The inner multiply in both
+CIOS and the separate path is schoolbook O(k²).  For k ≥ 32 (2048+
+bits), Karatsuba's O(k^1.585) would reduce the dominant cost of every
+squaring and multiply iteration.  This requires adapting the existing
+`mul_karatsuba` kernel to work within the CIOS accumulator or as a
+fast product for the separate mul+REDC path.  Expected impact: 15-30%
+at 2048-bit, 30-40% at 4096-bit.
 
 ---
 

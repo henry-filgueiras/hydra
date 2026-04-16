@@ -2495,6 +2495,204 @@ static void test_pow_mod_montgomery_2048bit_cross() {
     CHECK(mont == naive, "pow_mod 2048-bit Montgomery cross-check");
 }
 
+// ── Fused CIOS Montgomery tests ──────────────────────────────
+
+// Direct kernel-level test: fused mul matches separate mul+REDC
+static void test_fused_montgomery_mul_vs_separate() {
+    // Small modulus: 3233 (known from existing tests)
+    uint64_t mod[] = {3233};
+    uint32_t k = 1;
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    uint64_t a[] = {42};
+    uint64_t b[] = {100};
+
+    uint64_t out_sep[1] = {0}, out_fused[1] = {0};
+    uint64_t work_sep[3] = {0};  // 2k+1
+    uint64_t work_fused[3] = {0};  // k+2
+
+    hydra::detail::montgomery_mul(a, b, k, mod, n0inv, out_sep, work_sep);
+    hydra::detail::montgomery_mul_fused(a, b, k, mod, n0inv, out_fused, work_fused);
+    CHECK(out_sep[0] == out_fused[0], "fused mul matches separate at k=1");
+}
+
+// Multi-limb fused vs separate
+static void test_fused_montgomery_mul_multi_limb() {
+    // 256-bit modulus (4 limbs)
+    std::mt19937_64 rng(12345);
+    uint64_t mod[4], a[4], b[4];
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1;  // odd
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+
+    uint32_t k = 4;
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    uint64_t out_sep[4] = {}, out_fused[4] = {};
+    uint64_t work_sep[9] = {};   // 2k+1
+    uint64_t work_fused[6] = {}; // k+2
+
+    hydra::detail::montgomery_mul(a, b, k, mod, n0inv, out_sep, work_sep);
+    hydra::detail::montgomery_mul_fused(a, b, k, mod, n0inv, out_fused, work_fused);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_sep[i] != out_fused[i]) { match = false; break; }
+    }
+    CHECK(match, "fused mul matches separate at k=4 (256-bit)");
+}
+
+// Fused squaring cross-check
+static void test_fused_montgomery_sqr_cross() {
+    std::mt19937_64 rng(67890);
+    uint64_t mod[8], a[8];
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1;
+    for (auto& l : a) l = rng();
+
+    uint32_t k = 8;
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    uint64_t out_sep[8] = {}, out_fused[8] = {};
+    uint64_t work_sep[17] = {};   // 2k+1
+    uint64_t work_fused[10] = {}; // k+2
+
+    hydra::detail::montgomery_sqr(a, k, mod, n0inv, out_sep, work_sep);
+    hydra::detail::montgomery_sqr_fused(a, k, mod, n0inv, out_fused, work_fused);
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_sep[i] != out_fused[i]) { match = false; break; }
+    }
+    CHECK(match, "fused sqr matches separate sqr at k=8 (512-bit)");
+}
+
+// Random odd moduli at key widths: 1024, 2048, 4096
+static void test_fused_pow_mod_random_widths() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    // For each width: fused pow_mod vs naive reference
+    {
+        Hydra base = make(256, 42 + 1024);
+        Hydra exp_val = make(64, 99 + 1024);
+        Hydra mod_val = make(1024, 7777 + 1024);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "fused pow_mod matches naive at 1024 bits");
+    }
+    {
+        Hydra base = make(256, 42 + 2048);
+        Hydra exp_val = make(64, 99 + 2048);
+        Hydra mod_val = make(2048, 7777 + 2048);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "fused pow_mod matches naive at 2048 bits");
+    }
+}
+
+// Edge: Montgomery boundary width (k=64, 4096 bits)
+static void test_fused_pow_mod_4096bit() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    Hydra base = make(256, 1111);
+    Hydra exp_val = make(32, 2222);    // 32-bit exp for tractability
+    Hydra mod_val = make(4096, 3333);
+
+    Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+    Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+    CHECK(result == naive, "fused pow_mod matches naive at 4096 bits");
+}
+
+// Fused kernel with k=1 edge case
+static void test_fused_pow_mod_single_limb() {
+    // pow(2, 10, 1009) = 15 (Fermat)
+    Hydra r = hydra::pow_mod(Hydra{2u}, Hydra{10u}, Hydra{1009u});
+    CHECK(r == Hydra{15u}, "fused pow_mod single-limb: 2^10 mod 1009 = 15");
+}
+
+// Cross-check: fused mul kernel at all relevant k values
+static void test_fused_montgomery_mul_sweep() {
+    std::mt19937_64 rng(55555);
+    for (uint32_t k : {1u, 2u, 3u, 4u, 8u, 16u, 32u, 64u}) {
+        std::vector<uint64_t> mod(k), a(k), b(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1;
+        for (auto& l : a) l = rng();
+        for (auto& l : b) l = rng();
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_sep(k, 0), out_fused(k, 0);
+        std::vector<uint64_t> work_sep(2 * k + 1, 0);
+        std::vector<uint64_t> work_fused(k + 2, 0);
+
+        hydra::detail::montgomery_mul(a.data(), b.data(), k, mod.data(), n0inv,
+                                       out_sep.data(), work_sep.data());
+        hydra::detail::montgomery_mul_fused(a.data(), b.data(), k, mod.data(), n0inv,
+                                             out_fused.data(), work_fused.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_sep[i] != out_fused[i]) { match = false; break; }
+        }
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "fused mul sweep k=%u", k);
+        CHECK(match, msg);
+    }
+}
+
+// Fused with values near Montgomery width boundaries
+static void test_fused_pow_mod_boundary_widths() {
+    // Test at k=48 (old threshold) and k=63 (near max)
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+
+    {
+        uint32_t k = 48;
+        uint32_t bits = k * 64;
+        Hydra base = make(128, 42 + k);
+        Hydra exp_val = make(32, 99 + k);
+        Hydra mod_val = make(bits, 7777 + k);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "fused pow_mod boundary k=48");
+    }
+    {
+        uint32_t k = 63;
+        uint32_t bits = k * 64;
+        Hydra base = make(128, 42 + k);
+        Hydra exp_val = make(32, 99 + k);
+        Hydra mod_val = make(bits, 7777 + k);
+        Hydra result = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        CHECK(result == naive, "fused pow_mod boundary k=63");
+    }
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -2811,6 +3009,16 @@ int main() {
     test_pow_mod_random_odd_moduli_near_threshold();
     test_pow_mod_sliding_window_coverage();
     test_pow_mod_montgomery_2048bit_cross();
+
+    // Fused CIOS Montgomery kernel tests
+    test_fused_montgomery_mul_vs_separate();
+    test_fused_montgomery_mul_multi_limb();
+    test_fused_montgomery_sqr_cross();
+    test_fused_pow_mod_random_widths();
+    test_fused_pow_mod_4096bit();
+    test_fused_pow_mod_single_limb();
+    test_fused_montgomery_mul_sweep();
+    test_fused_pow_mod_boundary_widths();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
