@@ -1,0 +1,231 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Hydra Sigil — Three-headed serpent for the Hydra C++ big integer runtime -->
+  <!-- Three heads: Small (64-bit), Medium (192-bit), Large (arbitrary precision) -->
+  <!-- All converge on a single core: one canonical numeric identity -->
+
+  <!-- Background: transparent for theme compatibility -->
+
+  <!-- ============================================================ -->
+  <!-- OUTER RING — concentric hexagons (circuit / silicon aesthetic) -->
+  <!-- ============================================================ -->
+
+  <!-- Outermost hexagon — faint border -->
+  <polygon points="256,52 432,154 432,358 256,460 80,358 80,154"
+           fill="none" stroke="#4a5568" stroke-width="1.5" stroke-opacity="0.3"/>
+
+  <!-- Middle hexagon — slightly brighter -->
+  <polygon points="256,72 416,164 416,348 256,440 96,348 96,164"
+           fill="none" stroke="#4a5568" stroke-width="1" stroke-opacity="0.2"/>
+
+  <!-- Inner hexagon — subtle glow ring -->
+  <polygon points="256,92 400,174 400,338 256,420 112,338 112,174"
+           fill="none" stroke="#3b82f6" stroke-width="0.8" stroke-opacity="0.15"/>
+
+  <!-- ============================================================ -->
+  <!-- CENTRAL CORE — silicon die / CPU register nucleus            -->
+  <!-- ============================================================ -->
+
+  <!-- Core glow (layered fills for depth) -->
+  <polygon points="256,210 290,236 278,276 234,276 222,236"
+           fill="#1e293b" stroke="#3b82f6" stroke-width="1.5" stroke-opacity="0.4"/>
+
+  <!-- Inner core — brighter -->
+  <polygon points="256,218 282,238 273,268 239,268 230,238"
+           fill="#0f172a" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.6"/>
+
+  <!-- Core register lines (circuit traces) -->
+  <line x1="256" y1="218" x2="256" y2="200" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="282" y1="238" x2="296" y2="230" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="230" y1="238" x2="216" y2="230" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="273" y1="268" x2="282" y2="282" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="239" y1="268" x2="230" y2="282" stroke="#60a5fa" stroke-width="1" stroke-opacity="0.5"/>
+
+  <!-- Core dot -->
+  <circle cx="256" cy="246" r="4" fill="#3b82f6" fill-opacity="0.8"/>
+  <circle cx="256" cy="246" r="2" fill="#93c5fd"/>
+
+  <!-- ============================================================ -->
+  <!-- SPINE — single trunk descending from core                    -->
+  <!-- ============================================================ -->
+
+  <path d="M256,276 L256,380 Q256,400 256,410"
+        fill="none" stroke="#475569" stroke-width="6" stroke-linecap="round"/>
+  <path d="M256,276 L256,380 Q256,400 256,410"
+        fill="none" stroke="#64748b" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Spine vertebrae marks -->
+  <line x1="250" y1="300" x2="262" y2="300" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <line x1="250" y1="320" x2="262" y2="320" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <line x1="250" y1="340" x2="262" y2="340" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <line x1="250" y1="360" x2="262" y2="360" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <line x1="251" y1="380" x2="261" y2="380" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.3"/>
+
+  <!-- Spine base flare -->
+  <path d="M240,400 Q256,430 272,400"
+        fill="none" stroke="#475569" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- ============================================================ -->
+  <!-- HEAD 1 — TOP CENTER (Large: arbitrary precision / heap)      -->
+  <!-- The largest, most prominent head                              -->
+  <!-- ============================================================ -->
+
+  <!-- Neck from core upward -->
+  <path d="M256,210 C256,180 256,140 256,110 C256,95 248,80 240,72"
+        fill="none" stroke="#475569" stroke-width="5" stroke-linecap="round"/>
+  <path d="M256,210 C256,180 256,140 256,110 C256,95 248,80 240,72"
+        fill="none" stroke="#64748b" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Head shape — angular, pointing down-inward toward core -->
+  <path d="M240,72 L224,58 L218,62 L228,80 L236,86 Z"
+        fill="#334155" stroke="#64748b" stroke-width="1.5"/>
+
+  <!-- Upper jaw -->
+  <path d="M224,58 L208,64 L218,62"
+        fill="#475569" stroke="#64748b" stroke-width="1"/>
+
+  <!-- Eye — emerald -->
+  <circle cx="228" cy="68" r="3" fill="#10b981"/>
+  <circle cx="228" cy="68" r="1.5" fill="#34d399"/>
+
+  <!-- Head crest / horn -->
+  <path d="M232,60 L226,44 L236,56"
+        fill="none" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round"/>
+
+  <!-- Scale detail on neck -->
+  <path d="M252,140 L260,136" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M252,155 L260,151" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M252,170 L260,166" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+
+  <!-- ============================================================ -->
+  <!-- HEAD 2 — BOTTOM LEFT (Small: native 64-bit)                  -->
+  <!-- Smallest, leanest head                                        -->
+  <!-- ============================================================ -->
+
+  <!-- Neck from core to lower-left -->
+  <path d="M234,268 C210,290 170,320 140,340 C125,350 108,352 96,346"
+        fill="none" stroke="#475569" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M234,268 C210,290 170,320 140,340 C125,350 108,352 96,346"
+        fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Head shape — angular, compact, pointing up-right toward core -->
+  <path d="M96,346 L80,350 L78,344 L92,334 L100,336 Z"
+        fill="#334155" stroke="#64748b" stroke-width="1.5"/>
+
+  <!-- Upper jaw -->
+  <path d="M80,350 L72,340 L78,344"
+        fill="#475569" stroke="#64748b" stroke-width="1"/>
+
+  <!-- Eye — emerald -->
+  <circle cx="86" cy="342" r="2.5" fill="#10b981"/>
+  <circle cx="86" cy="342" r="1.2" fill="#34d399"/>
+
+  <!-- Head crest / horn -->
+  <path d="M84,338 L72,328 L88,332"
+        fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round"/>
+
+  <!-- Scale detail on neck -->
+  <path d="M170,318 L176,324" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M155,328 L161,334" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M140,336 L146,342" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+
+  <!-- ============================================================ -->
+  <!-- HEAD 3 — BOTTOM RIGHT (Medium: inline 3-limb / 192-bit)     -->
+  <!-- Medium-sized head                                             -->
+  <!-- ============================================================ -->
+
+  <!-- Neck from core to lower-right -->
+  <path d="M278,268 C302,290 342,320 372,340 C387,350 404,352 416,346"
+        fill="none" stroke="#475569" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M278,268 C302,290 342,320 372,340 C387,350 404,352 416,346"
+        fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Head shape — angular, pointing up-left toward core -->
+  <path d="M416,346 L432,350 L434,344 L420,334 L412,336 Z"
+        fill="#334155" stroke="#64748b" stroke-width="1.5"/>
+
+  <!-- Upper jaw -->
+  <path d="M432,350 L440,340 L434,344"
+        fill="#475569" stroke="#64748b" stroke-width="1"/>
+
+  <!-- Eye — emerald -->
+  <circle cx="426" cy="342" r="2.5" fill="#10b981"/>
+  <circle cx="426" cy="342" r="1.2" fill="#34d399"/>
+
+  <!-- Head crest / horn -->
+  <path d="M428,338 L440,328 L424,332"
+        fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round"/>
+
+  <!-- Scale detail on neck -->
+  <path d="M342,318 L336,324" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M357,328 L351,334" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+  <path d="M372,336 L366,342" stroke="#94a3b8" stroke-width="0.6" stroke-opacity="0.4"/>
+
+  <!-- ============================================================ -->
+  <!-- CONVERGENCE LINES — heads → core (energy / data flow)        -->
+  <!-- ============================================================ -->
+
+  <!-- Top head → core -->
+  <line x1="240" y1="86" x2="256" y2="210" stroke="#3b82f6" stroke-width="0.8" stroke-opacity="0.25"/>
+
+  <!-- Left head → core -->
+  <line x1="100" y1="336" x2="234" y2="268" stroke="#3b82f6" stroke-width="0.8" stroke-opacity="0.25"/>
+
+  <!-- Right head → core -->
+  <line x1="412" y1="336" x2="278" y2="268" stroke="#3b82f6" stroke-width="0.8" stroke-opacity="0.25"/>
+
+  <!-- ============================================================ -->
+  <!-- CIRCUIT TRACE ACCENTS — radiating from core                  -->
+  <!-- ============================================================ -->
+
+  <!-- Horizontal traces from core -->
+  <line x1="216" y1="246" x2="160" y2="246" stroke="#3b82f6" stroke-width="0.6" stroke-opacity="0.2"/>
+  <line x1="296" y1="246" x2="352" y2="246" stroke="#3b82f6" stroke-width="0.6" stroke-opacity="0.2"/>
+
+  <!-- Diagonal traces -->
+  <line x1="222" y1="236" x2="188" y2="210" stroke="#3b82f6" stroke-width="0.6" stroke-opacity="0.15"/>
+  <line x1="290" y1="236" x2="324" y2="210" stroke="#3b82f6" stroke-width="0.6" stroke-opacity="0.15"/>
+
+  <!-- Trace terminal dots -->
+  <circle cx="160" cy="246" r="1.5" fill="#3b82f6" fill-opacity="0.3"/>
+  <circle cx="352" cy="246" r="1.5" fill="#3b82f6" fill-opacity="0.3"/>
+  <circle cx="188" cy="210" r="1.5" fill="#3b82f6" fill-opacity="0.3"/>
+  <circle cx="324" cy="210" r="1.5" fill="#3b82f6" fill-opacity="0.3"/>
+
+  <!-- ============================================================ -->
+  <!-- TRIANGULAR SYMMETRY GUIDES — very faint structural geometry  -->
+  <!-- ============================================================ -->
+
+  <polygon points="256,72 96,346 416,346"
+           fill="none" stroke="#3b82f6" stroke-width="0.5" stroke-opacity="0.08"/>
+
+  <!-- ============================================================ -->
+  <!-- SUBTLE NUMERIC EASTER EGGS                                   -->
+  <!-- ============================================================ -->
+
+  <!-- "64" near left (small) head — very understated -->
+  <text x="108" y="368" font-family="monospace" font-size="8" fill="#64748b" fill-opacity="0.25"
+        text-anchor="middle">64</text>
+
+  <!-- "192" near right (medium) head -->
+  <text x="404" y="368" font-family="monospace" font-size="8" fill="#64748b" fill-opacity="0.25"
+        text-anchor="middle">192</text>
+
+  <!-- "∞" near top (large / arbitrary) head -->
+  <text x="256" y="48" font-family="monospace" font-size="10" fill="#64748b" fill-opacity="0.25"
+        text-anchor="middle">&#x221e;</text>
+
+  <!-- ============================================================ -->
+  <!-- WORDMARK — "HYDRA" beneath the sigil                         -->
+  <!-- ============================================================ -->
+
+  <text x="256" y="470" font-family="monospace" font-size="28" font-weight="bold"
+        fill="#94a3b8" text-anchor="middle" letter-spacing="12">HYDRA</text>
+
+  <!-- Thin rule under wordmark -->
+  <line x1="180" y1="478" x2="332" y2="478" stroke="#475569" stroke-width="0.8" stroke-opacity="0.4"/>
+
+  <!-- Subtitle -->
+  <text x="256" y="496" font-family="monospace" font-size="9" fill="#64748b" fill-opacity="0.6"
+        text-anchor="middle" letter-spacing="3">BIG INTEGER RUNTIME</text>
+
+</svg>
