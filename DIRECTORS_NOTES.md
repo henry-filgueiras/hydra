@@ -197,19 +197,104 @@ Treat this as a **Phase 2 architectural fork**, not an immediate work item.
 
 ---
 
+### Division Foundation Layer (Phase 1 extension)
+
+_Implemented 2026-04-15 — Claude Sonnet 4.6_
+
+Three new kernels in `hydra::detail` and four new public methods on `Hydra`:
+
+#### detail kernels
+
+| Kernel              | Purpose                                             |
+|---------------------|-----------------------------------------------------|
+| `shl_limbs`         | Left-shift a limb array by arbitrary bit count      |
+| `shr_limbs`         | Right-shift a limb array by arbitrary bit count     |
+| `divmod_u64_limbs`  | Short division of limb array by scalar uint64_t     |
+
+**`shl_limbs`** decomposes `shift` into `whole = shift/64` (whole-limb offset,
+handled via `memcpy` or loop offset) and `bits = shift%64` (intra-limb shift,
+handled with a two-register sliding window).  The `bits==0` branch avoids the
+carry loop entirely.  Output buffer size = `na + whole + 1` limbs.
+
+**`shr_limbs`** mirrors `shl_limbs`; the stitching step is
+`out[i] = (a[i+whole] >> bits) | (a[i+whole+1] << (64-bits))`.
+`64-bits` is safe because the `bits==0` branch is handled separately.
+
+**`divmod_u64_limbs`** processes limbs MSL→LSL via `unsigned __int128`:
+`(rem*2^64 + limbs[i]) ÷ d` — maps to a single `divq` on x86-64,
+`udiv`/`msub` on aarch64.  This is the exact primitive used in Knuth D's
+inner loop for computing trial quotient digits.
+
+#### Public API additions
+
+| Method                            | Tier support | Heap activity           |
+|-----------------------------------|--------------|-------------------------|
+| `Hydra operator<<(unsigned)`      | All 3        | None ≤256-bit, one alloc above |
+| `Hydra operator>>(unsigned)`      | All 3        | None ≤256-bit, one alloc above |
+| `Hydra& operator<<=`              | All 3        | delegates to `<<`       |
+| `Hydra& operator>>=`              | All 3        | delegates to `>>`       |
+| `Hydra div_u64(uint64_t)`         | All 3        | None ≤256-bit, one alloc above |
+| `uint64_t mod_u64(uint64_t)`      | All 3        | **Zero always**         |
+
+`mod_u64` is completely heap-free at all sizes — it computes the remainder
+in a single pass without storing the quotient.
+
+#### Small fast paths
+
+`operator<<` has a dedicated `is_small() && shift < 64` fast path that
+computes the 128-bit result with two arithmetic instructions and returns
+without touching the general kernel.  `operator>>` likewise avoids the
+kernel for Small (whole must be 0 after the early-exit guard, so `>> shift`
+is a single `payload.small >> shift`).
+
+#### Normalization invariant
+
+Both shift operators and `div_u64` call `normalize()` after construction,
+so the result always occupies the smallest valid tier.  `shr_limbs` trims
+trailing zeros internally; `shl_limbs` simply never writes leading zeros
+(the carry slot is only filled when carry != 0).
+
+#### `to_string()` refactor
+
+The medium/large path of `to_string()` previously allocated a `std::vector`
+per decimal digit.  It now calls `mod_u64(10)` (zero heap) and `div_u64(10)`
+(one LargeRep alloc on the heap path), reducing temporary allocation by one
+per digit and making the intent explicit.
+
+#### Groundwork for Knuth Algorithm D (large ÷ large)
+
+Knuth D operates in three phases:
+
+1. **Normalize**: left-shift divisor until its leading limb has bit 63 set
+   (`shift = clz(v[m-1])`).  Apply same shift to dividend.
+   → **Uses `operator<<`**.
+2. **Main loop**: for each quotient digit `q_hat`, estimate via
+   `(u[j+m]*2^64 + u[j+m-1]) / v[m-1]` — a 2-limb ÷ 1-limb step,
+   exactly what `divmod_u64_limbs` already does on a 2-element slice.
+   → **Uses `divmod_u64_limbs` directly**.
+3. **De-normalize**: right-shift remainder by the normalization shift.
+   → **Uses `operator>>`**.
+
+`div_u64` / `mod_u64` are also the direct single-limb-divisor base case
+of Knuth D when `m == 1`.  Everything needed for the algorithm's outer
+skeleton is now in place; the next phase adds the trial-quotient loop and
+the multi-limb multiply-subtract step.
+
+---
+
 ### Phase 2 Roadmap (Active TODOs)
 
 _Catalogued 2026-04-15 — Claude Sonnet 4.6_
 
 - **No signed arithmetic.** Sign bit (meta bit 2) is allocated but ignored.
-- **No division or modulo.** Planned using Knuth Algorithm D.
-- **`to_string()` for Medium/Large is very slow.** Uses repeated division by 10
-  via the limb kernel. Replace with base-10^9 extraction.
+- **No full Hydra÷Hydra division.** The substrate is in place; implement
+  Knuth Algorithm D next using `shl_limbs`, `shr_limbs`, and `divmod_u64_limbs`.
+- **`to_string()` still slow.** Now uses `div_u64`/`mod_u64` (one alloc per
+  digit); replace with base-10^9 extraction to cut digit-loop count by 9×.
 - **Schoolbook O(n²) multiplication.** Fine up to ~200 limbs; add Karatsuba
   at n ≥ 32.
 - **No allocator customisation.** `LargeRep` uses `::operator new` directly.
   A PMR-style allocator hook is a natural extension.
-- **No bit-shift operators.** `<<` and `>>` are needed for many algorithms.
 - **No hash specialisation.** `std::hash<Hydra>` should be added for use in
   unordered containers.
 - **Stack buffer size is intuition-based.** The 4-limb / 6-limb cutoffs in

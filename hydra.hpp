@@ -465,6 +465,113 @@ inline int cmp_limbs(
     return 0;
 }
 
+// ── Left-shift a limb array by `shift` bits ───────────────
+//
+// Writes result into `out`.  Caller must provide space for
+// na + (shift/64) + 1 limbs.  Positions below (shift/64) are
+// zeroed by this function.  Precondition: na > 0, shift > 0.
+// Returns significant limb count (trailing zeros trimmed).
+//
+inline uint32_t shl_limbs(
+    const uint64_t* a, uint32_t na,
+    unsigned shift,
+    uint64_t* out) noexcept
+{
+    const unsigned whole = shift / 64;   // whole-limb offset
+    const unsigned bits  = shift % 64;   // intra-limb shift
+
+    // Zero the whole-limb prefix (these contribute nothing from `a`).
+    for (unsigned i = 0; i < whole; ++i) out[i] = 0;
+
+    if (bits == 0) {
+        // Pure limb-shift: no intra-limb carry needed.
+        std::memcpy(out + whole, a, na * sizeof(uint64_t));
+        uint32_t used = na + whole;
+        while (used > 0 && out[used - 1] == 0) --used;
+        return used;
+    }
+
+    // bits in [1..63]: each output limb receives the low part of a[i]
+    // shifted left plus the high part of a[i-1] shifted right.
+    // 64 - bits is safe here because bits != 0.
+    uint64_t carry = 0;
+    for (uint32_t i = 0; i < na; ++i) {
+        out[i + whole] = (a[i] << bits) | carry;
+        carry           = a[i] >> (64 - bits);
+    }
+    uint32_t used = na + whole;
+    if (carry) out[used++] = carry;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
+// ── Right-shift a limb array by `shift` bits ──────────────
+//
+// Writes result into `out`.  Caller must provide space for
+// na - (shift/64) limbs.  Precondition: na > 0, shift > 0,
+// shift/64 < na (checked by caller).
+// Returns significant limb count (trailing zeros trimmed).
+//
+inline uint32_t shr_limbs(
+    const uint64_t* a, uint32_t na,
+    unsigned shift,
+    uint64_t* out) noexcept
+{
+    const unsigned whole = shift / 64;
+    const unsigned bits  = shift % 64;
+
+    if (whole >= na) return 0;   // every bit shifted out
+
+    const uint32_t n = na - whole;   // remaining limbs
+
+    if (bits == 0) {
+        // Pure limb-shift.
+        std::memcpy(out, a + whole, n * sizeof(uint64_t));
+        uint32_t used = n;
+        while (used > 0 && out[used - 1] == 0) --used;
+        return used;
+    }
+
+    // bits in [1..63]: stitch adjacent pairs.
+    // 64 - bits is safe because bits != 0.
+    for (uint32_t i = 0; i < n - 1; ++i) {
+        out[i] = (a[i + whole] >> bits)
+               | (a[i + whole + 1] << (64 - bits));
+    }
+    out[n - 1] = a[na - 1] >> bits;
+
+    uint32_t used = n;
+    while (used > 0 && out[used - 1] == 0) --used;
+    return used;
+}
+
+// ── Short (scalar) division kernel ────────────────────────
+//
+// Divides the `na`-limb (LSB-first) integer `a` by 64-bit
+// scalar `d`.  Writes quotient limbs (exactly `na` of them)
+// into `q` and returns the remainder.
+//
+// Uses the standard two-word / one-word reduction via
+// unsigned __int128, which maps to a single `divq` on x86-64
+// and `udiv` + `msub` on aarch64.
+//
+// Precondition: d != 0, na > 0.
+//
+inline uint64_t divmod_u64_limbs(
+    const uint64_t* a, uint32_t na,
+    uint64_t d,
+    uint64_t* q) noexcept
+{
+    uint64_t rem = 0;
+    for (uint32_t i = na; i-- > 0;) {
+        unsigned __int128 cur =
+            (static_cast<unsigned __int128>(rem) << 64) | a[i];
+        q[i] = static_cast<uint64_t>(cur / d);
+        rem  = static_cast<uint64_t>(cur % d);
+    }
+    return rem;
+}
+
 } // namespace detail
 
 // ─────────────────────────────────────────────────────────
@@ -1009,6 +1116,173 @@ struct Hydra {
     Hydra& operator*=(const Hydra& o) { return *this = *this * o; }
 
     // ─────────────────────────────────────────────────────
+    // Bit-shift operators
+    //
+    // Both operators preserve the normalization invariant:
+    //   • the result always occupies the smallest valid tier.
+    //   • cross-limb carry (<<) and borrow (>>) are handled
+    //     in the detail kernels.
+    //
+    // Stack buffers cover results up to 4 limbs (256-bit) with
+    // zero heap activity — the same threshold used by add_general.
+    // The large path allocates directly into a LargeRep so no
+    // intermediate copy is needed.
+    // ─────────────────────────────────────────────────────
+
+    [[nodiscard]] Hydra operator<<(unsigned shift) const {
+        if (shift == 0) return *this;
+
+        auto lv = limb_view();
+        if (lv.count == 0) return Hydra{};   // 0 << n = 0
+
+        // ── Small fast path: shift < 64 ─────────────────────
+        // Avoids the general kernel for the overwhelmingly common case.
+        if (is_small() && shift < 64) {
+            // shift > 0 guaranteed (early-return above).
+            // 64 - shift is in [1..63] → no UB.
+            const uint64_t hi = payload.small >> (64 - shift);
+            const uint64_t lo = payload.small << shift;
+            if (hi == 0) return Hydra{lo};
+            return make_medium(lo, hi, 0, 2);
+        }
+
+        // ── General path ─────────────────────────────────────
+        // max output limbs: na + whole_limbs + 1
+        const uint32_t whole    = static_cast<uint32_t>(shift / 64);
+        const uint32_t max_out  = lv.count + whole + 1u;
+
+        // Stack path: result fits in ≤ 4 limbs.
+        if (max_out <= 4) {
+            uint64_t out[4] = {};
+            const uint32_t used = detail::shl_limbs(
+                lv.ptr, lv.count, shift, out);
+            return from_limbs(out, used);
+        }
+
+        // Heap path: write directly into LargeRep.
+        LargeGuard rep{LargeRep::create(max_out)};
+        rep->used = detail::shl_limbs(
+            lv.ptr, lv.count, shift, rep->limbs());
+        Hydra result;
+        result.meta          = make_large_meta();
+        result.payload.large = rep.release();
+        result.normalize();
+        return result;
+    }
+
+    [[nodiscard]] Hydra operator>>(unsigned shift) const {
+        if (shift == 0) return *this;
+
+        auto lv = limb_view();
+        if (lv.count == 0) return Hydra{};   // 0 >> n = 0
+
+        const uint32_t whole = static_cast<uint32_t>(shift / 64);
+        if (whole >= lv.count) return Hydra{};   // all bits shifted out
+
+        // ── Small fast path ──────────────────────────────────
+        // For Small, lv.count == 1, so whole == 0 (checked above).
+        // shift > 0 and shift < 64 (whole == 0 ⟹ shift < 64).
+        if (is_small()) return Hydra{payload.small >> shift};
+
+        // ── General path ─────────────────────────────────────
+        // Output has at most (lv.count - whole) limbs.
+        const uint32_t max_out = lv.count - whole;
+
+        // Stack path.
+        if (max_out <= 4) {
+            uint64_t out[4] = {};
+            const uint32_t used = detail::shr_limbs(
+                lv.ptr, lv.count, shift, out);
+            return from_limbs(out, used);
+        }
+
+        // Heap path.
+        LargeGuard rep{LargeRep::create(max_out)};
+        rep->used = detail::shr_limbs(
+            lv.ptr, lv.count, shift, rep->limbs());
+        Hydra result;
+        result.meta          = make_large_meta();
+        result.payload.large = rep.release();
+        result.normalize();
+        return result;
+    }
+
+    Hydra& operator<<=(unsigned shift) { return *this = *this << shift; }
+    Hydra& operator>>=(unsigned shift) { return *this = *this >> shift; }
+
+    // ─────────────────────────────────────────────────────
+    // Scalar division and modulo
+    //
+    // div_u64 returns the quotient of *this / divisor.
+    // mod_u64 returns the remainder (*this % divisor) as a
+    //         raw uint64_t — no Hydra allocation.
+    //
+    // Both use the "short division" algorithm (process limbs
+    // MSL→LSL with a running remainder).  The inner step is
+    //   q[i] = (rem*2^64 + limbs[i]) / d
+    //   rem  = (rem*2^64 + limbs[i]) % d
+    // which maps to a single divq / udiv instruction.
+    //
+    // This is the exact primitive used in Knuth Algorithm D
+    // for estimating trial quotient digits (q-hat), making
+    // these functions the direct building block for full
+    // large ÷ large division.  See DIRECTORS_NOTES.md for
+    // the full roadmap.
+    //
+    // Throws std::domain_error on divisor == 0.
+    // ─────────────────────────────────────────────────────
+
+    [[nodiscard]] Hydra div_u64(uint64_t divisor) const {
+        if (divisor == 0)
+            throw std::domain_error("Hydra::div_u64: division by zero");
+
+        auto lv = limb_view();
+        if (lv.count == 0) return Hydra{};   // 0 / d = 0
+
+        // ── Small fast path ──────────────────────────────────
+        if (is_small()) return Hydra{payload.small / divisor};
+
+        // ── Stack path: quotient fits in ≤ 4 limbs ──────────
+        if (lv.count <= 4) {
+            uint64_t q[4];
+            detail::divmod_u64_limbs(lv.ptr, lv.count, divisor, q);
+            return from_limbs(q, lv.count);   // from_limbs trims
+        }
+
+        // ── Heap path: write quotient directly into LargeRep ─
+        LargeGuard rep{LargeRep::create(lv.count)};
+        detail::divmod_u64_limbs(
+            lv.ptr, lv.count, divisor, rep->limbs());
+        rep->used = lv.count;
+        Hydra result;
+        result.meta          = make_large_meta();
+        result.payload.large = rep.release();
+        result.normalize();   // quotient MSLs may be zero
+        return result;
+    }
+
+    [[nodiscard]] uint64_t mod_u64(uint64_t divisor) const {
+        if (divisor == 0)
+            throw std::domain_error("Hydra::mod_u64: division by zero");
+
+        auto lv = limb_view();
+        if (lv.count == 0) return 0u;   // 0 % d = 0
+
+        // ── Small fast path ──────────────────────────────────
+        if (is_small()) return payload.small % divisor;
+
+        // ── General path: process MSL→LSL without storing quotient.
+        // Zero heap activity regardless of operand size.
+        uint64_t rem = 0;
+        for (uint32_t i = lv.count; i-- > 0;) {
+            unsigned __int128 cur =
+                (static_cast<unsigned __int128>(rem) << 64) | lv.ptr[i];
+            rem = static_cast<uint64_t>(cur % divisor);
+        }
+        return rem;
+    }
+
+    // ─────────────────────────────────────────────────────
     // Debug / inspection
     // ─────────────────────────────────────────────────────
 
@@ -1027,30 +1301,15 @@ struct Hydra {
             }
             return std::string(buf + i);
         }
-        // For medium/large: convert by repeated subtraction or
-        // digit extraction via repeated division.
-        // Slow schoolbook base-10 extraction.
+        // Medium / Large: repeated short division by 10 via mod_u64/div_u64.
+        // Each iteration is O(n) with zero heap activity for mod_u64,
+        // and one LargeRep allocation for div_u64 (on the heap path).
         Hydra copy = *this;
-        if (copy.limb_count() == 0) return "0";
-
         std::string digits;
         digits.reserve(64);
-        const Hydra ten{ 10u };
-        while (copy.compare(Hydra{}) > 0) {
-            // Extract last decimal digit via sub-and-count (very slow but correct)
-            // TODO: replace with proper division in phase 2.
-            auto lv = copy.limb_view();
-            // Divide by 10 using schoolbook.
-            std::vector<uint64_t> q(lv.count);
-            uint64_t rem = 0;
-            for (uint32_t i = lv.count; i-- > 0;) {
-                unsigned __int128 cur =
-                    (static_cast<unsigned __int128>(rem) << 64) | lv.ptr[i];
-                q[i] = static_cast<uint64_t>(cur / 10);
-                rem  = static_cast<uint64_t>(cur % 10);
-            }
-            digits.push_back('0' + static_cast<char>(rem));
-            copy = from_limbs(q.data(), lv.count);
+        while (copy.limb_count() > 0) {
+            digits.push_back('0' + static_cast<char>(copy.mod_u64(10)));
+            copy = copy.div_u64(10);
         }
         std::reverse(digits.begin(), digits.end());
         return digits.empty() ? "0" : digits;
