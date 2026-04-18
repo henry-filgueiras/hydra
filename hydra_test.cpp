@@ -421,6 +421,122 @@ static void test_karatsuba_recursion_boundary() {
     }
 }
 
+// ── ScratchWorkspace regression tests ──────────────────────────
+//
+// Every Karatsuba operation now consumes bump-allocated scratch out
+// of a ScratchWorkspace.  These tests prove the bump-and-rewind
+// semantics survive:
+//   1. pre-reserved capacity exactly matches karatsuba_scratch_limbs
+//   2. LIFO nesting: opening an inner frame and closing it leaves the
+//      outer frame's limbs untouched
+//   3. reusing the same workspace for many sequential multiplies does
+//      not accumulate garbage across calls
+
+static void test_scratch_capacity_bound() {
+    // Compute products at every Karatsuba-recursive size and assert
+    // each result matches schoolbook when the workspace is reserved
+    // to exactly karatsuba_scratch_limbs(n).  If the bound were an
+    // under-estimate, alloc_zeroed's assert (or ASan) would fire.
+    for (uint32_t n : {
+            hydra::detail::KARATSUBA_RECURSION_BASE * 2,        // 32
+            hydra::detail::KARATSUBA_RECURSION_BASE * 4,        // 64
+            hydra::detail::KARATSUBA_RECURSION_BASE * 8 }) {    // 128
+        std::mt19937_64 rng(0xBAD5C2A7 ^ n);
+        std::vector<uint64_t> a(n), b(n);
+        for (auto& l : a) l = rng() | 1u;
+        for (auto& l : b) l = rng() | 1u;
+
+        hydra::detail::ScratchWorkspace ws;
+        ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n));
+
+        std::vector<uint64_t> out_k(2 * n), out_s(2 * n);
+        hydra::detail::mul_karatsuba(a.data(), b.data(), n, out_k.data(), ws);
+        hydra::detail::mul_limbs(a.data(), n, b.data(), n, out_s.data());
+
+        bool eq = std::memcmp(out_k.data(), out_s.data(),
+                               2 * n * sizeof(uint64_t)) == 0;
+        std::string msg = "scratch capacity bound exact at n=" + std::to_string(n);
+        CHECK(eq, msg.c_str());
+    }
+}
+
+static void test_scratch_reuse_across_calls() {
+    // A single workspace used for many sequential multiplies must
+    // produce results identical to a fresh workspace per call.  Any
+    // residual state (un-zeroed limbs, stale cursor) would corrupt
+    // later products.
+    const uint32_t n = 64;
+    std::mt19937_64 rng(0xF1EA5ED);
+
+    hydra::detail::ScratchWorkspace ws;
+    ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n));
+
+    bool all_ok = true;
+    for (int iter = 0; iter < 32; ++iter) {
+        std::vector<uint64_t> a(n), b(n);
+        for (auto& l : a) l = rng() | 1u;
+        for (auto& l : b) l = rng() | 1u;
+
+        std::vector<uint64_t> out_shared(2 * n), out_fresh(2 * n);
+        hydra::detail::mul_karatsuba(a.data(), b.data(), n, out_shared.data(), ws);
+
+        hydra::detail::ScratchWorkspace ws_fresh;
+        ws_fresh.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n));
+        hydra::detail::mul_karatsuba(a.data(), b.data(), n, out_fresh.data(), ws_fresh);
+
+        if (std::memcmp(out_shared.data(), out_fresh.data(),
+                        2 * n * sizeof(uint64_t)) != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    CHECK(all_ok, "scratch reuse matches fresh workspace across 32 iterations");
+}
+
+static void test_scratch_nested_frames() {
+    // Interleave manual outer frames with Karatsuba's internal frames:
+    // allocate an outer buffer, run a Karatsuba into a sibling buffer,
+    // then verify the outer buffer is bit-identical to what we wrote
+    // before the Karatsuba call.  This proves ScratchFrame's LIFO
+    // rewind never leaks past its own mark.
+    const uint32_t n = 64;
+    hydra::detail::ScratchWorkspace ws;
+    // Reserve: outer sentinel + operand/output for the inner call +
+    // karatsuba recursion scratch.
+    ws.reserve_limbs(4 + 4 * n + hydra::detail::karatsuba_scratch_limbs(n));
+
+    hydra::detail::ScratchFrame outer(ws);
+    uint64_t* sentinel = outer.take(4);
+    for (int i = 0; i < 4; ++i) sentinel[i] = 0xDEADBEEF00000000ull | uint64_t(i);
+
+    // Inner Karatsuba, using the same workspace.
+    std::mt19937_64 rng(0xA5D1F00D);
+    uint64_t* a = outer.take(n);
+    uint64_t* b = outer.take(n);
+    uint64_t* out = outer.take(2 * n);
+    for (uint32_t i = 0; i < n; ++i) a[i] = rng() | 1u;
+    for (uint32_t i = 0; i < n; ++i) b[i] = rng() | 1u;
+
+    hydra::detail::mul_karatsuba(a, b, n, out, ws);
+
+    // After the Karatsuba call (which opened its own inner frames),
+    // the sentinel must still read back unchanged.
+    bool sentinel_intact = true;
+    for (int i = 0; i < 4; ++i) {
+        if (sentinel[i] != (0xDEADBEEF00000000ull | uint64_t(i))) {
+            sentinel_intact = false;
+            break;
+        }
+    }
+    CHECK(sentinel_intact, "scratch nested frames preserve outer sentinel");
+
+    // Cross-check the inner result against schoolbook for good measure.
+    std::vector<uint64_t> out_s(2 * n);
+    hydra::detail::mul_limbs(a, n, b, n, out_s.data());
+    bool eq = std::memcmp(out, out_s.data(), 2 * n * sizeof(uint64_t)) == 0;
+    CHECK(eq, "scratch nested frames — Karatsuba matches schoolbook");
+}
+
 // ── mul_general dispatch-seam tests ───────────────────────────────────
 //
 // These tests exercise the dispatch boundary of mul_general at the
@@ -2722,10 +2838,12 @@ static void test_karatsuba_mont_mul_vs_fused() {
     std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
     std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
     std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::ScratchWorkspace ws;
+    ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n_padded));
     hydra::detail::montgomery_mul_karatsuba(
         a.data(), b.data(), k, mod.data(), n0inv,
         out_kara.data(), work_kara.data(),
-        pa.data(), pb.data(), kbuf.data(), n_padded);
+        pa.data(), pb.data(), kbuf.data(), n_padded, ws);
 
     bool match = true;
     for (uint32_t i = 0; i < k; ++i) {
@@ -2755,10 +2873,12 @@ static void test_karatsuba_mont_mul_vs_fused_4096() {
     std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
     std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
     std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::ScratchWorkspace ws;
+    ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n_padded));
     hydra::detail::montgomery_mul_karatsuba(
         a.data(), b.data(), k, mod.data(), n0inv,
         out_kara.data(), work_kara.data(),
-        pa.data(), pb.data(), kbuf.data(), n_padded);
+        pa.data(), pb.data(), kbuf.data(), n_padded, ws);
 
     bool match = true;
     for (uint32_t i = 0; i < k; ++i) {
@@ -2790,10 +2910,12 @@ static void test_karatsuba_mont_mul_non_pow2() {
     std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
     std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
     std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::ScratchWorkspace ws;
+    ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n_padded));
     hydra::detail::montgomery_mul_karatsuba(
         a.data(), b.data(), k, mod.data(), n0inv,
         out_kara.data(), work_kara.data(),
-        pa.data(), pb.data(), kbuf.data(), n_padded);
+        pa.data(), pb.data(), kbuf.data(), n_padded, ws);
 
     bool match = true;
     for (uint32_t i = 0; i < k; ++i) {
@@ -2894,10 +3016,12 @@ static void test_karatsuba_mont_sqr_cross() {
     std::vector<uint64_t> out_kara(k), work_kara(2 * k + 1, 0);
     std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
     std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::ScratchWorkspace ws;
+    ws.reserve_limbs(hydra::detail::karatsuba_scratch_limbs(n_padded));
     hydra::detail::montgomery_sqr_karatsuba(
         a.data(), k, mod.data(), n0inv,
         out_kara.data(), work_kara.data(),
-        pa.data(), pb.data(), kbuf.data(), n_padded);
+        pa.data(), pb.data(), kbuf.data(), n_padded, ws);
 
     bool match = true;
     for (uint32_t i = 0; i < k; ++i) {
@@ -2977,6 +3101,9 @@ int main() {
     test_karatsuba_64x64();
     test_karatsuba_all_ones();
     test_karatsuba_recursion_boundary();
+    test_scratch_capacity_bound();
+    test_scratch_reuse_across_calls();
+    test_scratch_nested_frames();
 
     // mul_general dispatch-seam tests (Karatsuba integration)
     test_mul_seam_31_limbs();

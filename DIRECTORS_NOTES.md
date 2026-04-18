@@ -2449,4 +2449,147 @@ path (see Dragon note above re: Karatsuba inside Montgomery multiply).
 
 ---
 
+### Dragon — Karatsuba Scratch Allocator Tax
+
+_Investigated 2026-04-18 — Claude Opus 4.7_
+_Status: **PARTIAL WIN** — heap removed, measurable speedup at 4096-bit only._
+
+#### Hypothesis
+
+The Karatsuba prototype allocated three `std::vector<uint64_t>` per
+recursion frame for z1 assembly (`sum_a`, `sum_b`, `z1`), plus three
+more vectors (`pa`, `pb`, `pout`) per top-level `mul_general` call
+for power-of-2 padding.  Prior DIRECTORS_NOTES estimated ~30 ns per
+frame of allocator overhead.  At 4096-bit (k=64, n_padded=64), that's
+12 frames × ~1280 muls per pow_mod ≈ 15 000 heap allocations.
+
+The sprint was narrowly scoped to eliminate that heap traffic and
+re-measure pow_mod.  No Toom-Cook, no SIMD, no public-API widening.
+
+#### Design
+
+A minimal internal `detail::ScratchWorkspace` with SBO:
+
+- **Stack-inline buffer** of 512 limbs (4 KB) — sized so that every
+  Karatsuba-dispatch operation up to 4096-bit stays fully on the
+  stack.  For `mul_general` at n=64 we need 4n + M(n) = 256 + 200 =
+  456 limbs; for `pow_mod_montgomery` at n=64 we only need M(64) =
+  200 limbs (pa/pb/kara_buf stay on the caller's stack).
+- **Heap spill-over** via `std::unique_ptr<uint64_t[]>` if a caller
+  reserves past SBO_LIMBS (only `mul_general` at ≥128-limb operands).
+- **Bump cursor**, LIFO nesting via a tiny `ScratchFrame` RAII helper.
+- **Lazy zeroing**: backing storage is intentionally left
+  uninitialized on grow.  `alloc_zeroed` is the only thing that
+  memsets, so fresh allocations never pay a double-zero cost.
+- **Fused take**: Karatsuba's three per-frame slices are carved out
+  of one `take(4m+4)` call — a single SIMD-friendly memset instead
+  of three small ones.
+
+`karatsuba_scratch_limbs(n)` gives the exact worst-case depth bound
+(single recursion path, since the three subproblems run sequentially).
+Callers pre-reserve once; no further resize occurs.
+
+Thread-through changes:
+
+- `mul_karatsuba` now takes a `ScratchWorkspace&`.  A convenience
+  overload builds a local one for standalone benchmarks and tests.
+- `mul_general` pulls pa/pb/pout from one frame plus the Karatsuba
+  recursion scratch out of the same workspace.
+- `montgomery_mul_karatsuba` / `montgomery_sqr_karatsuba` pass a
+  workspace reference through to `mul_karatsuba`.
+- `pow_mod_montgomery` constructs one workspace at the top of the
+  function and amortizes it across every mont_mul / mont_sqr in
+  the sliding-window loop.
+
+Public API unchanged.
+
+#### What improved
+
+**Mul micro-benchmarks (median of 3 × 0.2 s, Darwin arm64):**
+
+| benchmark              | before   | after    | delta   |
+|------------------------|----------|----------|---------|
+| mul_karatsuba/32       |  563 ns  |  569 ns  |  +1.0 % |
+| mul_karatsuba/64       | 2056 ns  | 1932 ns  |  −6.0 % |
+| mul_dispatched/32      |  716 ns  |  701 ns  |  −2.1 % |
+| mul_dispatched/64      | 2284 ns  | 2235 ns  |  −2.2 % |
+| mul_dispatched/128     | 7485 ns  | 7062 ns  |  −5.6 % |
+
+**pow_mod (10 independent runs, Hydra median):**
+
+| bits  | before min / med   | after min / med    | Δmin    | Δmed    |
+|-------|--------------------|--------------------|---------|---------|
+|  256  |  9938 / 10084 ns   |  9625 /  9875 ns   |  −3.1 % |  −2.1 % |
+|  512  | 50812 / 54833 ns   | 51583 / 53229 ns   |  +1.5 % |  −2.9 % |
+| 1024  |   311 /  316 µs    |   310 /  320 µs    |  −0.2 % |  +1.0 % |
+| 2048  |  3183 / 3296 µs    |  3207 / 3288 µs    |  +0.7 % |  −0.3 % |
+| 4096  | 24093 / 24202 µs   | 23730 / 23799 µs   |  **−1.5 %** | **−1.7 %** |
+
+The only pow_mod width that cleanly beats the ~1 % run-to-run noise
+floor is **4096-bit (−1.7 %)**.  At 2048-bit the expected savings
+(~0.6–1.2 %) are lost under noise.
+
+#### What did NOT improve (and why)
+
+The original "~30 ns per frame" estimate came from a different
+platform/allocator mix.  An orthogonal micro-benchmark on this host
+(alloc/largerep_create_destroy/64) measures ~16 ns per heap
+create+destroy round-trip, suggesting macOS libmalloc's tiny-zone
+is roughly half as expensive as assumed.
+
+Extrapolating the actual per-alloc cost:
+
+- 2048-bit: saved ~3 allocs/mul × 10 ns × 640 muls ≈ 20 µs out of
+  3.2 ms → ~0.6 % expected.  Observed: noise.
+- 4096-bit: saved ~12 allocs/mul × 10 ns × 1280 muls ≈ 150 µs out
+  of 24 ms → ~0.6 % expected.  Observed: −1.7 % (the extra wins
+  come from the fused memset, better cache locality from the
+  contiguous buffer, and zero heap traffic keeping the allocator's
+  thread cache cold).
+
+The micro-benchmarks (−5–6 % at large widths) show the allocator
+cost IS real — it's just a smaller fraction of a full pow_mod than
+of an isolated Karatsuba call.
+
+#### What the data says about remaining hotspots
+
+At 4096-bit Hydra still sits at 23.8 ms vs OpenSSL 6.0 ms — a ~4×
+gap the scratch workspace cannot close.  The remaining cost center
+is the **O(k²) inner multiply-accumulate** inside both
+`mul_limbs` (Karatsuba leaves) and `montgomery_redc`'s row loop.
+
+#### Remaining unknowns
+
+- Whether the allocator win reproduces on Linux/glibc (glibc's ptmalloc
+  has a heavier per-alloc cost, so the fraction could be ≥ 2× of
+  what we measured on macOS).
+- Whether `KARATSUBA_RECURSION_BASE` should be re-tuned.  The notes
+  at line 637 predicted "a re-tune to lower values is expected
+  once the scratch strategy switches to a caller-supplied arena".
+  With the heap gone, pushing the base case below 16 may pay off —
+  a follow-up measurement sprint.
+
+#### Recommended next sprint
+
+The data points at **SIMD or hand-tuned inner kernels** for the
+schoolbook multiply/MAC, not at another bookkeeping refactor.
+Evidence:
+
+1. `mul_school/64` runs at 2.6 µs; Karatsuba is 1.9 µs (only 25 %
+   faster).  The Karatsuba crossover is shallow because the leaves
+   are still schoolbook.  A tight `mul_limbs_8x8`-style ASM/SIMD
+   kernel at the leaves would multiply the Karatsuba win.
+2. Fused CIOS at k=16 takes ~6 µs per mul (1024-bit pow_mod is
+   322 µs / ~52 muls → 6 µs).  The inner `__int128` MAC is the
+   dominant op; NEON/SVE 64×64→128 instructions could double it.
+3. `KARATSUBA_RECURSION_BASE` re-tune is a cheap quick-win now
+   that allocation cost no longer bottoms it out at 16.
+
+Lower-priority follow-ups: Toom-Cook (benefits only ≥ 4096-bit and
+adds recursive complexity); `MontgomeryContext` reuse across
+multiple pow_mod calls with the same modulus (benefits batch
+workloads but changes public API).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

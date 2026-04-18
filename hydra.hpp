@@ -649,6 +649,110 @@ inline void subfrom_limbs(
 constexpr uint32_t KARATSUBA_THRESHOLD_LIMBS = 32;
 constexpr uint32_t KARATSUBA_RECURSION_BASE  = 16;
 
+// ─── ScratchWorkspace — bump arena for limb-level temporaries ───
+//
+// Hydra's Karatsuba kernel needs O(m) limbs of transient storage per
+// recursion frame (two (m+1)-limb sums + one (2m+2)-limb product).
+// The original prototype used `std::vector<uint64_t>` per frame, which
+// added a measurable allocator tax (~30 ns/frame) that dominated at
+// the small recursion depths pow_mod actually hits.
+//
+// ScratchWorkspace owns one contiguous backing buffer and hands out
+// zeroed slices via a bump cursor.  ScratchFrame captures the cursor
+// on construction and restores it on destruction, giving LIFO-nested
+// recursion semantics at zero per-frame allocator cost.
+//
+// Pointer stability: callers MUST pre-reserve enough capacity before
+// opening any frame — the backing vector is not resized once cursor_
+// is non-zero, so pointers handed out earlier stay valid across later
+// allocations in the same frame tree.  `karatsuba_scratch_limbs(n)`
+// gives the exact bound.  `alloc_zeroed` asserts on overrun.
+//
+class ScratchWorkspace {
+public:
+    // Small-buffer size tuned so that every Karatsuba-dispatch
+    // operation up to 4096-bit (k=64) stays fully on the stack:
+    //
+    //     mul_general at n=64:   pa+pb+pout + M(64) = 256 + 200 = 456
+    //     pow_mod    at n=64:              M(64)   =           200
+    //     pow_mod    at n=32:              M(32)   =            68
+    //
+    // A 512-limb (4 KB) SBO covers all three cleanly.  Larger
+    // operations fall back to heap via the unique_ptr path; they
+    // remain correct, just slightly less cache-friendly.
+    static constexpr uint32_t SBO_LIMBS = 512;
+
+    ScratchWorkspace() noexcept : buf_(sbo_), cap_(SBO_LIMBS) {}
+    ScratchWorkspace(const ScratchWorkspace&) = delete;
+    ScratchWorkspace& operator=(const ScratchWorkspace&) = delete;
+
+    // Ensure backing storage holds at least `cap` limbs.  The buffer
+    // is intentionally left UNINITIALIZED on grow — `alloc_zeroed`
+    // zeroes every region it hands out, so value-initializing the
+    // backing on top of that would just double-zero the common case.
+    void reserve_limbs(uint32_t cap) {
+        if (cap_ < cap) {
+            heap_ = std::unique_ptr<uint64_t[]>(new uint64_t[cap]);
+            buf_ = heap_.get();
+            cap_ = cap;
+        }
+    }
+
+    uint64_t* alloc_zeroed(uint32_t n) noexcept {
+        assert(cursor_ + n <= cap_);
+        uint64_t* p = buf_ + cursor_;
+        std::memset(p, 0, n * sizeof(uint64_t));
+        cursor_ += n;
+        return p;
+    }
+
+    uint32_t mark() const noexcept { return cursor_; }
+    void     rewind(uint32_t m) noexcept { cursor_ = m; }
+
+private:
+    uint64_t                    sbo_[SBO_LIMBS];  // stack-inline storage
+    std::unique_ptr<uint64_t[]> heap_;            // spill-over allocation
+    uint64_t*                   buf_;             // → sbo_ or heap_.get()
+    uint32_t                    cap_;
+    uint32_t                    cursor_ = 0;
+};
+
+// RAII bump-frame: rewinds ScratchWorkspace to its prior cursor on
+// destruction.  Supports arbitrary LIFO nesting; each `take(n)` carves
+// out a zeroed slice whose lifetime is bounded by the enclosing frame.
+class ScratchFrame {
+public:
+    explicit ScratchFrame(ScratchWorkspace& ws) noexcept
+        : ws_(ws), mark_(ws.mark()) {}
+    ~ScratchFrame() noexcept { ws_.rewind(mark_); }
+    ScratchFrame(const ScratchFrame&) = delete;
+    ScratchFrame& operator=(const ScratchFrame&) = delete;
+
+    uint64_t* take(uint32_t n) noexcept { return ws_.alloc_zeroed(n); }
+
+private:
+    ScratchWorkspace& ws_;
+    uint32_t mark_;
+};
+
+// Exact limb-count bound for a single top-level Karatsuba call at
+// size n.  At each recursion level only one branch is live at a time
+// (the three z0/z2/z1 subproblems run sequentially), so the peak
+// scratch footprint is the sum down a single recursion path:
+//
+//     M(n) = (4·m + 4) + M(m),   m = n/2,   M(base) = 0
+//
+// where (4m+4) covers sum_a (m+1) + sum_b (m+1) + z1 (2m+2).
+inline uint32_t karatsuba_scratch_limbs(uint32_t n) noexcept {
+    uint32_t total = 0;
+    while (n > KARATSUBA_RECURSION_BASE) {
+        const uint32_t m = n >> 1;
+        total += 4 * m + 4;
+        n = m;
+    }
+    return total;
+}
+
 // Karatsuba multiplication of two same-sized n-limb operands.
 // `n` must be a power of 2 and >= 2.  Callers that violate this
 // should fall back to schoolbook; the recursion would otherwise
@@ -656,9 +760,13 @@ constexpr uint32_t KARATSUBA_RECURSION_BASE  = 16;
 //
 // `out` must point to 2n limbs of writable storage.  Contents are
 // fully overwritten.  Returns the trimmed used-limb count.
+//
+// `ws` must have at least `karatsuba_scratch_limbs(n)` free limbs
+// above its current cursor.  The function opens a ScratchFrame, so
+// all scratch is released back to the workspace on return.
 inline uint32_t mul_karatsuba(
     const uint64_t* a, const uint64_t* b, uint32_t n,
-    uint64_t* out) noexcept
+    uint64_t* out, ScratchWorkspace& ws) noexcept
 {
     assert(n >= 2 && (n & (n - 1)) == 0);  // power of two
 
@@ -677,52 +785,30 @@ inline uint32_t mul_karatsuba(
 
     // Compute z0 directly into out[0..2m-1] and z2 into out[2m..2n-1].
     // The two subproblems are disjoint ranges of `out`, so this is safe.
-    // Recursive call returns a trimmed used count, but we need the full
-    // 2m-limb region to be correct (including trailing zeros) because
-    // subsequent steps read it positionally. mul_karatsuba at the base
-    // case uses mul_limbs which writes every limb before trimming; at
-    // the recursive case it writes z0/z2 into disjoint halves of its
-    // own `out` and zero-fills internally. So the full range is valid.
-    (void)mul_karatsuba(a_lo, b_lo, m, out);
-    (void)mul_karatsuba(a_hi, b_hi, m, out + 2 * m);
+    (void)mul_karatsuba(a_lo, b_lo, m, out,         ws);
+    (void)mul_karatsuba(a_hi, b_hi, m, out + 2 * m, ws);
 
-    // Now the trailing tail of the base-case mul_limbs may have written
-    // fewer than 2m limbs (trimmed).  We need the full 2m-limb region
-    // to be zero-extended.  mul_limbs writes into a zero-memset'd
-    // buffer; however, it does NOT re-zero across the 2m boundary.
-    // To be safe, zero-pad the upper tails of z0/z2 if the used count
-    // was short.  Easier: always memset before calling.  Simpler still:
-    // call mul_limbs in "known-zero output" form.  But our recursion
-    // returns `used` — we don't read it here, but callers of mul_limbs
-    // do memset first.  Since mul_limbs always starts with memset, and
-    // our recursive call ends up calling mul_limbs at the leaves, the
-    // full 2m region is properly zero-extended.  (Recursive internal
-    // nodes assemble the full 2m region via z0/z1/z2 combination.)
+    // Scratch for z1 assembly, all carved from the bump workspace:
+    //   sum_a  : m+1 limbs  (a_lo + a_hi, plus carry slot)
+    //   sum_b  : m+1 limbs
+    //   z1     : 2m+2 limbs (product (m+1)·(m+1))
+    // Total per frame: 4m+4 limbs.  Released when `frame` destructs.
     //
-    // No explicit action required — every path writes or zeroes the
-    // full 2m-limb range.
+    // One fused `take(4m+4)` is noticeably faster than three separate
+    // takes: a single 4m+4-limb memset vectorizes cleanly, whereas
+    // three tiny memsets don't hit the SIMD fast path.
+    ScratchFrame frame(ws);
+    const uint32_t z1_cap = (m + 1) * 2;
+    uint64_t* buf   = frame.take(2 * (m + 1) + z1_cap);
+    uint64_t* sum_a = buf;
+    uint64_t* sum_b = buf + (m + 1);
+    uint64_t* z1    = buf + 2 * (m + 1);
 
-    // Scratch for z1 assembly: two (m+1)-limb sums and one (2m+2)-limb
-    // product.  Total ≈ 4m+4 limbs of transient storage per frame.
-    //
-    // For the prototype we use std::vector.  This adds a ~constant
-    // per-level allocator cost but keeps the implementation readable.
-    // Asymptotic behaviour (the thing we actually care about for
-    // crossover measurement) is unaffected.
-    std::vector<uint64_t> sum_a(m + 1, 0);
-    std::vector<uint64_t> sum_b(m + 1, 0);
-
-    uint32_t sa_used = add_limbs(a_lo, m, a_hi, m, sum_a.data());
-    uint32_t sb_used = add_limbs(b_lo, m, b_hi, m, sum_b.data());
+    uint32_t sa_used = add_limbs(a_lo, m, a_hi, m, sum_a);
+    uint32_t sb_used = add_limbs(b_lo, m, b_hi, m, sum_b);
 
     // Middle multiply: (sum_a) * (sum_b).  Max size (m+1)*(m+1) = 2m+2.
-    const uint32_t z1_cap = (m + 1) * 2;
-    std::vector<uint64_t> z1(z1_cap, 0);
-    uint32_t z1_used = mul_limbs(
-        sum_a.data(), sa_used,
-        sum_b.data(), sb_used,
-        z1.data());
-    (void)z1_used;  // used only for the optional post-subtract retrim
+    (void)mul_limbs(sum_a, sa_used, sum_b, sb_used, z1);
 
     // z1 := z1 - z0 - z2.  out[0..2m-1] = z0, out[2m..4m-1] = z2.
     //
@@ -732,20 +818,18 @@ inline uint32_t mul_karatsuba(
     // algebraically z1 ≥ z0 + z2 always holds.  The trailing positions
     // of z1 are zero-initialized, so subfrom_limbs treats them as zero
     // minuends and propagates borrow exactly as expected.
-    subfrom_limbs(z1.data(), z1_cap, out,           2 * m);
-    subfrom_limbs(z1.data(), z1_cap, out + 2 * m,   2 * m);
+    subfrom_limbs(z1, z1_cap, out,           2 * m);
+    subfrom_limbs(z1, z1_cap, out + 2 * m,   2 * m);
 
-    // Retrim: the subtract may have written into limbs past z1_used, so
-    // scan from the top of the full capacity.
-    z1_used = z1_cap;
+    // Retrim: the subtract may have written into limbs past the
+    // original used count.
+    uint32_t z1_used = z1_cap;
     while (z1_used > 0 && z1[z1_used - 1] == 0) --z1_used;
 
     // Accumulate z1 into out at offset m (middle position).
-    // The available window in `out` from index m up to 2n-1 is
-    // 2n - m = 3m limbs — comfortably larger than z1_used (≤ 2m+2).
     uint64_t final_carry = addto_limbs(
         out + m, 2 * n - m,
-        z1.data(), z1_used);
+        z1, z1_used);
     assert(final_carry == 0);  // mathematically impossible
     (void)final_carry;
 
@@ -753,6 +837,20 @@ inline uint32_t mul_karatsuba(
     uint32_t used = 2 * n;
     while (used > 0 && out[used - 1] == 0) --used;
     return used;
+}
+
+// Convenience overload for call sites that lack an outer workspace
+// (standalone benchmarks, tests).  Creates a local workspace sized
+// exactly for this call.  Hot paths (mul_general, pow_mod_montgomery)
+// should use the explicit-workspace overload to amortize backing
+// storage across calls.
+inline uint32_t mul_karatsuba(
+    const uint64_t* a, const uint64_t* b, uint32_t n,
+    uint64_t* out)
+{
+    ScratchWorkspace ws;
+    ws.reserve_limbs(karatsuba_scratch_limbs(n));
+    return mul_karatsuba(a, b, n, out, ws);
 }
 
 // Lexicographic compare of two limb arrays (MSB first logically, LSB stored first).
@@ -1545,7 +1643,8 @@ inline void montgomery_mul_karatsuba(
     uint64_t* out,
     uint64_t* work,
     uint64_t* pa, uint64_t* pb, uint64_t* kara_buf,
-    uint32_t n_padded) noexcept
+    uint32_t n_padded,
+    ScratchWorkspace& ws) noexcept
 {
     // Step 1: Pad operands to next power of 2 for Karatsuba
     std::memcpy(pa, a, k * sizeof(uint64_t));
@@ -1553,12 +1652,12 @@ inline void montgomery_mul_karatsuba(
     std::memcpy(pb, b, k * sizeof(uint64_t));
     if (n_padded > k) std::memset(pb + k, 0, (n_padded - k) * sizeof(uint64_t));
 
-    // Step 2: Karatsuba product → kara_buf (2*n_padded limbs)
-    (void)mul_karatsuba(pa, pb, n_padded, kara_buf);
+    // Step 2: Karatsuba product → kara_buf (2*n_padded limbs).
+    // Uses the caller-supplied ScratchWorkspace to amortize backing
+    // storage across every Montgomery multiply in the pow_mod loop.
+    (void)mul_karatsuba(pa, pb, n_padded, kara_buf, ws);
 
     // Step 3: Copy the relevant 2k+1 limbs into work for REDC
-    // The product T = a * b has at most 2k limbs of actual value.
-    // kara_buf has 2*n_padded limbs; we need work[0..2k] for REDC.
     std::memcpy(work, kara_buf, 2 * k * sizeof(uint64_t));
     work[2 * k] = 0;  // overflow slot for REDC carry propagation
 
@@ -1580,10 +1679,11 @@ inline void montgomery_sqr_karatsuba(
     uint64_t* out,
     uint64_t* work,
     uint64_t* pa, uint64_t* pb, uint64_t* kara_buf,
-    uint32_t n_padded) noexcept
+    uint32_t n_padded,
+    ScratchWorkspace& ws) noexcept
 {
     montgomery_mul_karatsuba(a, a, k, mod, n0inv, out, work,
-                             pa, pb, kara_buf, n_padded);
+                             pa, pb, kara_buf, n_padded, ws);
 }
 
 } // namespace detail
@@ -2416,19 +2516,25 @@ struct Hydra {
             uint32_t n = 1;
             while (n < max_limbs) n <<= 1;
 
-            std::vector<uint64_t> pa(n, 0);
-            std::vector<uint64_t> pb(n, 0);
-            std::memcpy(pa.data(), lv.ptr,
-                        lv.count * sizeof(uint64_t));
-            std::memcpy(pb.data(), rv.ptr,
-                        rv.count * sizeof(uint64_t));
+            // One heap block for the full Karatsuba operation: padded
+            // operands (n + n), output buffer (2n), and recursion
+            // scratch.  The vector grows exactly once per top-level
+            // mul_general call instead of once per recursion frame.
+            detail::ScratchWorkspace ws;
+            ws.reserve_limbs(4 * n + detail::karatsuba_scratch_limbs(n));
 
-            std::vector<uint64_t> pout(2 * n);
-            uint32_t used = detail::mul_karatsuba(
-                pa.data(), pb.data(), n, pout.data());
+            detail::ScratchFrame frame(ws);
+            uint64_t* pa   = frame.take(n);
+            uint64_t* pb   = frame.take(n);
+            uint64_t* pout = frame.take(2 * n);
+
+            std::memcpy(pa, lv.ptr, lv.count * sizeof(uint64_t));
+            std::memcpy(pb, rv.ptr, rv.count * sizeof(uint64_t));
+
+            uint32_t used = detail::mul_karatsuba(pa, pb, n, pout, ws);
             // `used` is already trimmed by mul_karatsuba; from_limbs
             // handles any final Large→Medium→Small demotion.
-            return from_limbs(pout.data(), used);
+            return from_limbs(pout, used);
         }
 
         // ── Generic fallback (schoolbook) ────────────────────
@@ -3264,6 +3370,17 @@ struct EGCDResult {
     uint64_t kara_pb[MAX_K_PADDED];
     uint64_t kara_buf[2 * MAX_K_PADDED];
 
+    // Karatsuba recursion scratch — one heap block, reused across
+    // every mont_mul / mont_sqr call in the entire exponentiation
+    // loop.  Without this, the old code paid ~3 std::vector allocs
+    // per frame × 12 frames per mul × ~1000 muls per pow_mod at
+    // 4096-bit.  We pre-reserve the exact worst-case depth bound
+    // once; no further allocation occurs.
+    detail::ScratchWorkspace kara_ws;
+    if (use_karatsuba) {
+        kara_ws.reserve_limbs(detail::karatsuba_scratch_limbs(n_padded));
+    }
+
     // ── Sliding window precomputation ──
     // Window size W=4: precompute base^1, base^3, base^5, ..., base^15
     // in Montgomery form.  table[i] = base^(2i+1) for i in [0..7].
@@ -3282,7 +3399,7 @@ struct EGCDResult {
             detail::montgomery_mul_karatsuba(a, b, k, ctx.mod_limbs.data(),
                                               ctx.n0inv, out, work_buf,
                                               kara_pa, kara_pb, kara_buf,
-                                              n_padded);
+                                              n_padded, kara_ws);
         else if (use_fused)
             detail::montgomery_mul_fused(a, b, k, ctx.mod_limbs.data(),
                                           ctx.n0inv, out, work_buf);
@@ -3295,7 +3412,7 @@ struct EGCDResult {
             detail::montgomery_sqr_karatsuba(a, k, ctx.mod_limbs.data(),
                                               ctx.n0inv, out, work_buf,
                                               kara_pa, kara_pb, kara_buf,
-                                              n_padded);
+                                              n_padded, kara_ws);
         else if (use_fused)
             detail::montgomery_sqr_fused(a, k, ctx.mod_limbs.data(),
                                           ctx.n0inv, out, work_buf);
