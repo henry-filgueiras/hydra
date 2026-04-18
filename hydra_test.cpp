@@ -3099,7 +3099,6 @@ static void test_karatsuba_pow_mod_random_sweep() {
     std::mt19937_64 rng(0xCA4A5EE9ull);
     // Test at k = 32, 40, 48, 56, 64 (all >= KARATSUBA_MONT_THRESHOLD=32)
     for (uint32_t k : {32u, 40u, 48u, 56u, 64u}) {
-        uint32_t bits = k * 64;
         for (int trial = 0; trial < 5; ++trial) {
             // Random odd modulus
             std::vector<uint64_t> mod_limbs(k);
