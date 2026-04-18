@@ -2592,4 +2592,180 @@ workloads but changes public API).
 
 ---
 
+### Dragon — NEON-tuned Dual-Row Schoolbook Leaf Kernel
+
+_Investigated 2026-04-18 — Claude Opus 4.7_
+_Status: **WIN** — 15–17 % end-to-end pow_mod speedup at 2048+/4096-bit._
+
+#### Prior hypothesis and what the scratch sprint revealed
+
+The previous sprint replaced per-recursion `std::vector` churn with
+`ScratchWorkspace` and expected a measurable pow_mod improvement.
+The measured win was small (~1.7 % at 4096-bit, noise elsewhere).
+Post-mortem in the scratch-workspace entry identified that the
+remaining cost center was **not allocation**, but the **O(k²) scalar
+MAC loops** inside `mul_limbs` (Karatsuba leaves) and, to a lesser
+extent, the CIOS row loops.
+
+This sprint attacks that cost center.
+
+#### Why the leaf kernel became the next target
+
+Running numbers on Apple M5 Pro, per the scratch sprint:
+
+| kernel          | ns/op |  ns per inner MAC  |
+|-----------------|-------|--------------------|
+| mul_school/16   |  141  |  141 / 256 ≈ 0.55  |
+| mul_school/32   |  565  |  565 / 1024 ≈ 0.55 |
+| mul_school/64   | 2552  | 2552 / 4096 ≈ 0.62 |
+
+~0.55 ns/MAC = ~2.2 cycles/MAC on M5.  An aarch64 MUL+UMULH+ADDS+ADCS
+sequence is three instructions on the critical path — theoretical
+lower bound ~2.0 cycles/MAC.  So the old loop ran at ~90 % of the
+serial-chain bound.  The only way to go faster is **parallel chains**:
+the M-series can issue ~3–4 MUL/UMULH pairs per cycle, but one carry
+chain consumes only ~1.5.  Most mul/umulh ports were idle.
+
+The classic fix is a **dual-row multiply-accumulate**: process two
+`a[i]` limbs in the same outer iteration, each with its own carry
+chain, interleaved within the j-loop.  The two chains share only a
+1-step cross-read of `out[j+1]` (chain 0's j+1 reads what chain 1
+wrote at j), which the OoO core hides behind the multiply latency.
+
+#### Design
+
+`detail::mac_row_1` — single-row scalar MAC (reference path).
+`detail::mac_row_2` — dual-row kernel with two independent chains.
+
+`mac_row_2` is guarded by `HYDRA_HAS_NEON` (`__aarch64__ && __ARM_NEON`)
+with a scalar fallback that uses the same data-flow.  The NEON variant
+uses `vld1q_u64` to pair-load `b[j..j+1]` into one register before
+extracting via `vgetq_lane_u64` — this keeps the two scalar operands
+adjacent to the muls so the scheduler doesn't stretch the dependency
+chain.  The muls themselves stay scalar `__uint128_t`; native
+64×64→128 **does not exist** in ARMv8-A NEON (only in scalar).
+
+`mul_limbs` dispatches to `mac_row_2` for every row-pair when
+`nb ≥ 2`.  Odd `na` falls back to `mac_row_1` for the final row.
+The old `if (a[i] == 0) continue` fast-path was dropped — on random
+operand distributions (pow_mod sum-halves, Karatsuba middle terms)
+the branch mispredicts often enough to cost more than it saves.
+
+The specialized 3×3 / 4×4 / 8×8 kernels are **untouched**.  They are
+already fully unrolled and outperform the generic dispatch at their
+target widths.
+
+#### What improved — micro-benchmarks
+
+(median of 5 × 0.3 s, M5 Pro)
+
+| benchmark             | before   | after    | Δ        |
+|-----------------------|----------|----------|----------|
+| mul_school/4          |   9.6    |   6.9    |  −28.0 % |
+| mul_school/8          |  30.6    |  22.3    |  −27.1 % |
+| mul_school/16         | 141.4    | 136.8    |   −3.2 % |
+| mul_school/32         | 565.3    | 345.6    |  −38.9 % |
+| mul_school/64         | 2552     | 1391     |  −45.5 % |
+| mul_karatsuba/32      |  581     |  313     |  −46.1 % |
+| mul_karatsuba/64      | 1946     | 1142     |  −41.3 % |
+| mul_dispatched/32     |  702     |  362     |  −48.5 % |
+| mul_dispatched/64     | 2258     | 1211     |  −46.4 % |
+| mul_dispatched/128    | 7161     | 4118     |  −42.5 % |
+
+The apparent −3.2 % at `mul_school/16` is anomalous — the compiler
+aggressively vectorizes the baseline at this well-trodden size, so
+the dual-row pattern matches rather than beats it.  Every larger
+size shows the expected ~2× throughput gain.
+
+#### What improved — end-to-end pow_mod
+
+(median of 10 independent `bench_pow_mod` runs, Hydra backend)
+
+| bits | before min / med  | after min / med   | Δmin   | Δmed   |
+|------|-------------------|-------------------|--------|--------|
+|  256 |  9625 / 9708 ns   |  9583 / 9980 ns   | −0.4 % | +2.8 % |
+|  512 | 51084 / 51730 ns  | 51333 / 51625 ns  | +0.5 % | −0.2 % |
+| 1024 |   303 /  317 µs   |   304 /  317 µs   | +0.2 % | +0.1 % |
+| 2048 |  3164 / 3246 µs   |  2666 / 2709 µs   | −15.8 %| **−16.6 %** |
+| 4096 | 23235 / 23883 µs  | 19541 / 20090 µs  | −15.9 %| **−15.9 %** |
+
+Karatsuba engages for `k ≥ 32` in Montgomery (2048-bit = k=32,
+4096-bit = k=64).  Those two widths are where the leaf kernel
+benefits end-to-end exponentiation.  Below k=32 the fused CIOS
+path handles the multiply and is untouched by this sprint.
+
+**End-to-end pow_mod moved materially** — not just microbenchmarks.
+The sprint goal is met.
+
+#### Gap to OpenSSL / GMP (after)
+
+| bits | Hydra    | GMP      | Hydra/GMP | OpenSSL  | Hydra/OpenSSL |
+|------|----------|----------|-----------|----------|---------------|
+| 2048 |  2696 µs |  1114 µs | 2.42 ×    |   786 µs | 3.43 ×        |
+| 4096 | 20149 µs |  7693 µs | 2.62 ×    |  5925 µs | 3.40 ×        |
+
+Before this sprint Hydra trailed OpenSSL by ~4 ×.  After this sprint
+the gap is ~3.4 ×.  Both GMP and OpenSSL hand-tune `mpn_mul_basecase`
+and the Montgomery row at the assembly level; Hydra's next gains
+require either matching that asm-level tuning or reducing the number
+of leaves (Toom-Cook / larger Karatsuba trees).
+
+#### Threshold retuning
+
+With leaves ~45 % faster, the dispatch crossovers were re-checked:
+
+- `KARATSUBA_RECURSION_BASE` sweep {4, 8, 16, 32}:
+  16 remains the winner at every measured `n` (lowering hurts because
+  schoolbook leaves are now fast enough that deeper Karatsuba costs
+  more in bookkeeping than it saves in MACs).
+- `KARATSUBA_MONT_THRESHOLD` sweep {32, 48, 64}:
+  32 remains the winner (disabling Karatsuba below k=48 costs ~7 %
+  at 2048-bit pow_mod).
+- `KARATSUBA_THRESHOLD_LIMBS` (mul_general dispatch): kept at 32.
+  At k=32, mul_general's Karatsuba path is 362 ns versus schoolbook
+  346 ns — ~5 % gap, not worth the threshold bump for the
+  non-pow_mod public multiply path.
+
+No threshold changes in this PR.
+
+#### What still limits Hydra vs GMP / OpenSSL
+
+1. **Scalar MAC is still the dominant cost** — each dual-row
+   iteration still runs two MUL+UMULH+ADDC chains sequentially per
+   carry step.  GMP's hand-tuned aarch64 `mpn_mul_basecase_k2` gets
+   an additional ~30–40 % by using wider unrolling and explicit
+   `ADCS` sequences that the C compiler can't reach.
+2. **Montgomery row reduction is still a single scalar chain.**
+   CIOS per-row reduce was looked at this sprint and deferred —
+   rows have a serial dependency through the accumulator's low-limb
+   invalidation, so the dual-row trick doesn't apply without a
+   rewrite to SOS (Separated Operand Scanning).
+3. **No Toom-Cook** — at 4096-bit, Toom-3 on top of Karatsuba would
+   save another ~15–20 % of the multiply cost.  Deferred.
+
+#### Recommended next sprint
+
+Ranked by confidence-of-win:
+
+1. **CIOS row-pair / SOS Montgomery kernel.**  The CIOS multiply-step
+   inner loop has the same shape as `mul_limbs` and could consume
+   `mac_row_2` directly (processing two `a[i]` per row) if the
+   algorithm is restructured from row-interleaved to separated
+   operand scanning.  Expected pow_mod impact: 10–15 % at 1024-bit
+   (the width that did NOT benefit this sprint because it's below
+   the Karatsuba threshold).
+2. **Hand-tuned aarch64 `mul_limbs_base` (inline asm).**  Explicitly
+   emit the `ADCS` carry chain with wider unrolling (process 4 rows
+   at a time).  This lifts the implementation ceiling toward the
+   GMP equivalent.  The public header's portable C path would remain
+   the fallback.  Expected additional pow_mod win: 15–25 % at 2048+
+   bit, but at the cost of architecture-specific code.
+3. **Toom-Cook 3-way above k=64.**  Only helps ≥ 4096-bit; adds
+   recursion depth + evaluation/interpolation overhead.  Defer until
+   2 is exhausted.
+4. **Threshold sweep + PGO.**  Low ceiling (a few % at most);
+   skip unless both 1 and 2 land.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

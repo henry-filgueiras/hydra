@@ -537,6 +537,134 @@ static void test_scratch_nested_frames() {
     CHECK(eq, "scratch nested frames — Karatsuba matches schoolbook");
 }
 
+// ── Dual-row MAC leaf kernel regression tests ──────────────
+//
+// The NEON-tuned dual-row kernel (mac_row_2 inside mul_limbs) pairs
+// up adjacent a-limbs and runs two independent carry chains.  These
+// tests verify it produces byte-identical output to a naïve single-
+// row reference across:
+//   • all nb widths from 1 up to well past the NEON 2-lane unroll
+//     boundary (probes the "j + 2 <= nb" tail)
+//   • odd na (tests the odd-row tail handler that falls back to
+//     mac_row_1 for the last a-limb)
+//   • extreme operands (all-ones) for worst-case carry-out pressure
+
+static void test_mul_limbs_dual_row_cross_check() {
+    // Naïve reference: pure single-row schoolbook, no fast paths.
+    auto ref_mul = [](const uint64_t* a, uint32_t na,
+                      const uint64_t* b, uint32_t nb,
+                      uint64_t* out) {
+        std::memset(out, 0, (na + nb) * sizeof(uint64_t));
+        for (uint32_t i = 0; i < na; ++i) {
+            uint64_t carry = 0;
+            for (uint32_t j = 0; j < nb; ++j) {
+                unsigned __int128 t =
+                    static_cast<unsigned __int128>(a[i]) * b[j]
+                    + out[i + j] + carry;
+                out[i + j] = static_cast<uint64_t>(t);
+                carry = static_cast<uint64_t>(t >> 64);
+            }
+            for (uint32_t k = i + nb; carry; ++k) {
+                uint64_t t = out[k] + carry;
+                carry = (t < carry) ? 1u : 0u;
+                out[k] = t;
+            }
+        }
+    };
+
+    std::mt19937_64 rng(0xD1AB10CA);
+    bool all_ok = true;
+
+    // Random operands: sweep na ∈ [1..12] × nb ∈ [1..12] to probe the
+    // even/odd row-pair boundary and the NEON 2-lane inner tail.
+    for (uint32_t na = 1; na <= 12 && all_ok; ++na) {
+        for (uint32_t nb = 1; nb <= 12 && all_ok; ++nb) {
+            std::vector<uint64_t> a(na), b(nb);
+            for (auto& l : a) l = rng();
+            for (auto& l : b) l = rng();
+
+            std::vector<uint64_t> got(na + nb + 1), ref(na + nb + 1);
+            hydra::detail::mul_limbs(a.data(), na, b.data(), nb, got.data());
+            ref_mul(a.data(), na, b.data(), nb, ref.data());
+
+            if (std::memcmp(got.data(), ref.data(),
+                            (na + nb) * sizeof(uint64_t)) != 0) {
+                std::string msg = "dual-row mul_limbs mismatch at na="
+                                  + std::to_string(na)
+                                  + " nb=" + std::to_string(nb);
+                CHECK(false, msg.c_str());
+                all_ok = false;
+            }
+        }
+    }
+    CHECK(all_ok, "dual-row mul_limbs matches reference over 12×12 sweep");
+}
+
+static void test_mul_limbs_dual_row_all_ones() {
+    // All-ones: maximises carry propagation.  (2^(64na) - 1) × (2^(64nb) - 1)
+    // produces a product where the carry chain touches every limb.
+    auto ref_mul = [](const uint64_t* a, uint32_t na,
+                      const uint64_t* b, uint32_t nb,
+                      uint64_t* out) {
+        std::memset(out, 0, (na + nb) * sizeof(uint64_t));
+        for (uint32_t i = 0; i < na; ++i) {
+            uint64_t carry = 0;
+            for (uint32_t j = 0; j < nb; ++j) {
+                unsigned __int128 t =
+                    static_cast<unsigned __int128>(a[i]) * b[j]
+                    + out[i + j] + carry;
+                out[i + j] = static_cast<uint64_t>(t);
+                carry = static_cast<uint64_t>(t >> 64);
+            }
+            for (uint32_t k = i + nb; carry; ++k) {
+                uint64_t t = out[k] + carry;
+                carry = (t < carry) ? 1u : 0u;
+                out[k] = t;
+            }
+        }
+    };
+
+    for (uint32_t n : {2u, 3u, 4u, 7u, 8u, 16u, 17u, 32u}) {
+        std::vector<uint64_t> a(n, UINT64_MAX), b(n, UINT64_MAX);
+        std::vector<uint64_t> got(2 * n), ref(2 * n);
+        hydra::detail::mul_limbs(a.data(), n, b.data(), n, got.data());
+        ref_mul(a.data(), n, b.data(), n, ref.data());
+        bool eq = std::memcmp(got.data(), ref.data(),
+                              2 * n * sizeof(uint64_t)) == 0;
+        std::string msg = "dual-row all-ones at n=" + std::to_string(n);
+        CHECK(eq, msg.c_str());
+    }
+}
+
+static void test_mul_limbs_dual_row_nb_one() {
+    // nb = 1 must bypass mac_row_2 (it requires nb >= 2) and take the
+    // single-row fallback for every a-limb.  Cross-check at several na.
+    std::mt19937_64 rng(0xC1A551CA);
+    bool all_ok = true;
+    for (uint32_t na : {1u, 2u, 3u, 7u, 8u, 16u}) {
+        std::vector<uint64_t> a(na);
+        for (auto& l : a) l = rng();
+        uint64_t b = rng();
+        std::vector<uint64_t> got(na + 1), ref(na + 1, 0);
+        hydra::detail::mul_limbs(a.data(), na, &b, 1, got.data());
+        // Reference: single-row MAC in a naïve loop.
+        uint64_t carry = 0;
+        for (uint32_t i = 0; i < na; ++i) {
+            unsigned __int128 t =
+                static_cast<unsigned __int128>(a[i]) * b + carry;
+            ref[i] = static_cast<uint64_t>(t);
+            carry  = static_cast<uint64_t>(t >> 64);
+        }
+        ref[na] = carry;
+        if (std::memcmp(got.data(), ref.data(),
+                        (na + 1) * sizeof(uint64_t)) != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    CHECK(all_ok, "dual-row fallback: nb=1 matches single-row reference");
+}
+
 // ── mul_general dispatch-seam tests ───────────────────────────────────
 //
 // These tests exercise the dispatch boundary of mul_general at the
@@ -3104,6 +3232,9 @@ int main() {
     test_scratch_capacity_bound();
     test_scratch_reuse_across_calls();
     test_scratch_nested_frames();
+    test_mul_limbs_dual_row_cross_check();
+    test_mul_limbs_dual_row_all_ones();
+    test_mul_limbs_dual_row_nb_one();
 
     // mul_general dispatch-seam tests (Karatsuba integration)
     test_mul_seam_31_limbs();

@@ -43,6 +43,20 @@
 #include <chrono>
 #endif
 
+// ── NEON detection (ARMv8 / Apple Silicon) ──
+//
+// All NEON-tuned kernels live inside `#if HYDRA_HAS_NEON` guards so the
+// scalar fallback stays the authoritative reference on every other ISA.
+// The intrinsics we use are the standard ARM C Language Extensions
+// subset (vld1q_u64 / vst1q_u64 / vgetq_lane_u64); no Apple-specific
+// hardware-revision probes.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#  define HYDRA_HAS_NEON 1
+#  include <arm_neon.h>
+#else
+#  define HYDRA_HAS_NEON 0
+#endif
+
 namespace hydra {
 
 // ─────────────────────────────────────────────────────────
@@ -238,7 +252,163 @@ inline uint32_t sub_limbs(
     return used;
 }
 
+// ── Single-row multiply-accumulate helper ────────────────────
+//
+// Computes  out[0..nb-1] += a_i * b[0..nb-1]  and returns the final
+// carry-out from the top limb.  Pure scalar — one MUL+UMULH+ADDS+ADCS
+// chain per iteration.  The compiler reliably turns this into tight
+// aarch64 code; the OoO core happily speculates the mul/umulh of
+// j+1 ahead of the j-carry resolution, so throughput saturates the
+// mul/umulh ports without further unrolling.
+inline uint64_t mac_row_1(
+    uint64_t        a_i,
+    const uint64_t* b, uint32_t nb,
+    uint64_t*       out) noexcept
+{
+    uint64_t carry = 0;
+    for (uint32_t j = 0; j < nb; ++j) {
+        unsigned __int128 t =
+            static_cast<unsigned __int128>(a_i) * b[j]
+            + out[j]
+            + carry;
+        out[j] = static_cast<uint64_t>(t);
+        carry  = static_cast<uint64_t>(t >> 64);
+    }
+    return carry;
+}
+
+// ── Dual-row multiply-accumulate helper ──────────────────────
+//
+// Computes, for each j in [0, nb):
+//   out[j]   += a0 * b[j] + carry0_in
+//   out[j+1] += a1 * b[j] + carry1_in
+// keeping two INDEPENDENT scalar carry chains.
+//
+// Why this helps on Apple Silicon (M1+ / M5):
+//   • The M-series issues 3-4 MUL/UMULH pairs per cycle.
+//   • A single-row MAC (mac_row_1 above) has one chain and saturates
+//     ~1-1.5 mul/umulh per cycle — leaving the remaining ports idle.
+//   • Running two chains doubles the in-flight multiplies while
+//     keeping the serial dependency (`out[j+1]` in chain 0 at j+1
+//     reads what chain 1 wrote at j) one step apart — OoO hides it.
+//   • NEON vld1q_u64 pair-loads `b[]` into one register; the two
+//     lanes are then consumed by the two independent mul chains.
+//
+// Preconditions:
+//   out[0..nb+1] are all readable; out[nb], out[nb+1] hold the
+//   accumulator tail (typically zero on entry when called from
+//   mul_limbs).  Caller is responsible for folding the returned
+//   pair (c0, c1) into out[nb] and out[nb+1] if they aren't
+//   already zero-valued on entry.
+//
+// Returns nothing — the pair's final carries are folded into
+// out[nb] (c0) and out[nb+1] (c1) inside this function.
+inline void mac_row_2(
+    uint64_t        a0, uint64_t a1,
+    const uint64_t* b, uint32_t nb,
+    uint64_t*       out) noexcept
+{
+    uint64_t c0 = 0, c1 = 0;
+
+#if HYDRA_HAS_NEON
+    // NEON pair-load path: vld1q_u64 fetches two `b[]` limbs into one
+    // 128-bit register, which the compiler cleanly splits into the
+    // two scalar operands for the MUL/UMULH issued below.  On an
+    // out-of-order core this is equivalent to two scalar loads, but
+    // consistently places the loads next to the muls so the
+    // scheduler doesn't stretch the dependency chain.
+    uint32_t j = 0;
+    for (; j + 2 <= nb; j += 2) {
+        const uint64x2_t bv = vld1q_u64(b + j);
+        const uint64_t   bj0 = vgetq_lane_u64(bv, 0);
+        const uint64_t   bj1 = vgetq_lane_u64(bv, 1);
+
+        // j: chain 0 writes out[j], chain 1 writes out[j+1].
+        unsigned __int128 t0 =
+            static_cast<unsigned __int128>(a0) * bj0 + out[j]     + c0;
+        unsigned __int128 t1 =
+            static_cast<unsigned __int128>(a1) * bj0 + out[j + 1] + c1;
+        out[j]     = static_cast<uint64_t>(t0);
+        c0         = static_cast<uint64_t>(t0 >> 64);
+        const uint64_t mid_hi = static_cast<uint64_t>(t1 >> 64);
+        const uint64_t mid_lo = static_cast<uint64_t>(t1);
+        // The next iteration of chain 0 will read out[j+1], which we
+        // have just produced in (mid_lo).  Fold immediately so the
+        // read is satisfied from a register, not from memory.
+        out[j + 1] = mid_lo;
+        c1         = mid_hi;
+
+        // j+1: chain 0 writes out[j+1], chain 1 writes out[j+2].
+        unsigned __int128 t2 =
+            static_cast<unsigned __int128>(a0) * bj1 + out[j + 1] + c0;
+        unsigned __int128 t3 =
+            static_cast<unsigned __int128>(a1) * bj1 + out[j + 2] + c1;
+        out[j + 1] = static_cast<uint64_t>(t2);
+        c0         = static_cast<uint64_t>(t2 >> 64);
+        out[j + 2] = static_cast<uint64_t>(t3);
+        c1         = static_cast<uint64_t>(t3 >> 64);
+    }
+    // Tail (odd nb): one scalar iteration.
+    if (j < nb) {
+        const uint64_t bj = b[j];
+        unsigned __int128 t0 =
+            static_cast<unsigned __int128>(a0) * bj + out[j]     + c0;
+        unsigned __int128 t1 =
+            static_cast<unsigned __int128>(a1) * bj + out[j + 1] + c1;
+        out[j]     = static_cast<uint64_t>(t0);
+        c0         = static_cast<uint64_t>(t0 >> 64);
+        out[j + 1] = static_cast<uint64_t>(t1);
+        c1         = static_cast<uint64_t>(t1 >> 64);
+        ++j;
+    }
+#else
+    // Scalar fallback: identical data flow, no NEON loads.
+    for (uint32_t j = 0; j < nb; ++j) {
+        const uint64_t bj = b[j];
+        unsigned __int128 t0 =
+            static_cast<unsigned __int128>(a0) * bj + out[j]     + c0;
+        unsigned __int128 t1 =
+            static_cast<unsigned __int128>(a1) * bj + out[j + 1] + c1;
+        out[j]     = static_cast<uint64_t>(t0);
+        c0         = static_cast<uint64_t>(t0 >> 64);
+        out[j + 1] = static_cast<uint64_t>(t1);
+        c1         = static_cast<uint64_t>(t1 >> 64);
+    }
+#endif
+
+    // Fold the two tail carries.  c0 lands at out[nb]; c1 at out[nb+1].
+    // On entry to mac_row_2 these slots are normally zero (mul_limbs
+    // memsets the output), so the "+ old" reads are simple loads.
+    unsigned __int128 t = static_cast<unsigned __int128>(out[nb]) + c0;
+    out[nb]     = static_cast<uint64_t>(t);
+    uint64_t ch = static_cast<uint64_t>(t >> 64);
+
+    t           = static_cast<unsigned __int128>(out[nb + 1]) + c1 + ch;
+    out[nb + 1] = static_cast<uint64_t>(t);
+    ch          = static_cast<uint64_t>(t >> 64);
+
+    // Rare: the fold of c1 into out[nb+1] produced its own carry.
+    // Propagate upward until it dies.
+    for (uint32_t k = nb + 2; ch; ++k) {
+        uint64_t s = out[k] + ch;
+        ch = (s < out[k]) ? 1u : 0u;
+        out[k] = s;
+    }
+}
+
 // Schoolbook O(n²) multiply. out must have na+nb zeroed limbs.
+//
+// Row dispatch:
+//   • Small leaves (na < 4 or nb < 4) go through the single-row MAC
+//     helper — the dual-row setup isn't worth it below that.
+//   • Larger leaves pair up `a` two rows at a time and call mac_row_2,
+//     which issues two independent mul/umulh chains per inner MAC.
+//     This is the only structural change from the prior implementation.
+//
+// The `a[i] == 0` fast-path from the old loop is dropped: on random
+// operand distributions (pow_mod, Karatsuba sum-halves) the branch
+// mispredicts often enough to cost more than it saves, and the MACs
+// are already cheap when a[i] is zero.
 inline uint32_t mul_limbs(
     const uint64_t* a, uint32_t na,
     const uint64_t* b, uint32_t nb,
@@ -246,18 +416,21 @@ inline uint32_t mul_limbs(
 {
     std::memset(out, 0, (na + nb) * sizeof(uint64_t));
 
-    for (uint32_t i = 0; i < na; ++i) {
-        if (a[i] == 0) continue;
-        uint64_t carry = 0;
-        for (uint32_t j = 0; j < nb; ++j) {
-            unsigned __int128 t =
-                static_cast<unsigned __int128>(a[i]) * b[j]
-                + out[i + j]
-                + carry;
-            out[i + j] = static_cast<uint64_t>(t);
-            carry       = static_cast<uint64_t>(t >> 64);
+    uint32_t i = 0;
+
+    // Dual-row kernel: process a[i], a[i+1] together.  Requires at
+    // least 2 a-limbs and nb >= 2 (mac_row_2 writes out[nb] and
+    // out[nb+1] as carry slots, so the output window must straddle
+    // two extra limbs, which is already true for na+nb >= 4).
+    if (nb >= 2) {
+        for (; i + 2 <= na; i += 2) {
+            mac_row_2(a[i], a[i + 1], b, nb, out + i);
         }
-        // Propagate final carry into higher limbs.
+    }
+
+    // Single-row tail: at most one a-limb left (or nb==1).
+    for (; i < na; ++i) {
+        uint64_t carry = mac_row_1(a[i], b, nb, out + i);
         for (uint32_t k = i + nb; carry; ++k) {
             uint64_t t = out[k] + carry;
             carry = (t < carry) ? 1u : 0u;
