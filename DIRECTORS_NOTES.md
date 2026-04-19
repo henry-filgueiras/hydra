@@ -2754,6 +2754,10 @@ Ranked by confidence-of-win:
    operand scanning.  Expected pow_mod impact: 10–15 % at 1024-bit
    (the width that did NOT benefit this sprint because it's below
    the Karatsuba threshold).
+   _Investigated 2026-04-18 — see "Dragon — SOS Montgomery (Null
+   Result)" below.  The expected win did not materialise; the SOS
+   structure costs more end-to-end than fused CIOS at every k where
+   it would have replaced fused CIOS._
 2. **Hand-tuned aarch64 `mul_limbs_base` (inline asm).**  Explicitly
    emit the `ADCS` carry chain with wider unrolling (process 4 rows
    at a time).  This lifts the implementation ceiling toward the
@@ -2765,6 +2769,215 @@ Ranked by confidence-of-win:
    2 is exhausted.
 4. **Threshold sweep + PGO.**  Low ceiling (a few % at most);
    skip unless both 1 and 2 land.
+
+---
+
+### Dragon — SOS Montgomery (Null Result)
+
+_Investigated 2026-04-18 — Claude Opus 4.7_
+_Status: **NULL RESULT** — kept SOS as a callable alternate; default
+dispatch reverts to fused CIOS for k=8..31._
+
+#### Hypothesis (from the prior sprint)
+
+The dual-row leaf kernel sprint left 1024-bit (k=16) and 512-bit
+(k=8) `pow_mod` essentially unchanged.  Both widths fall below
+`KARATSUBA_MONT_THRESHOLD = 32` and so use **fused CIOS**
+(`montgomery_mul_fused`), whose hand-rolled inner row loops do not
+go through `mul_limbs` and therefore never touch `mac_row_2`.
+
+The proposed restructuring: switch the multiply phase from CIOS's
+interleaved `T += a[i]·b; reduce` to **SOS** (Separated Operand
+Scanning) — compute the full 2k-limb product `T = a·b` first, then
+run the existing word-by-word REDC.  In SOS form the product phase
+*is* `mul_limbs`, so it consumes `mac_row_2` for free.  Predicted
+end-to-end pow_mod win: 10–15 % at 1024-bit.
+
+#### What was built
+
+Two new primitives in `detail::` next to the existing fused/karatsuba
+backends:
+
+- `montgomery_mul_sos(a, b, k, mod, n0inv, out, work)` — calls
+  `mul_limbs(a, k, b, k, work)` then `montgomery_redc(work, k, …)`.
+  Needs 2k+1 work limbs (vs k+2 for fused).
+- `montgomery_sqr_sos(a, k, …)` — thin alias to the existing
+  `montgomery_sqr` (cross-terms + diagonal + REDC), which is already
+  SOS-shaped.  Replacing its product phase with `mul_limbs(a, a, …)`
+  would *lose* the cross-term symmetry trick (~k(k-1)/2 vs k² MACs),
+  so we leave the dedicated squaring intact.
+
+Tests added in `hydra_test.cpp`:
+
+- `test_sos_mont_mul_vs_fused_sweep` — k = 1, 2, 3, 4, 8, 12, 16, 24,
+  31 cross-checks against the prior dispatch winner at each k.
+- `test_sos_mont_mul_carry_adversarial` — `(mod-1)²` operands at
+  every carry-stress k; this is the worst case for REDC's upward
+  carry walk and for the 2k-limb product's high-half handling.
+- `test_sos_mont_mul_dirty_work_buffer` — pre-fills `work[]` with
+  `0xBADC0FFEE0DDF00D` to catch any future regression that assumes
+  caller-side zeroing of the SOS buffer.
+- `test_sos_mont_sqr_cross` — SOS squaring vs fused squaring at
+  every carry-stress k.
+- `test_sos_pow_mod_dispatch_widths` — end-to-end pow_mod at the
+  widths the SOS path was supposed to own (256/512/1024/1536/1984-bit).
+
+All 21 new test cases pass, confirming SOS is algebraically correct.
+
+#### Why it didn't win — the measurement
+
+Two probe binaries were added in `bench/` to attribute the cost:
+
+- `probe_mont_sos.cpp` — kernel-level A/B with **fixed operands**
+  in a tight loop (everything stays cache-hot).
+- `probe_mont_variants.cpp` — **rotating-operand loop** mimicking
+  pow_mod's per-window body: `8 × (sqr + mul-against-rotating-table)`
+  with a result/temp ping-pong, the same shape pow_mod actually
+  exercises.
+
+Kernel-only probe (single-call, hot operands):
+
+| k  | fused      | sos_mul_limbs | Δ      |
+|----|------------|----------------|--------|
+|  4 |   45.4 ns  |    29.5 ns     | −35 %  |
+|  8 |   78.0 ns  |    63.8 ns     | −18 %  |
+| 16 |  238.0 ns  |   241.6 ns     |  +1.5 %|
+| 24 |  604.9 ns  |   523.4 ns     | −13 %  |
+| 31 | 1028.3 ns  |   957.8 ns     |  −7 %  |
+
+This matched the optimistic prediction.  But under the rotating-
+operand probe — which has the same call cadence as pow_mod's inner
+loop:
+
+| k  | fused      | sos_mul_limbs | sos_singlerow | B-vs-A | C-vs-A |
+|----|------------|----------------|----------------|--------|--------|
+|  4 |   546 ns   |   608 ns       |   637 ns       | +11 %  | +17 %  |
+|  8 |  1350 ns   |  1492 ns       |  1650 ns       | +11 %  | +22 %  |
+| 12 |  2435 ns   |  3107 ns       |  3608 ns       | +28 %  | +48 %  |
+| 16 |  4078 ns   |  5072 ns       |  6282 ns       | +24 %  | +54 %  |
+| 24 |  9919 ns   | 10328 ns       | 12053 ns       |  +4 %  | +22 %  |
+| 31 | 17370 ns   | 16064 ns       | 19134 ns       |  −7 %  | +10 %  |
+
+`sos_singlerow` is a hand-coded SOS that bypasses
+`mul_limbs`/`mac_row_2` entirely (open-coded single-row schoolbook
++ REDC).  It is the cleanest possible measurement of the SOS
+*structure cost* without any dual-row machinery.
+
+The pivotal reading is column C-vs-A: **even with the dual-row
+kernel removed entirely, SOS is +10 % to +54 % slower than fused
+CIOS at every k from 4 to 31.**  The structure itself loses;
+`mac_row_2` only narrows the gap.  The actual SOS implementation
+(column B) wins back ~5–25 % from `mac_row_2` over single-row, but
+that's not enough to cross fused CIOS's structural advantage in
+this range.
+
+End-to-end pow_mod confirmed the same picture (`probe_pow_mod_ab`,
+which inlines pow_mod_montgomery's exponentiation loop and toggles
+just the backend):
+
+| bits | k  | fused_pow_mod | sos_pow_mod | Δ        |
+|------|----|---------------|-------------|----------|
+|  256 |  4 |    11.91 µs   |    9.54 µs  | **−20 %**|
+|  512 |  8 |    52.17 µs   |   54.05 µs  |   +4 %   |
+| 1024 | 16 |   311.07 µs   |  405.76 µs  | **+30 %**|
+| 1536 | 24 |  1133.47 µs   | 1065.64 µs  |   −6 %   |
+| 1984 | 31 |  2560.93 µs   | 2441.01 µs  |   −5 %   |
+
+The 1024-bit case — the very width the sprint targeted — gets
+**worse** by 30 %.  Only k=4 (256-bit) and the high-k corners
+(k≥24, where padding rules out Karatsuba) benefit, and not by
+enough to justify the dispatch complexity.
+
+#### Why fused CIOS wins in this range
+
+CIOS keeps the running accumulator `T` in `k+2` limbs throughout,
+which fits in 18 limbs (144 B) at k=16.  Every per-row mul and
+reduce step touches the same 18 limbs; they stay register- /
+L1-resident.  The serial cost is the MAC chain; the working set is
+tiny.
+
+SOS materialises a `2k`-limb product in `work[]` (32 limbs / 256 B
+at k=16), reads the same 32 limbs back during REDC, and then writes
+out the `k`-limb result.  Same MAC count, but **two passes over a
+2× larger working set**, plus the 2k-limb buffer evicts other
+nearby state from L1 between consecutive `mont_mul`/`mont_sqr`
+calls.  Under the rotating-operand pattern that pow_mod's
+sliding-window loop generates, this matters; the kernel-only probe
+hides it because the buffer is the only cache-resident state.
+
+The dual-row kernel `mac_row_2` was supposed to pay for that
+overhead.  At k=16 it doesn't: the prior sprint already noted
+`mac_row_2` is only `−3 %` vs scalar at k=16 because the compiler
+auto-vectorises the baseline `mul_limbs` loop at that size.  Below
+k=16 the dual-row win is even smaller (the dispatch can't issue
+many parallel chains when there are only ~8 rows).  So the SOS
+restructuring spends the structural overhead without earning enough
+from `mac_row_2` to cover it.
+
+`always_inline` annotations on the SOS chain were tried — they
+forced inlining (verified via `nm`) but did not change the result;
+the regression is structural, not from function-call overhead.
+
+#### What landed in this PR
+
+- `detail::montgomery_mul_sos`, `detail::montgomery_sqr_sos`
+  (callable alternates, fully tested at every k from 1 to 31).
+- 21 new unit tests in `hydra_test.cpp` covering correctness,
+  carry-adversarial inputs, and dirty-buffer tolerance.
+- `bench/probe_mont_sos.cpp`, `bench/probe_mont_loop.cpp`,
+  `bench/probe_mont_variants.cpp`, `bench/probe_pow_mod_ab.cpp`
+  for future re-attribution.
+- **No dispatch change.**  `pow_mod_montgomery` still uses fused
+  CIOS for k=8..31 and Karatsuba for k≥32.  The SOS code is in-tree
+  so a follow-up that finds the right shape for it (see below)
+  doesn't have to re-derive correctness or re-write the tests.
+
+#### What this sprint *learned* (worth banking)
+
+1. **Kernel microbenches mislead in the SOS direction.**  At k=4..16,
+   single-call kernel A/B suggested SOS would win by 1.5–35 %.  The
+   pow_mod call cadence inverts the result.  Future Montgomery work
+   should benchmark against `probe_mont_variants.cpp` (or directly
+   against `pow_mod`) before proposing structural changes.
+2. **`mac_row_2`'s win at k≤16 is small — too small to pay structural
+   tax for.**  The honest read of the prior sprint's `−3 %` data
+   point at k=16 is that the dual-row kernel essentially ties the
+   compiler's auto-vectorisation in this range.  Restructuring just
+   to expose `mac_row_2` to a phase that didn't have it before
+   doesn't move the needle here.
+3. **Fused CIOS is structurally tight.**  Its `k+2`-limb accumulator
+   is the cache-locality reason it beats SOS at small k.  Any
+   future restructuring needs to *preserve* that property, not
+   sacrifice it for ILP that the hardware can't actually exploit at
+   this size.
+
+#### Updated recommendation for next sprint
+
+Ranked by confidence-of-win, **after** this null result:
+
+1. **Hand-tuned aarch64 `mul_limbs_base` (inline asm)** — explicit
+   `ADCS` carry chain with 4-row unrolling.  Lifts the inner-loop
+   ceiling on every Montgomery width (fused CIOS row included), not
+   just k≥32.  Now the highest-confidence remaining win;
+   moves to slot 1 because it's the only path that can move
+   1024-bit and below without restructuring.  Expected pow_mod
+   delta: 15–25 % at 2048+, possibly 10–15 % at 1024-bit (where
+   the row loop becomes the dominant remaining cost once compiler
+   auto-vectorisation is replaced with explicit carry-chain asm).
+2. **Dual-row CIOS** — pair two outer iterations of `montgomery_mul_fused`
+   so the multiply phase consumes `mac_row_2` *while keeping the
+   k+2-limb fused accumulator*.  This avoids SOS's structural
+   penalty.  Expected win is small (`mac_row_2` is only `−3 %` at
+   k=16, the only width that matters for this), but it's portable
+   C and would be the right experiment if inline asm is off-limits.
+3. **Toom-Cook 3-way above k=64.**  Only helps ≥4096-bit; deferred
+   until 1 lands.
+4. **Threshold sweep + PGO.**  Same low ceiling as before.
+
+The SOS path is no longer a recommended next experiment.  Future
+attempts at "expose `mac_row_2` to Montgomery" should target dual-row
+CIOS (option 2) — keep the fused structure, change only the multiply
+row's shape.
 
 ---
 

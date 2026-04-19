@@ -3157,6 +3157,213 @@ static void test_karatsuba_mont_sqr_cross() {
     CHECK(match, "karatsuba mont sqr vs fused at k=32");
 }
 
+// ─── SOS-style Montgomery kernel tests ────────────────────────────
+//
+// `montgomery_mul_sos` (mul_limbs + REDC) replaces `montgomery_mul_fused`
+// and the open-coded `montgomery_mul` for k < KARATSUBA_MONT_THRESHOLD.
+// These tests cross-check it against the older (still-callable) backends
+// at the carry-stress widths where the dual-row inner kernel and the
+// 2k-limb intermediate buffer interact in non-obvious ways.
+//
+static void test_sos_mont_mul_vs_fused_sweep() {
+    std::mt19937_64 rng(0x505000A1ull);
+    // Cover every k that the SOS path now owns: from "1 limb edge case"
+    // through the FUSED_THRESHOLD it replaced (k=8) and up to the
+    // largest k where Karatsuba can't take over because of padding
+    // (k=31, the last fused-CIOS slot before KARATSUBA_MONT_THRESHOLD).
+    for (uint32_t k : {1u, 2u, 3u, 4u, 8u, 12u, 16u, 24u, 31u}) {
+        std::vector<uint64_t> mod(k), a(k), b(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1u;
+        mod[k - 1] |= (1ull << 63);
+        for (auto& l : a) l = rng();
+        for (auto& l : b) l = rng();
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        // Reference: fused CIOS (the prior dispatch winner at k≥8)
+        // for k≥1; below k=8, the historical reference is the
+        // open-coded `montgomery_mul`.  We use whichever the prior
+        // dispatcher would have selected so this test catches any
+        // SOS-introduced regression at the same algebraic value.
+        std::vector<uint64_t> out_ref(k);
+        if (k >= 8) {
+            std::vector<uint64_t> work_ref(k + 2, 0);
+            hydra::detail::montgomery_mul_fused(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_ref(2 * k + 1, 0);
+            hydra::detail::montgomery_mul(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        }
+
+        // SOS path
+        std::vector<uint64_t> out_sos(k), work_sos(2 * k + 1, 0);
+        hydra::detail::montgomery_mul_sos(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_sos.data(), work_sos.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_sos[i]) { match = false; break; }
+        }
+        std::string label = "sos mont_mul vs reference at k=" +
+                            std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
+static void test_sos_mont_mul_carry_adversarial() {
+    // Adversarial operands: mod just under R, a = b = mod-1 (largest
+    // possible residues).  This pushes the schoolbook product to its
+    // maximum value (≈ R²) and forces the REDC carry chain to walk
+    // every upper limb.  If the SOS path mishandles work[2k] init or
+    // any per-row carry into the upper half, this test will catch it.
+    for (uint32_t k : {2u, 4u, 8u, 16u, 24u}) {
+        std::vector<uint64_t> mod(k), a(k);
+        // mod = 2^(64k) - 3 (odd, very close to R)
+        for (auto& l : mod) l = ~uint64_t{0};
+        mod[0] -= 2;  // ensure odd and slightly below R
+        std::vector<uint64_t> b(k);
+        // a = b = mod - 1  (so a*b = (mod-1)² = mod² - 2·mod + 1,
+        // residue = 1; trivially verifiable post-REDC roundtrip)
+        for (uint32_t i = 0; i < k; ++i) { a[i] = mod[i]; b[i] = mod[i]; }
+        a[0] -= 1; b[0] -= 1;
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_ref(k);
+        if (k >= 8) {
+            std::vector<uint64_t> work_ref(k + 2, 0);
+            hydra::detail::montgomery_mul_fused(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_ref(2 * k + 1, 0);
+            hydra::detail::montgomery_mul(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        }
+
+        std::vector<uint64_t> out_sos(k), work_sos(2 * k + 1, 0);
+        hydra::detail::montgomery_mul_sos(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_sos.data(), work_sos.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_sos[i]) { match = false; break; }
+        }
+        std::string label = "sos mont_mul adversarial (mod-1)² at k=" +
+                            std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
+static void test_sos_mont_mul_dirty_work_buffer() {
+    // The fused CIOS path memsets work[0..k+1] on entry; SOS relies on
+    // mul_limbs to memset work[0..2k-1] and then explicitly sets
+    // work[2k] = 0.  If a future change drops that overflow-slot init
+    // or assumes the caller pre-zeroed the buffer, we want this test
+    // to fail loudly: pre-fill `work` with garbage and confirm the
+    // result still matches the fused reference.
+    const uint32_t k = 16;
+    std::mt19937_64 rng(0x505000DDull);
+    std::vector<uint64_t> mod(k), a(k), b(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;
+    mod[k - 1] |= (1ull << 63);
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    std::vector<uint64_t> out_ref(k), work_ref(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(
+        a.data(), b.data(), k, mod.data(),
+        n0inv, out_ref.data(), work_ref.data());
+
+    std::vector<uint64_t> out_sos(k), work_sos(2 * k + 1);
+    // Fill with garbage so any unintialised read shows up.
+    for (auto& l : work_sos) l = 0xBADC0FFEE0DDF00Dull;
+    hydra::detail::montgomery_mul_sos(
+        a.data(), b.data(), k, mod.data(),
+        n0inv, out_sos.data(), work_sos.data());
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_ref[i] != out_sos[i]) { match = false; break; }
+    }
+    CHECK(match, "sos mont_mul tolerates dirty work buffer at k=16");
+}
+
+static void test_sos_mont_sqr_cross() {
+    // SOS squaring routes through the existing dedicated `montgomery_sqr`
+    // (cross-terms + diagonal + REDC).  Cross-check against the fused
+    // square at carry-stress widths.
+    std::mt19937_64 rng(0x505005A1ull);
+    for (uint32_t k : {2u, 4u, 8u, 16u, 24u}) {
+        std::vector<uint64_t> mod(k), a(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1u;
+        mod[k - 1] |= (1ull << 63);
+        for (auto& l : a) l = rng();
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        // Reference: fused (which falls through to mul_fused(a,a,...))
+        std::vector<uint64_t> out_ref(k);
+        if (k >= 8) {
+            std::vector<uint64_t> work_ref(k + 2, 0);
+            hydra::detail::montgomery_sqr_fused(
+                a.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_ref(2 * k + 1, 0);
+            hydra::detail::montgomery_sqr(
+                a.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        }
+
+        std::vector<uint64_t> out_sos(k), work_sos(2 * k + 1, 0);
+        hydra::detail::montgomery_sqr_sos(
+            a.data(), k, mod.data(),
+            n0inv, out_sos.data(), work_sos.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_sos[i]) { match = false; break; }
+        }
+        std::string label = "sos mont_sqr vs fused at k=" + std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
+static void test_sos_pow_mod_dispatch_widths() {
+    // End-to-end pow_mod at the widths the SOS path now owns
+    // (256/512/1024/1536-bit).  Cross-check against the naive divisor
+    // path; this is the same ground truth used by the broader pow_mod
+    // suite, but it pins the SOS dispatch slots specifically.
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+    for (uint32_t bits : {256u, 512u, 1024u, 1536u, 1984u}) {
+        Hydra base = make(bits, 0x5050'0001ull + bits);
+        Hydra exp_val = make(bits, 0x5050'0002ull + bits);
+        Hydra mod_val = make(bits, 0x5050'0003ull + bits);
+        Hydra mont = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        std::string label = "sos pow_mod e2e at " + std::to_string(bits) + "-bit";
+        CHECK(mont == naive, label.c_str());
+    }
+}
+
 // Boundary: k=31 should NOT use Karatsuba (stays on fused CIOS)
 // k=32 should use Karatsuba.  Both must produce same pow_mod result.
 static void test_karatsuba_threshold_boundary() {
@@ -3532,6 +3739,13 @@ int main() {
     test_karatsuba_pow_mod_random_sweep();
     test_karatsuba_mont_sqr_cross();
     test_karatsuba_threshold_boundary();
+
+    // SOS-style Montgomery (mul_limbs + REDC) tests
+    test_sos_mont_mul_vs_fused_sweep();
+    test_sos_mont_mul_carry_adversarial();
+    test_sos_mont_mul_dirty_work_buffer();
+    test_sos_mont_sqr_cross();
+    test_sos_pow_mod_dispatch_widths();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

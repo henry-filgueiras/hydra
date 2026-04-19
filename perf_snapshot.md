@@ -2,9 +2,13 @@
 
 Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
-> Current state after the **scratch-workspace** (pow_mod allocator removal)
-> and **dual-row schoolbook leaf kernel** sprints.  See `DIRECTORS_NOTES.md`
-> for hypothesis / design / rationale history.
+> Current state after the **scratch-workspace** (pow_mod allocator removal),
+> **dual-row schoolbook leaf kernel**, and **SOS Montgomery null-result**
+> sprints.  No `pow_mod` numbers moved in the SOS sprint; the SOS primitives
+> ship as callable alternates in `detail::` but the default dispatch still
+> uses fused CIOS for k=8..31 because the SOS structure costs more
+> end-to-end than fused CIOS in that range.  See `DIRECTORS_NOTES.md` for
+> hypothesis / design / rationale history.
 
 ---
 
@@ -72,12 +76,17 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
-### Hot-path hotspots after the last two sprints
+### Hot-path hotspots after the last three sprints
 
-1. **CIOS Montgomery row loop** — now the dominant cost at 1024-bit
-   (k=16), where Karatsuba doesn't engage.  Row-reduce is serial by
-   construction; restructuring to SOS + `mac_row_2` is the next
-   concrete target.
+1. **CIOS Montgomery row loop** — still the dominant cost at 1024-bit
+   (k=16), where Karatsuba doesn't engage.  The SOS sprint
+   (2026-04-18) confirmed that restructuring the multiply phase to
+   reuse `mac_row_2` does *not* help — fused CIOS is structurally
+   tighter at k=8..31 (smaller working set, single accumulator stays
+   in L1).  Remaining options are inline asm on the row loop or a
+   dual-row CIOS variant that keeps the fused accumulator.  See the
+   "Dragon — SOS Montgomery (Null Result)" entry in
+   `DIRECTORS_NOTES.md`.
 2. **Schoolbook leaf at k=16** — the dual-row kernel at n=16 shows
    only a −3 % delta vs. the old scalar (whereas k=32 / k=64 are −40 %).
    Compiler auto-vectorization of the baseline narrows the gap.

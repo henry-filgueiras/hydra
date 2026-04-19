@@ -1788,6 +1788,100 @@ inline void montgomery_sqr(
     montgomery_redc(work, k, mod, n0inv, out);
 }
 
+// ─── SOS-style Montgomery multiply (mul_limbs + REDC) ────────
+//
+// Separated Operand Scanning: compute the full 2k-limb product
+// T = a*b first, then run word-by-word Montgomery reduction.
+//
+// The product phase delegates to `mul_limbs`, which already routes
+// through the dual-row `mac_row_2` kernel (two independent mul/umulh
+// chains per inner MAC).  The fused CIOS path can't reuse that
+// kernel because its outer-row structure interleaves a single mul
+// row with a single reduce row — there is no second a-row to pair
+// with.  SOS sidesteps the constraint entirely by separating the
+// two phases.
+//
+// **Status: callable alternate, NOT on the default dispatch path.**
+// The 2026-04-18 SOS sprint built this primitive expecting the
+// dual-row win to translate end-to-end at k=8..24 (the widths
+// where fused CIOS owns dispatch).  It did not — under realistic
+// pow_mod call cadence the SOS structure costs more than fused
+// CIOS by 5–35 % at every k in that range, even with the dual-row
+// kernel removed entirely (a hand-coded single-row SOS variant
+// loses by even more).  The mac_row_2 win (~3 % at k=16) is real
+// but smaller than the structural cost of materialising a 2k-limb
+// intermediate.  See "Dragon — SOS Montgomery (Null Result)" in
+// DIRECTORS_NOTES.md for the full attribution and the rotating-
+// operand probe that surfaces the regression.
+//
+// We keep the primitive in-tree because (a) it's correct and
+// well-tested, (b) it gives any future "dual-row CIOS" attempt a
+// reference to compare against, and (c) it is occasionally useful
+// for the very top of the non-Karatsuba band (k=29..31) where it
+// is roughly a wash with fused CIOS.
+//
+// Trade-offs vs fused CIOS:
+//   + Product phase exploits mac_row_2 (the original motivation)
+//   + No per-row "T >>= 64" memmove (CIOS shifts k+1 limbs × k rows)
+//   - Larger work buffer: 2k+1 vs k+2 limbs (loses cache locality
+//     under realistic pow_mod operand-rotation cadence)
+//   - Two separate O(k²) passes vs one fused pass (same MAC count;
+//     the MACs are just laid out differently)
+//
+// Trade-offs vs Karatsuba+REDC:
+//   + No padding-to-power-of-2 waste (works for any k)
+//   + No allocator/Karatsuba scratch overhead
+//   - O(k²) product vs Karatsuba's O(k^1.585) at large k
+//
+// out[]  must have at least k limbs.
+// work[] must have at least 2k+1 limbs.
+//
+inline void montgomery_mul_sos(
+    const uint64_t* a, const uint64_t* b,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    // Step 1: full schoolbook product T = a·b → work[0..2k-1].
+    // mul_limbs zeroes the output range and routes through mac_row_2
+    // for k ≥ 2 (dual-row inner kernel).  At k=1 it falls through to
+    // a single-row tail, which is identical to the open-coded path
+    // the previous backend used.
+    (void)mul_limbs(a, k, b, k, work);
+
+    // Step 2: word-by-word Montgomery reduction.  REDC needs the
+    // overflow slot at work[2k] to be writable; mul_limbs only
+    // touched [0..2k-1] (and any zeros it left there), so initialise
+    // the slot here.
+    work[2 * k] = 0;
+    montgomery_redc(work, k, mod, n0inv, out);
+}
+
+// SOS-style Montgomery squaring.
+//
+// `montgomery_sqr` is already SOS-shaped: it builds the full 2k-limb
+// square in `work` (cross-terms doubled + diagonal terms) and then
+// runs the same `montgomery_redc`.  No structural change is needed
+// to expose it to the dual-row kernel — and crucially, replacing its
+// cross-term loop with `mul_limbs(a, a, ...)` would *lose* the
+// halving from the cross-term symmetry trick (~k(k-1)/2 vs k² MACs).
+//
+// We keep this thin alias so the dispatch in `pow_mod_montgomery`
+// reads symmetrically (`mul_sos` / `sqr_sos`) and so future SOS
+// squaring variants have an obvious slot to land in.
+inline void montgomery_sqr_sos(
+    const uint64_t* a,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    montgomery_sqr(a, k, mod, n0inv, out, work);
+}
+
 // ─── Karatsuba-backed Montgomery multiply (separate product + REDC) ───
 //
 // For large k (≥ KARATSUBA_THRESHOLD_LIMBS), the O(k²) schoolbook product
@@ -3499,9 +3593,19 @@ struct EGCDResult {
     // total cost in the fused path (both multiply-accumulate and reduce
     // are O(k²) per row × k rows).
     //
-    // The threshold is benchmark-derived.  Set to 0 (disabled) initially;
-    // the benchmark pass below will measure the actual crossover and
-    // update this constant.
+    // SOS (`montgomery_mul_sos`) is a fourth backend — `mul_limbs +
+    // REDC` — kept callable from `detail` but NOT used here.  It was
+    // built for the 1024-bit-class (k=8..24) gap where neither fused
+    // nor Karatsuba was a clear winner, on the hypothesis that exposing
+    // the dual-row `mac_row_2` kernel to the multiply phase would help.
+    // End-to-end pow_mod measurement showed the opposite: at k=8..24
+    // the structural cost of materialising the full 2k-limb product
+    // and then reading it back for REDC dominated the dual-row win
+    // (which itself is only ~3% at k=16 per the prior sprint's data).
+    // The null result is documented in DIRECTORS_NOTES.md; the SOS
+    // primitives stay in-tree so future experiments (e.g. dual-row
+    // CIOS, mixing SOS at the very top of the non-Karatsuba band) can
+    // build on it without rederiving correctness.
     constexpr uint32_t MAX_K = 64;
     constexpr uint32_t FUSED_THRESHOLD = 8;  // k >= 8 → use fused CIOS
     // Next power of 2 >= MAX_K for Karatsuba padding
