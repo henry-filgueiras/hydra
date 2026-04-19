@@ -303,11 +303,42 @@ inline uint64_t mac_row_1(
 //
 // Returns nothing — the pair's final carries are folded into
 // out[nb] (c0) and out[nb+1] (c1) inside this function.
+#if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
+// Out-of-line aarch64 dual-chain MAC kernel — see `hydra_mac_aarch64.S`.
+// Same contract as `mac_row_2` below (same pre/postconditions, same
+// carry-propagation behaviour).  Linked in only when HYDRA_AARCH64_ASM
+// is defined at build time.
+//
+// ⚠ OFF by default.  The 2026-04-18 asm sprint showed the kernel
+// beats the C++ fallback by ~7 % in isolated microbench at nb=16
+// but *regresses* `mul_karatsuba` by ~7-8 % and is neutral-to-mild-
+// negative on end-to-end pow_mod at 2048/4096-bit.  The asm body
+// wins the inner-loop race and loses the call-overhead race; once
+// the compiler can no longer inline mac_row_2 into the caller the
+// small per-MAC win is cancelled by argument marshalling and the
+// lost scheduling slack around the call site.  The kernel is
+// retained as a correctness-tested A/B target so the next attempt
+// (full-schoolbook asm, asm REDC, etc.) has something to beat.
+// See DIRECTORS_NOTES.md (2026-04-18 aarch64 asm null result).
+extern "C" void hydra_mac_row_2_aarch64(
+    uint64_t a0, uint64_t a1,
+    const uint64_t* b, uint32_t nb,
+    uint64_t* out) noexcept;
+#endif
+
 inline void mac_row_2(
     uint64_t        a0, uint64_t a1,
     const uint64_t* b, uint32_t nb,
     uint64_t*       out) noexcept
 {
+#if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
+    // Asm path: register-resident sliding window + explicit adcs
+    // carry chains.  See the extern declaration above for the
+    // null-result context — this branch is off by default and only
+    // built when the build system deliberately opts in.
+    hydra_mac_row_2_aarch64(a0, a1, b, nb, out);
+    return;
+#endif
     uint64_t c0 = 0, c1 = 0;
 
 #if HYDRA_HAS_NEON

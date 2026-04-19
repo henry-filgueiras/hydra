@@ -3528,6 +3528,86 @@ static void test_sos_pow_mod_dispatch_widths() {
 // 2026-04-18 threshold cleanup (FUSED_THRESHOLD: 8 → 1).  These k values
 // used to dispatch through the separate schoolbook+REDC path; cross-check
 // against the naive divisor path to pin the new dispatch slots.
+// When the aarch64 asm mac_row_2 kernel is compiled in (opt-in; see
+// CMakeLists HYDRA_AARCH64_ASM), pin it against the scalar fallback
+// at every nb the schoolbook and Karatsuba paths actually call with.
+// This catches regressions in the asm path even though dispatch
+// defaults to the C++ fallback.
+#if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
+extern "C" void hydra_mac_row_2_aarch64(
+    uint64_t a0, uint64_t a1,
+    const uint64_t* b, uint32_t nb,
+    uint64_t* out) noexcept;
+
+// Scalar reference — a byte-for-byte copy of the C++ fallback body
+// from mac_row_2, intentionally NOT routing through the dispatch so
+// we compare asm vs scalar directly.
+static void mac_row_2_scalar_reference(
+    uint64_t a0, uint64_t a1,
+    const uint64_t* b, uint32_t nb, uint64_t* out) noexcept
+{
+    uint64_t c0 = 0, c1 = 0;
+    for (uint32_t j = 0; j < nb; ++j) {
+        const uint64_t bj = b[j];
+        unsigned __int128 t0 =
+            static_cast<unsigned __int128>(a0) * bj + out[j]     + c0;
+        unsigned __int128 t1 =
+            static_cast<unsigned __int128>(a1) * bj + out[j + 1] + c1;
+        out[j]     = static_cast<uint64_t>(t0);
+        c0         = static_cast<uint64_t>(t0 >> 64);
+        out[j + 1] = static_cast<uint64_t>(t1);
+        c1         = static_cast<uint64_t>(t1 >> 64);
+    }
+    unsigned __int128 t = static_cast<unsigned __int128>(out[nb]) + c0;
+    out[nb]     = static_cast<uint64_t>(t);
+    uint64_t ch = static_cast<uint64_t>(t >> 64);
+    t           = static_cast<unsigned __int128>(out[nb + 1]) + c1 + ch;
+    out[nb + 1] = static_cast<uint64_t>(t);
+    ch          = static_cast<uint64_t>(t >> 64);
+    for (uint32_t k = nb + 2; ch; ++k) {
+        uint64_t s = out[k] + ch;
+        ch = (s < out[k]) ? 1u : 0u;
+        out[k] = s;
+    }
+}
+
+static void test_aarch64_mac_row_2_matches_scalar() {
+    std::mt19937_64 rng(0xAA'CC'64ull);
+    // Sweep nb across every shape that mul_limbs / mul_karatsuba
+    // actually invokes, plus adversarial all-ones for carry stress.
+    for (uint32_t nb : {1u, 2u, 3u, 4u, 8u, 12u, 15u, 16u, 17u, 24u, 31u, 32u}) {
+        // Random operands
+        {
+            uint64_t a0 = rng(), a1 = rng();
+            std::vector<uint64_t> b(nb), out_a(nb + 4, 0), out_b(nb + 4, 0);
+            for (auto& l : b) l = rng();
+            for (uint32_t i = 0; i < nb + 4; ++i) {
+                out_a[i] = out_b[i] = rng();
+            }
+            mac_row_2_scalar_reference(a0, a1, b.data(), nb, out_a.data());
+            hydra_mac_row_2_aarch64(a0, a1, b.data(), nb, out_b.data());
+            bool match = (out_a == out_b);
+            std::string label = "aarch64 mac_row_2 vs scalar at nb=" +
+                                std::to_string(nb);
+            CHECK(match, label.c_str());
+        }
+        // Carry-adversarial: all-ones operands (max carry pressure)
+        {
+            uint64_t a0 = ~uint64_t{0}, a1 = ~uint64_t{0};
+            std::vector<uint64_t> b(nb, ~uint64_t{0});
+            std::vector<uint64_t> out_a(nb + 4, ~uint64_t{0});
+            std::vector<uint64_t> out_b = out_a;
+            mac_row_2_scalar_reference(a0, a1, b.data(), nb, out_a.data());
+            hydra_mac_row_2_aarch64(a0, a1, b.data(), nb, out_b.data());
+            bool match = (out_a == out_b);
+            std::string label = "aarch64 mac_row_2 adversarial at nb=" +
+                                std::to_string(nb);
+            CHECK(match, label.c_str());
+        }
+    }
+}
+#endif  // HYDRA_AARCH64_ASM
+
 static void test_fios_small_k_pow_mod_dispatch_widths() {
     auto make = [](uint32_t bits, uint64_t seed) {
         uint32_t n_limbs = (bits + 63) / 64;
@@ -3941,6 +4021,10 @@ int main() {
     test_fios_mont_mul_dirty_work_buffer();
     test_fios_mont_sqr_cross();
     test_fios_small_k_pow_mod_dispatch_widths();
+
+#if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
+    test_aarch64_mac_row_2_matches_scalar();
+#endif
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -3399,4 +3399,258 @@ Ranked by confidence-of-win, **after** the threshold cleanup:
 
 ---
 
+### Dragon — aarch64 asm for `mac_row_2` (Null Result)
+
+_Implemented 2026-04-18 — Claude Opus 4.7_
+_Status: **NULL RESULT** — the asm kernel is correct and ~7 % faster
+than the C++ fallback in isolated microbench, but *regresses*
+`mul_karatsuba` by ~7-8 % and leaves end-to-end pow_mod unchanged
+(or marginally worse at 2048/4096-bit).  Default dispatch stays on
+the portable C++ path.  `HYDRA_AARCH64_ASM=OFF` by default._
+
+#### Why asm was attempted now (and not earlier)
+
+After the threshold cleanup, every obvious portable Montgomery
+lever was exhausted: FIOS owned the k=1..31 band, Karatsuba owned
+k≥32, and the remaining gap vs GMP/OpenSSL at 2048/4096-bit was
+concentrated in the schoolbook leaves and REDC.  The hypothesis
+for this sprint: the compiler's code generation for `mac_row_2`
+— the inner dual-chain MAC kernel that every Karatsuba leaf
+bottoms out into — was leaving machine-level throughput on the
+table, and hand-tuned aarch64 could close ~5-10 % of the 2048/4096
+gap.
+
+The microbench baseline supported that hypothesis:
+
+```
+mac_row_2 nb=16   →  12.71 ns  (32 MACs ⇒ 2.52 MAC/ns)
+M5 Pro ceiling    →  ~4.0 MAC/ns for two independent chains
+```
+
+So the kernel ran at ~63 % of the theoretical dual-chain ceiling.
+The remaining 37 % *looked* like compiler slack.
+
+#### Why a .S helper was preferred over inline asm
+
+1. **Readability.**  Hand-written carry choreography, load/store
+   scheduling, and register allocation are easier to reason about
+   when separated from the C++ type system.  Inline asm would
+   require packaging all of those decisions into Clang constraint
+   strings and giving the register allocator a say in the result.
+2. **Isolation.**  `hydra_mac_aarch64.S` is a single file with a
+   single function and no dependencies on `hydra.hpp`'s type
+   layout.  It can be compiled, disassembled, and A/B-tested
+   independently of the rest of the library.
+3. **Fallback.**  The `HYDRA_AARCH64_ASM` macro gate keeps the C++
+   path byte-for-byte identical and compiled on every target.
+   Any compiler/assembler disagreement is caught immediately by
+   `test_aarch64_mac_row_2_matches_scalar` (which pins the asm
+   kernel against a local copy of the scalar body at 12 widths ×
+   2 operand patterns — 24 cross-checks total).
+
+Inline asm would have bought ~0.5 ns of call-overhead elimination
+per invocation but at a real readability cost; the preference held
+up even after the null result (see below) because keeping a clean
+A/B baseline was the whole point.
+
+#### What the asm kernel exploited
+
+The hand-written kernel used three machine-level levers the C++
+compiler was not reliably producing:
+
+1. **Explicit `adcs` carry chains.**  The inner loop's six 64-bit
+   additions per chain (old + carry, then + lo, with high-half
+   carry propagation) are encoded as a tight `adds` / `adcs` /
+   `adds` / `adc` sequence per chain — six instructions total.
+   Clang's output for the `unsigned __int128` lowering occasionally
+   broke that chain with intermediate `mov`s or extra `adds` for
+   algebraic rearrangements that added a cycle per step.
+
+2. **Register-resident sliding window.**  C++ cannot prove that
+   `b[]` and `out[]` don't alias, so it round-trips chain B's
+   `out[j+1]` write through memory between iterations even though
+   chain A's next read will consume it.  The asm kernel forwards
+   that value directly in `x9` (one `mov`) and suppresses the
+   interior store; only the *last* chain-B value is written, as
+   part of the end-of-loop fold.  At nb=16 that eliminates ~15
+   stores per call.
+
+3. **Fewer total instructions per inner j.**  The isolated loop
+   body is 18 aarch64 instructions (2 loads, 4 mul/umulh, 10 adds/
+   adcs, 1 mov, 1 store, branch).  The compiler-generated C++
+   version issues ~24 instructions for the equivalent j-pair (per
+   objdump of the `mac_row_2` inline), so per-j the asm is ~15 %
+   lighter.  Matching the M-series' observed ~4 mul/umulh/cycle
+   upper bound.
+
+Isolated benchmark confirms the body win:
+
+```
+mac_row_2 nb=16   scalar:  12.26 ns
+mac_row_2 nb=16   asm:     11.33 ns      −7.6 %
+mac_row_2 nb=24   scalar:  18.65 ns
+mac_row_2 nb=24   asm:     17.43 ns      −6.5 %
+mac_row_2 nb=32   scalar:  25.74 ns
+mac_row_2 nb=32   asm:     23.83 ns      −7.4 %
+```
+
+#### Why the win did not translate up the stack
+
+The body-level gain is real, but gets cancelled at two structural
+boundaries:
+
+1. **Out-of-line call overhead.**  `bl` + `ret` + argument marshal
+   costs ~1-2 ns per call on M5 Pro.  At nb=16 that's ~10 % of the
+   12 ns body time.  Across mul_limbs (8 calls per 16×16 leaf) it
+   halves to ~3 % net win.  Across Karatsuba (9 leaves at n=64 =
+   72 calls) the overhead compounds and the kernel-level win flips
+   sign entirely.
+
+2. **Loss of inlining.**  The C++ `mac_row_2` is small and gets
+   inlined into `mul_limbs` at -O3.  The compiler then interleaves
+   the inlined body with surrounding loop bookkeeping (the outer
+   `for (i += 2)` counter, the `out + i` pointer, etc.).  Once
+   the asm path is the callee, that interleaving is gone — the
+   compiler cannot see into the body and must flush live state
+   around the call.  The asm body runs the same 18 instructions
+   but the *caller* loses the scheduling slack it had when the
+   body was inlined.
+
+Both effects are invisible at the kernel-isolated microbench level
+(where the caller is a trivial harness loop) and become dominant
+at the mul_karatsuba and pow_mod levels.
+
+#### Measured benefit — direct A/B
+
+Kernel-level (isolated):
+
+|  nb  | C++ fallback  |  asm kernel  |    Δ    |
+|:----:|:-------------:|:------------:|:-------:|
+|   4  |   3.18 ns     |    3.30 ns   |  +3.8 % |
+|   8  |   5.31 ns     |    5.71 ns   |  +7.5 % |
+|  12  |   9.25 ns     |    8.72 ns   |  −5.7 % |
+|  16  |  12.26 ns     |   11.33 ns   |  −7.6 % |
+|  24  |  18.65 ns     |   17.43 ns   |  −6.5 % |
+|  32  |  25.74 ns     |   23.83 ns   |  −7.4 % |
+
+`mul_limbs` (schoolbook, full n×n):
+
+|  n   | C++ fallback  |  asm kernel  |    Δ    |
+|:----:|:-------------:|:------------:|:-------:|
+|   4  |   6.66 ns     |    7.66 ns   | +15.0 % |
+|   8  |  23.84 ns     |   23.29 ns   |  −2.3 % |
+|  12  |  51.12 ns     |   50.31 ns   |  −1.6 % |
+|  16  |  90.03 ns     |   89.25 ns   |  −0.9 % |
+|  24  | 211.26 ns     |  207.32 ns   |  −1.9 % |
+|  32  | 376.90 ns     |  371.59 ns   |  −1.4 % |
+
+`mul_karatsuba`:
+
+|  n   | C++ fallback  |  asm kernel  |    Δ    |
+|:----:|:-------------:|:------------:|:-------:|
+|  16  |  81.72 ns     |   89.52 ns   |  +9.5 % |
+|  32  | 311.42 ns     |  338.18 ns   |  +8.6 % |
+|  64  | 1139.58 ns    | 1218.96 ns   |  +7.0 % |
+
+End-to-end `pow_mod` (min-of-6 median):
+
+| Width | C++ fallback  |  asm kernel  |    Δ    |
+|------:|:-------------:|:------------:|:-------:|
+|  256  |    7.38 µs    |    7.29 µs   |  −1.2 % |
+|  512  |   36.62 µs    |   36.35 µs   |  −0.7 % |
+| 1024  |  233.50 µs    |  234.46 µs   |  +0.4 % |
+| 1536  |  779.96 µs    |  777.83 µs   |  −0.3 % |
+| 1984  | 1774.54 µs    | 1762.35 µs   |  −0.7 % |
+| 2048  | 2606.60 µs    | 2663.27 µs   |  +2.2 % |
+| 4096  |  20.25 ms     |   20.67 ms   |  +2.1 % |
+
+The 2048/4096 +2 % is plausibly within run-to-run noise (the
+`pow_mod` bench's CV at those widths is ~1-2 %), but the direction
+is the wrong one and consistent with the mul_karatsuba +7 %
+regression — the small kernel win is being eaten by call overhead
+before it reaches the benchmark's critical path.
+
+#### Did this path earn its keep?
+
+**No.**  The hypothesis ("C++ leaves machine-level throughput on
+the table") was correct for the *isolated kernel body*, but the
+structural cost of routing through an out-of-line call at every
+MAC row cancelled the win by the time it reached `mul_karatsuba`,
+and 2048/4096-bit pow_mod saw no improvement (and a small
+regression in the opposite direction).
+
+#### What changed in-tree
+
+1. `hydra_mac_aarch64.S` — hand-written kernel, tested against
+   the scalar reference at 12 widths × 2 operand patterns.
+2. `hydra.hpp` — `extern "C"` declaration and dispatch guard
+   under `#if defined(HYDRA_AARCH64_ASM)`.  Dispatch and fallback
+   are both compiled; only one is active per build.
+3. `CMakeLists.txt` — `HYDRA_AARCH64_ASM` option, **default OFF**.
+   Enables a separate `hydra_asm` static library that is linked
+   into `hydra_core` as an interface dep when opted in.
+4. `hydra_test.cpp` — `test_aarch64_mac_row_2_matches_scalar`,
+   compiled only when the flag is on.
+
+The kernel stays in tree as a **callable correctness-tested A/B
+target** rather than being removed, so the next asm experiment
+(e.g. full-schoolbook asm, asm REDC) has a validated baseline to
+start from.  This matches the project pattern of keeping null-
+result paths as in-tree references (SOS, canonical fused CIOS,
+separate mul+REDC).
+
+#### What this rules in / out
+
+- **Rules out** per-row asm at the mac_row_2 granularity.  The
+  call-overhead ceiling is ~−1 % end-to-end on pow_mod at 2048+,
+  and the 2048/4096 measurement showed +2 %.  No tuning of the
+  inner body (`adcs` sequencing, load scheduling, register choice)
+  is going to overcome that — the problem is the seam, not the
+  body.
+- **Does not rule out** coarser-grained asm.  A hand-written
+  schoolbook `mul_limbs_16x16` or `mul_limbs_16x16_asm` would
+  face exactly one call per Karatsuba leaf (9 calls for a 4096-bit
+  Montgomery multiply, vs 72 for the current per-row asm).  That
+  moves the overhead from "dominant" to "negligible".  Ceiling
+  estimate ~3-5 % end-to-end — still small, but plausibly above
+  noise.  Out of scope for this sprint.
+- **Does not rule out** asm REDC.  REDC is the larger Karatsuba-
+  width cost (O(k²), k=64 at 4096-bit).  An asm REDC with dual
+  chains is a structurally different experiment from this one and
+  would pass through `montgomery_redc`, not `mul_limbs`.
+
+#### Updated recommendation for next sprint
+
+Ranked by confidence-of-win after the asm null result:
+
+1. **PGO side quest** — promoted from slot 2 to slot 1.  The
+   remaining 2048/4096 gap is compiler-scheduling-dominated (the
+   mac_row_2 body is at ~65 % of peak, the REDC loop is similarly
+   not near peak).  `-fprofile-generate` / `-fprofile-use` with
+   `bench_pow_mod` as the training workload may recover some of
+   that without needing asm.  Cheap to try, ~1-3 % expected
+   ceiling.  If PGO delivers, that's the whole remaining portable
+   lever done.
+2. **Dual-chain REDC for Karatsuba-backed Montgomery (k ≥ 32).**
+   Unchanged from prior — structurally the biggest remaining
+   cost at 2048/4096.  A `montgomery_redc` variant that runs two
+   m*mod[j] chains per inner step, analogous to FIOS's dual-row
+   structure, is a bigger change but targets the cost center
+   this sprint's asm failed to reach.  Medium-high confidence.
+3. **Full-schoolbook asm (`mul_limbs_16x16_asm`)** — new slot,
+   replaces the per-row asm that just failed.  One call per
+   Karatsuba leaf, not per row.  Low-medium confidence; bounded
+   scope; builds on this sprint's correctness scaffolding.
+4. **Toom-Cook 3-way above k=64** — unchanged, only helps 4096+.
+5. **FIOS squaring with cross-term halving** — unchanged,
+   non-trivial correctness story.
+
+The 2026-04-18 arc (FIOS sprint + threshold cleanup + asm null
+result) probably **exhausts the portable leaf-kernel lever
+entirely.**  Everything remaining either targets REDC (slot 2),
+widens the asm seam past the call-overhead threshold (slot 3),
+or leaves the O(k²) regime for O(k^1.46) Toom (slot 4).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

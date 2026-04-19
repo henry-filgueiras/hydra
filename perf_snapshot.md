@@ -4,7 +4,14 @@ Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
 > Current state after the **scratch-workspace** (pow_mod allocator removal),
 > **dual-row schoolbook leaf kernel**, **SOS Montgomery null-result**,
-> **dual-row CIOS / FIOS**, and **FUSED_THRESHOLD cleanup** sprints.
+> **dual-row CIOS / FIOS**, **FUSED_THRESHOLD cleanup**, and
+> **aarch64 asm null-result** sprints.  The asm experiment probed
+> whether hand-written `mac_row_2` could close part of the 2048/4096
+> gap vs GMP/OpenSSL; it beats the C++ fallback by ~7 % in isolated
+> microbench but *regresses* `mul_karatsuba` by ~7-8 % due to
+> out-of-line call overhead, leaving pow_mod unchanged end-to-end.
+> The kernel stays in tree behind `HYDRA_AARCH64_ASM` (default OFF)
+> as a correctness-tested A/B target for future asm experiments.
 > FIOS now owns the entire non-Karatsuba band (k=1..31) after the
 > threshold sweep lowered `FUSED_THRESHOLD` from 8 to 1.  The canonical
 > fused CIOS (`montgomery_mul_fused`) and the separate schoolbook path

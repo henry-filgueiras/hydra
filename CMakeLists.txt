@@ -53,6 +53,40 @@ target_include_directories(hydra_core INTERFACE
 )
 
 # ─────────────────────────────────────────────────────────
+# Optional aarch64 assembly kernels — OFF by default
+#
+# HYDRA_AARCH64_ASM replaces the dual-row schoolbook leaf MAC
+# (`hydra::detail::mac_row_2`) with a hand-written aarch64 kernel
+# (`hydra_mac_aarch64.S`).  The kernel is ~7 % faster than the
+# C++ fallback in isolated microbench at nb=12..32, but its
+# out-of-line call overhead and loss of cross-call inlining
+# *regress* `mul_karatsuba` by ~7-8 % and leave end-to-end pow_mod
+# unchanged (or marginally worse at 2048/4096-bit).  The
+# 2026-04-18 asm sprint captured this null result; the kernel
+# stays in-tree as a correctness-tested A/B target for future
+# experiments (full-schoolbook asm, REDC asm, etc.) but is
+# OFF by default so the portable path is always what ships.
+#
+# To enable:  cmake -B build-rel -DHYDRA_AARCH64_ASM=ON
+# ─────────────────────────────────────────────────────────
+option(HYDRA_AARCH64_ASM "Enable aarch64 asm kernels (null-result A/B target — OFF by default)" OFF)
+
+if(HYDRA_AARCH64_ASM)
+    if(NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AArch64"))
+        message(FATAL_ERROR "HYDRA_AARCH64_ASM=ON but target is not aarch64.")
+    endif()
+    enable_language(ASM)
+    add_library(hydra_asm STATIC hydra_mac_aarch64.S)
+    set_target_properties(hydra_asm PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(hydra_core INTERFACE HYDRA_AARCH64_ASM)
+    target_link_libraries(hydra_core INTERFACE hydra_asm)
+    message(STATUS "  HYDRA_AARCH64_ASM : ON (mac_row_2 → hand-written aarch64 kernel)")
+else()
+    message(STATUS "  HYDRA_AARCH64_ASM : OFF (default — mac_row_2 on portable C++ fallback)")
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Tests
 # ─────────────────────────────────────────────────────────
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hydra_test.cpp")
