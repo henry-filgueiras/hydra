@@ -3201,4 +3201,202 @@ leaves portable-C++ territory (slot 2: inline asm).
 
 ---
 
+### FUSED_THRESHOLD Cleanup — FIOS Owns the Small-k Band
+
+_Implemented 2026-04-18 — Claude Opus 4.7_
+_Status: **shipped** — `FUSED_THRESHOLD` lowered from 8 to 1; FIOS now
+owns the entire non-Karatsuba band (k=1..31)._
+
+#### Why this sprint existed
+
+The FIOS landing (earlier the same day) set `FUSED_THRESHOLD = 8` —
+the holdover value from the pre-FIOS fused-CIOS sprint — without
+re-measuring the small-k band.  The fused-CIOS probe had already
+shown FIOS beating fused CIOS by −52 % at k=4 and −41 % at k=6;
+but dispatch at those widths still routed through
+`montgomery_mul` (separate schoolbook + REDC) + `montgomery_sqr`
+(cross-term-symmetry squaring), which FIOS had *not* been compared
+against.  The "Updated recommendation" at the bottom of the FIOS
+dragon explicitly named this as slot 1: verify FIOS also beats the
+separate path, and lower the threshold if it does.
+
+The asymmetry that made this non-obvious: at small k, separate uses
+`montgomery_sqr` with the cross-term halving trick (~k(k−1)/2 + k
+MACs vs k² for full mul), while FIOS squaring forwards to
+`montgomery_mul_fios(a, a, …)` — no cross-term halving.  So the
+question was whether FIOS's dual-chain throughput could still win
+against a squaring kernel with ~2× fewer MACs.
+
+#### What was measured
+
+`bench/probe_fios_small_k.cpp` (added this sprint) runs three layers
+for k = 1..7:
+
+1. **Kernel-level**, isolated — FIOS mul vs `montgomery_mul`; FIOS
+   sqr vs `montgomery_sqr`.
+2. **"pow_mod cadence"** — 5 sqr + 1 mul per iteration, rotating the
+   accumulator, to approximate sliding-window pow_mod's hot loop.
+3. **End-to-end `pow_mod`** at 64/128/192/256/320/384/448-bit with
+   both backends force-selected via a bespoke `pow_mod_with_backend`
+   (same sliding-window scaffolding as `pow_mod_montgomery`).
+
+Layer 3 is the deciding measurement — it includes the
+MontgomeryContext build, `r_sq`, base-in/out, sliding-window table
+setup, and the rotating-operand cadence that broke SOS under
+realistic load.
+
+#### Results (median of 5 runs per cell, M5 Pro, -O3 -march=native)
+
+**Kernel-level (ns/op):**
+
+|  k  | sep mul | fios mul | Δ mul  | sep sqr | fios sqr | Δ sqr  |
+|:---:|--------:|---------:|-------:|--------:|---------:|-------:|
+|  1  |  4.7    |    4.6   |  −1.6% |   6.6   |    4.6   | −31.0% |
+|  2  |  9.4    |    6.9   | −26.7% |  11.4   |    7.1   | −37.6% |
+|  3  | 14.1    |   10.1   | −28.5% |  15.8   |    9.9   | −37.6% |
+|  4  | 20.3    |   14.8   | −26.8% |  23.0   |   15.2   | −33.7% |
+|  5  | 32.3    |   22.2   | −31.3% |  33.4   |   23.1   | −30.8% |
+|  6  | 43.0    |   29.9   | −30.5% |  40.7   |   30.5   | −25.0% |
+|  7  | 53.7    |   37.7   | −29.8% |  54.8   |   40.6   | −25.9% |
+
+The mul column is a straight dual-chain win.  The sqr column is the
+key result: even without the cross-term halving trick, FIOS's
+dual-chain issue beats separate-with-halving at every k.  Why?  The
+halving saves ~half the MACs but still pays the full REDC pass
+(O(k²) MACs), and has to separately shift-and-fold the cross-term
+rows before adding diagonals — a lot of serial carry chains that
+FIOS's dual-chain issue dissolves.
+
+**pow_mod-cadence microbench (5 sqr + 1 mul per iter, rotating):**
+
+|  k  | sep ns/iter | fios ns/iter |    Δ   |
+|:---:|------------:|-------------:|-------:|
+|  1  |    50.1     |    43.9      | −12.4% |
+|  2  |   103.9     |    71.3      | −31.4% |
+|  3  |   163.2     |   105.0      | −35.6% |
+|  4  |   216.6     |   129.7      | −40.1% |
+|  5  |   302.0     |   163.7      | −45.8% |
+|  6  |   388.7     |   206.4      | −46.9% |
+|  7  |   491.6     |   277.6      | −43.5% |
+
+**End-to-end `pow_mod` (Layer 3, force-selected backend):**
+
+| bits | k  | sep µs | fios µs |    Δ   |
+|-----:|---:|-------:|--------:|-------:|
+|   64 |  1 |   0.77 |   0.62  | −19.5% |
+|  128 |  2 |   2.58 |   2.02  | −21.8% |
+|  192 |  3 |   5.68 |   4.33  | −23.8% |
+|  256 |  4 |   9.70 |   7.44  | −23.3% |
+|  320 |  5 |  16.49 |  11.72  | −29.0% |
+|  384 |  6 |  25.81 |  18.08  | −29.9% |
+|  448 |  7 |  41.95 |  26.94  | −32.3% |
+
+**Full `bench_pow_mod` before/after (min-of-6 median, all widths):**
+
+| Width | Pre-sprint (sep path, 256-bit) | Post-sprint (FIOS) |   Δ    |
+|------:|-------------------------------:|-------------------:|-------:|
+|  256  |              9.60 µs           |      7.29 µs       | −24.1% |
+|  512  |             35.35 µs           |     36.42 µs       |  +3%   |
+| 1024  |            232.33 µs           |    234.56 µs       |  +1%   |
+| 1536  |            775.35 µs           |    781.12 µs       |  +1%   |
+| 1984  |              1.78 ms           |      1.78 ms       |   0%   |
+| 2048  |              2.59 ms           |      2.59 ms       |   0%   |
+| 4096  |             20.08 ms           |     20.13 ms       |   0%   |
+
+The k=8..31 widths are untouched (FIOS was already the dispatch) —
+the tiny +1..+3% delta is run-to-run noise.  Karatsuba widths
+(2048, 4096) are unchanged by construction.  The headline result
+is **256-bit −24 %** end-to-end.
+
+#### Why the threshold went to 1 (not 4)
+
+The original scope was "lower the threshold for k=4..7", but the
+k=1..3 measurements showed the same qualitative result: FIOS wins
+at every k, at every layer, with no crossover where separate wins.
+At k=1, the mul column is a wash (−1.6 %) but sqr is −31.0 %, and
+pow_mod is ~5× sqr-dominated by bit — so the end-to-end win holds
+(−19.5 % at 64-bit).  Setting `FUSED_THRESHOLD = 1` rather than 4
+makes the dispatch a single two-way split (Karatsuba vs FIOS)
+instead of a three-way fork with a straddle band.  The code reads
+cleaner and there is no untested k that silently uses a different
+backend.
+
+`montgomery_mul` / `montgomery_sqr` (separate schoolbook + REDC,
+cross-term-symmetry sqr) remain in `detail::` as correctness
+references — they are still called by the FIOS unit tests at k < 8
+as the expected-value oracle.  They are no longer reachable via
+dispatch but removing them would be scope creep and would take
+away the reference that makes FIOS changes easy to validate.
+
+#### Implementation diff
+
+Three-line change in `hydra.hpp` (plus comment updates):
+
+- `FUSED_THRESHOLD = 8` → `FUSED_THRESHOLD = 1`.
+- Dispatch comment updated to describe the two-tier split.
+- Block comment on the separate/fused dispatch rewritten to
+  record the sweep outcome.
+
+#### Correctness
+
+924 tests pass (917 + 7 new), including ASan+UBSan at -O0.
+
+New coverage — `test_fios_small_k_pow_mod_dispatch_widths` in
+`hydra_test.cpp` runs `pow_mod` at 64/128/192/256/320/384/448-bit
+(k = 1..7) and cross-checks each against `pow_mod_naive`.  This
+pins the new dispatch slots against ground truth so any future
+FIOS-path change at small k is immediately caught.
+
+Existing tests that used `montgomery_mul` as the reference at k < 8
+still do (e.g. `test_fios_mont_mul_vs_fused_sweep`).  They call
+`detail::montgomery_mul` directly, independent of dispatch.
+
+#### Lessons / cross-cutting notes
+
+1. **Threshold constants carry forward silently.**  The FIOS sprint
+   preserved `FUSED_THRESHOLD = 8` because that was the existing
+   value and the sprint's goal was the kernel, not the dispatch.
+   A 15-minute threshold sweep unlocked a −24 % win that had been
+   sitting unclaimed since FIOS landed.  Worth a periodic pass over
+   every hard-coded threshold after any kernel replacement.
+
+2. **Cross-term halving isn't free.**  The separate `montgomery_sqr`
+   saves ~half the MACs via the cross-term symmetry trick, but the
+   shift-and-fold machinery to double the half and then add the
+   diagonals has its own serial carry chains.  FIOS's dual-chain
+   issue beats it at every k we measured — the MAC savings don't
+   compensate for the ILP cost.  A future FIOS squaring that exploits
+   the cross-term symmetry (dual-chain + halving) would likely win
+   again, but at a complexity cost that is not justified by the
+   current k=1..7 numbers.
+
+3. **"No regressions" is a weak gate; "no crossover" is the right one.**
+   Measuring at every k in the band (not just the endpoints) prevents
+   setting a threshold inside a band where the backends trade places.
+   Here there was no crossover — the win is monotone in k across
+   the measured range.
+
+#### Updated recommendation for next sprint
+
+Ranked by confidence-of-win, **after** the threshold cleanup:
+
+1. **Hand-tuned aarch64 `mul_limbs_base` (inline asm)** — was slot 2
+   before this sprint, promoted to slot 1.  Targets 1024-bit and up
+   (k = 16..31, Karatsuba widths).  Expected ceiling: 5–10 % after
+   FIOS, down from the 10–15 % estimate before FIOS.  Still the
+   highest-leverage remaining lever.
+2. **PGO side quest.**  Unchanged — cheap to try, low ceiling.
+3. **Dual-chain REDC for Karatsuba-backed Montgomery (k ≥ 32).**
+   Unchanged — modest win expected at 2048/4096-bit.
+4. **FIOS squaring with cross-term halving.**  New slot.  A FIOS
+   variant that exploits `a[i]*a[j] == a[j]*a[i]` should win some
+   of the MACs back while keeping the dual-chain issue.  Non-trivial
+   correctness story (the two chains no longer have uniform
+   structure at diagonal/cross positions), but bounded scope.
+   Low-medium confidence.
+5. **Toom-Cook 3-way above k=64.**  Unchanged — only helps 4096+,
+   still deferred.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

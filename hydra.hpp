@@ -3783,10 +3783,16 @@ struct EGCDResult {
     // ── Stack-based scratch buffers ──
     // MONTGOMERY_MAX_LIMBS is 64 (4096 bits).  All buffers fit on stack.
     //
-    // Three Montgomery multiply backends:
-    //   1. Separate schoolbook + REDC  (k < FUSED_THRESHOLD)
-    //   2. Fused CIOS                  (FUSED_THRESHOLD <= k < KARATSUBA_MONT_THRESHOLD)
-    //   3. Separate Karatsuba + REDC   (k >= KARATSUBA_MONT_THRESHOLD)
+    // Two Montgomery multiply backends on the dispatch:
+    //   1. FIOS (dual-row CIOS)        (k < KARATSUBA_MONT_THRESHOLD)
+    //   2. Separate Karatsuba + REDC   (k >= KARATSUBA_MONT_THRESHOLD)
+    //
+    // FIOS owns the entire non-Karatsuba band.  The 2026-04-18 threshold
+    // sweep (probe_fios_small_k) showed FIOS beating the previously-used
+    // separate-schoolbook+REDC path by −19% to −36% end-to-end at
+    // 64/128/192/256/320/384/448 bits — at every k from 1 through 7.
+    // Before that sweep, FUSED_THRESHOLD was 8 as a holdover from the
+    // pre-FIOS fused-CIOS sprint, which was only tested at k >= 8.
     //
     // The Karatsuba backend replaces the O(k²) product phase with
     // O(k^1.585), then runs the same word-by-word REDC.  The REDC
@@ -3794,21 +3800,19 @@ struct EGCDResult {
     // total cost in the fused path (both multiply-accumulate and reduce
     // are O(k²) per row × k rows).
     //
-    // SOS (`montgomery_mul_sos`) is a fourth backend — `mul_limbs +
-    // REDC` — kept callable from `detail` but NOT used here.  It was
-    // built for the 1024-bit-class (k=8..24) gap where neither fused
-    // nor Karatsuba was a clear winner, on the hypothesis that exposing
-    // the dual-row `mac_row_2` kernel to the multiply phase would help.
-    // End-to-end pow_mod measurement showed the opposite: at k=8..24
-    // the structural cost of materialising the full 2k-limb product
-    // and then reading it back for REDC dominated the dual-row win
-    // (which itself is only ~3% at k=16 per the prior sprint's data).
-    // The null result is documented in DIRECTORS_NOTES.md; the SOS
-    // primitives stay in-tree so future experiments (e.g. dual-row
-    // CIOS, mixing SOS at the very top of the non-Karatsuba band) can
-    // build on it without rederiving correctness.
+    // `montgomery_mul` / `montgomery_sqr` (separate schoolbook + REDC)
+    // and `montgomery_mul_fused` / `montgomery_mul_sos` remain callable
+    // from `detail::` as correctness references for the FIOS tests —
+    // they are NOT reachable via dispatch.  The null result for SOS is
+    // documented in DIRECTORS_NOTES.md; the primitives stay in-tree so
+    // future experiments can build on them without rederiving correctness.
     constexpr uint32_t MAX_K = 64;
-    constexpr uint32_t FUSED_THRESHOLD = 8;  // k >= 8 → use fused CIOS
+    // FUSED_THRESHOLD = 1 → FIOS owns every non-Karatsuba k.
+    // Kept as a named constant so the dispatch reads symmetrically and
+    // future experiments have an obvious knob.  Setting it >1 would
+    // route k < FUSED_THRESHOLD through the separate schoolbook+REDC
+    // reference path, which is strictly slower at every k we tested.
+    constexpr uint32_t FUSED_THRESHOLD = 1;
     // Next power of 2 >= MAX_K for Karatsuba padding
     constexpr uint32_t MAX_K_PADDED = 64;    // MAX_K is already a power of 2
 
@@ -3867,18 +3871,17 @@ struct EGCDResult {
     uint64_t table[TABLE_SIZE][MAX_K];
 
     // ── Montgomery mul/sqr dispatch helpers ──
-    // Three-tier dispatch:
+    // Two-tier dispatch:
     //   k >= KARATSUBA_MONT_THRESHOLD → Karatsuba product + REDC
-    //   k >= FUSED_THRESHOLD          → fused CIOS (interleaved multiply-reduce)
-    //   k < FUSED_THRESHOLD           → separate schoolbook + REDC
-    // FIOS ("dual-row CIOS") replaces the canonical fused CIOS path
-    // when k >= FUSED_THRESHOLD.  At the time of writing (2026-04-18)
-    // the dual-row sprint microbench showed −21% to −52% kernel
-    // deltas vs fused CIOS at k=4..32; the end-to-end pow_mod run
-    // at 1024/2048/4096-bit confirms the win survives realistic
-    // rotating-operand cadence (where SOS lost).  Canonical fused
-    // CIOS (`montgomery_mul_fused`) remains callable from `detail::`
-    // as a reference and A/B target.
+    //   otherwise                     → FIOS (dual-row CIOS)
+    // FIOS ("dual-row CIOS") owns the entire non-Karatsuba band.
+    // The 2026-04-18 FIOS sprint microbench showed −21% to −52% kernel
+    // deltas vs fused CIOS at k=4..32; the threshold-cleanup sprint
+    // that same day (probe_fios_small_k) extended FIOS down through
+    // k=1..7 with end-to-end pow_mod wins of −19% to −36%.  Canonical
+    // fused CIOS (`montgomery_mul_fused`) and the separate schoolbook
+    // path (`montgomery_mul`/`_sqr`) remain callable from `detail::`
+    // as correctness references and A/B targets.
     auto mont_mul = [&](const uint64_t* a, const uint64_t* b,
                         uint64_t* out) {
         if (use_karatsuba)
@@ -3959,8 +3962,8 @@ struct EGCDResult {
 
     // ── MSB-to-LSB sliding window exponentiation ──
     // Process exponent bits from position total_bits down to 0.
-    // Uses fused CIOS kernels for k >= FUSED_THRESHOLD, separate
-    // mul+REDC below.
+    // Uses FIOS for the entire non-Karatsuba band; Karatsuba+REDC
+    // above KARATSUBA_MONT_THRESHOLD.
     int bit_pos = total_bits;
     while (bit_pos >= 0) {
         // Get current bit

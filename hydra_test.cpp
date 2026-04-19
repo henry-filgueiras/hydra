@@ -3524,6 +3524,34 @@ static void test_sos_pow_mod_dispatch_widths() {
     }
 }
 
+// End-to-end pow_mod at the widths the FIOS path newly owns after the
+// 2026-04-18 threshold cleanup (FUSED_THRESHOLD: 8 → 1).  These k values
+// used to dispatch through the separate schoolbook+REDC path; cross-check
+// against the naive divisor path to pin the new dispatch slots.
+static void test_fios_small_k_pow_mod_dispatch_widths() {
+    auto make = [](uint32_t bits, uint64_t seed) {
+        uint32_t n_limbs = (bits + 63) / 64;
+        std::mt19937_64 rng(seed);
+        std::vector<uint64_t> limbs(n_limbs);
+        for (auto& l : limbs) l = rng();
+        limbs[0] |= 1u;
+        limbs.back() |= (1ull << 63);
+        return Hydra::from_limbs(limbs.data(), n_limbs);
+    };
+    // 64-bit (k=1), 128-bit (k=2), 192-bit (k=3), 256-bit (k=4),
+    // 320-bit (k=5), 384-bit (k=6), 448-bit (k=7)
+    for (uint32_t bits : {64u, 128u, 192u, 256u, 320u, 384u, 448u}) {
+        Hydra base    = make(bits, 0xF105'0011ull + bits);
+        Hydra exp_val = make(bits, 0xF105'0012ull + bits);
+        Hydra mod_val = make(bits, 0xF105'0013ull + bits);
+        Hydra mont = hydra::pow_mod(base, exp_val, mod_val);
+        Hydra naive = hydra::pow_mod_naive(base % mod_val, exp_val, mod_val);
+        std::string label = "fios small-k pow_mod e2e at " +
+                            std::to_string(bits) + "-bit";
+        CHECK(mont == naive, label.c_str());
+    }
+}
+
 // Boundary: k=31 should NOT use Karatsuba (stays on fused CIOS)
 // k=32 should use Karatsuba.  Both must produce same pow_mod result.
 static void test_karatsuba_threshold_boundary() {
@@ -3912,6 +3940,7 @@ int main() {
     test_fios_mont_mul_carry_adversarial();
     test_fios_mont_mul_dirty_work_buffer();
     test_fios_mont_sqr_cross();
+    test_fios_small_k_pow_mod_dispatch_widths();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

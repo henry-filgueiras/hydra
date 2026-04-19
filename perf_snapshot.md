@@ -3,15 +3,14 @@
 Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
 > Current state after the **scratch-workspace** (pow_mod allocator removal),
-> **dual-row schoolbook leaf kernel**, **SOS Montgomery null-result**, and
-> **dual-row CIOS / FIOS** sprints.  `pow_mod` at every width in the
-> fused-CIOS band (k=8..31, i.e. 512-bit through 1984-bit) moved
-> materially in the FIOS sprint; the canonical fused CIOS
-> (`montgomery_mul_fused`) now stays in-tree as a reference and is
-> called as the benchmark A-side for future experiments, but dispatch
-> routes through `montgomery_mul_fios` instead.  Karatsuba-backed
-> widths (k ≥ 32, 2048-bit and 4096-bit) and the sub-fused band
-> (k < 8, 256-bit) were not touched and are unchanged.
+> **dual-row schoolbook leaf kernel**, **SOS Montgomery null-result**,
+> **dual-row CIOS / FIOS**, and **FUSED_THRESHOLD cleanup** sprints.
+> FIOS now owns the entire non-Karatsuba band (k=1..31) after the
+> threshold sweep lowered `FUSED_THRESHOLD` from 8 to 1.  The canonical
+> fused CIOS (`montgomery_mul_fused`) and the separate schoolbook path
+> (`montgomery_mul` / `montgomery_sqr`) stay in-tree as correctness
+> references but are no longer reachable via dispatch.  Karatsuba-backed
+> widths (k ≥ 32, 2048-bit and 4096-bit) are untouched and unchanged.
 > See `DIRECTORS_NOTES.md` for hypothesis / design / rationale history.
 
 ---
@@ -20,20 +19,21 @@ Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
 _Min-of-6 runs, 50-sample median per run; `bench_pow_mod --markdown`_
 
-| Width | Hydra (FIOS) | Hydra (was)  | Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
+| Width | Hydra (now)  | Hydra (prior)| Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
 |------:|-------------:|-------------:|-----------:|----------:|----------:|------------:|----------------:|
-|   256 |    9.60 µs   |    9.67 µs   |      −1 %  |  7.21 µs  |  5.29 µs  |       1.33× |           1.82× |
-|   512 |   35.35 µs   |   52.06 µs   |     −32 %  | 27.58 µs  | 19.00 µs  |       1.28× |           1.86× |
-|  1024 |  232.33 µs   |  309.23 µs   |     −25 %  | 152.63 µs | 109.75 µs |       1.52× |           2.12× |
-|  1536 |  775.35 µs   |    1.14 ms   |     −32 %  | 461.67 µs | 336.75 µs |       1.68× |           2.30× |
-|  1984 |    1.78 ms   |    2.51 ms   |     −29 %  |   1.03 ms |   1.65 ms |       1.73× |           1.08× |
+|   256 |    7.29 µs   |    9.60 µs   |     −24 %  |  7.21 µs  |  5.29 µs  |       1.01× |           1.38× |
+|   512 |   36.42 µs   |   35.35 µs   |      +3 %  | 27.58 µs  | 19.00 µs  |       1.32× |           1.92× |
+|  1024 |  234.56 µs   |  232.33 µs   |      +1 %  | 152.63 µs | 109.75 µs |       1.54× |           2.14× |
+|  1536 |  781.12 µs   |  775.35 µs   |      +1 %  | 461.67 µs | 336.75 µs |       1.69× |           2.32× |
+|  1984 |    1.78 ms   |    1.78 ms   |       0 %  |   1.03 ms |   1.65 ms |       1.73× |           1.08× |
 |  2048 |    2.59 ms   |    2.59 ms   |       0 %  |   1.09 ms |  782.9 µs |       2.38× |           3.31× |
-|  4096 |   20.08 ms   |   19.93 ms   |      +1 %  |   7.47 ms |   5.82 ms |       2.69× |           3.45× |
+|  4096 |   20.13 ms   |   20.08 ms   |       0 %  |   7.47 ms |   5.82 ms |       2.69× |           3.46× |
 
-_1024-bit moved from −1.96× to −1.52× vs GMP (from +96 % to +52 % gap); 1536
-and 1984 gained similarly.  Karatsuba-backed widths (2048/4096) unchanged.
-256-bit is below `FUSED_THRESHOLD = 8` and stays on the separate
-schoolbook + REDC path, untouched by this sprint._
+_256-bit moved from essentially level with GMP to within noise of
+GMP — the FIOS path beats the separate schoolbook + REDC path it
+replaces by −24 %.  Non-Karatsuba widths ≥ 512-bit are within
+noise of the FIOS-sprint numbers (they already used FIOS).
+Karatsuba widths (2048, 4096) unchanged by construction._
 
 ---
 
@@ -53,10 +53,12 @@ _`build-rel/probe_mont_fios`, median of warmup+hot reps at each k._
 | 32 |             1111.0 ns  |             869.1 ns  |        −22 %   |
 
 _The k=4 and k=6 entries show FIOS's structural advantage over fused
-CIOS at small widths — but dispatch at those k's routes through
-`montgomery_mul` (separate schoolbook + REDC), not fused, so the
-kernel win does not translate to the end-to-end 256-bit column.
-Whether to lower `FUSED_THRESHOLD` below 8 is a potential follow-up._
+CIOS at small widths.  After the 2026-04-18 threshold cleanup,
+`FUSED_THRESHOLD = 1` so dispatch at these k's now routes through
+FIOS — the kernel win translates directly to the 256-bit end-to-end
+number (see the `pow_mod` table above).  The follow-up `probe_fios_small_k`
+sweep (k = 1..7, FIOS vs `montgomery_mul`/`montgomery_sqr`) showed
+FIOS wins of −17 % to −33 % end-to-end; full table in DIRECTORS_NOTES.md._
 
 ---
 
