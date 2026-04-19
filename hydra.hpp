@@ -440,11 +440,42 @@ inline void mac_row_2(
 // operand distributions (pow_mod, Karatsuba sum-halves) the branch
 // mispredicts often enough to cost more than it saves, and the MACs
 // are already cheap when a[i] is zero.
+#if defined(HYDRA_AARCH64_ASM_LEAF) && (defined(__aarch64__) || defined(_M_ARM64))
+// Out-of-line aarch64 full-leaf schoolbook kernel — see
+// `hydra_mul_leaf_aarch64.S`.  Replaces the entire (na=16, nb=16)
+// body of mul_limbs with a single asm call.  The higher seam is
+// the whole point of the experiment: one C↔asm transition per leaf
+// instead of eight (one per row pair), which is what the 2026-04-18
+// row-level asm sprint's null result asked for.
+// Zeroes out[0..31] internally; caller should NOT pre-memset.
+extern "C" void hydra_mul_limbs_16x16_aarch64(
+    const uint64_t* a, const uint64_t* b, uint64_t* out) noexcept;
+#endif
+
 inline uint32_t mul_limbs(
     const uint64_t* a, uint32_t na,
     const uint64_t* b, uint32_t nb,
     uint64_t* out) noexcept
 {
+#if defined(HYDRA_AARCH64_ASM_LEAF) && (defined(__aarch64__) || defined(_M_ARM64))
+    // Full-leaf asm fast path: the Karatsuba base-case schoolbook
+    // (KARATSUBA_RECURSION_BASE = 16) is the dominant leaf shape at
+    // k = 32..64 — every 2048-bit Montgomery mul hits this seam
+    // twice, every 4096-bit Montgomery mul hits it four times.
+    // The kernel handles its own zero-fill, so we short-circuit
+    // the memset as well.  Falls through to the portable path for
+    // every other (na, nb) shape, including the 17×17 middle
+    // multiply that Karatsuba's cross-term assembly produces.
+    if (na == 16 && nb == 16) {
+        hydra_mul_limbs_16x16_aarch64(a, b, out);
+        // Leaf product is 32 limbs; trim trailing zeros to match the
+        // portable return-value contract.
+        uint32_t used = 32;
+        while (used > 0 && out[used - 1] == 0) --used;
+        return used;
+    }
+#endif
+
     std::memset(out, 0, (na + nb) * sizeof(uint64_t));
 
     uint32_t i = 0;

@@ -3608,6 +3608,128 @@ static void test_aarch64_mac_row_2_matches_scalar() {
 }
 #endif  // HYDRA_AARCH64_ASM
 
+// ── Full-leaf 16×16 asm cross-check ───────────────────────────────
+//
+// Pins `hydra_mul_limbs_16x16_aarch64` against a byte-for-byte
+// scalar reference at six operand patterns (random, all-ones,
+// one-hot on each operand, alternating 0/~0, zero-high-half).
+// This is the correctness gate for the 2026-04-18 full-leaf asm
+// seam.  Runs only when the kernel is compiled in.
+#if defined(HYDRA_AARCH64_ASM_LEAF) && (defined(__aarch64__) || defined(_M_ARM64))
+extern "C" void hydra_mul_limbs_16x16_aarch64(
+    const uint64_t* a, const uint64_t* b, uint64_t* out) noexcept;
+
+// Scalar reference — a byte-for-byte copy of the mul_limbs body
+// specialised to na=nb=16, intentionally NOT routing through the
+// dispatch so we compare asm vs scalar directly.  Using the naive
+// row-by-row loop (not mac_row_2) to keep the reference as simple
+// and independent as possible.
+static void mul_limbs_16x16_scalar_reference(
+    const uint64_t* a, const uint64_t* b, uint64_t* out) noexcept
+{
+    for (uint32_t k = 0; k < 32; ++k) out[k] = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        uint64_t carry = 0;
+        const uint64_t ai = a[i];
+        for (uint32_t j = 0; j < 16; ++j) {
+            unsigned __int128 t =
+                static_cast<unsigned __int128>(ai) * b[j]
+                + out[i + j] + carry;
+            out[i + j] = static_cast<uint64_t>(t);
+            carry      = static_cast<uint64_t>(t >> 64);
+        }
+        out[i + 16] = carry;
+    }
+}
+
+static void test_aarch64_mul_limbs_16x16_matches_scalar() {
+    auto one_pattern = [](const char* label,
+                          const uint64_t* a,
+                          const uint64_t* b) {
+        uint64_t out_ref[32];
+        uint64_t out_asm[32];
+        mul_limbs_16x16_scalar_reference(a, b, out_ref);
+        // Seed out_asm with garbage so we can tell the kernel
+        // actually wrote every slot.
+        for (uint32_t k = 0; k < 32; ++k) out_asm[k] = 0xDEADBEEFDEADBEEFull;
+        hydra_mul_limbs_16x16_aarch64(a, b, out_asm);
+        bool match = true;
+        for (uint32_t k = 0; k < 32; ++k)
+            if (out_ref[k] != out_asm[k]) { match = false; break; }
+        std::string msg = std::string("aarch64 mul_limbs_16x16 vs scalar — ") + label;
+        CHECK(match, msg.c_str());
+    };
+
+    // Pattern 1: random
+    {
+        std::mt19937_64 rng(0xFEED'1616ull);
+        uint64_t a[16], b[16];
+        for (int i = 0; i < 16; ++i) { a[i] = rng(); b[i] = rng(); }
+        one_pattern("random", a, b);
+    }
+    // Pattern 2: carry-adversarial — all-ones both sides (max carry pressure)
+    {
+        uint64_t a[16], b[16];
+        for (int i = 0; i < 16; ++i) { a[i] = ~uint64_t{0}; b[i] = ~uint64_t{0}; }
+        one_pattern("all-ones", a, b);
+    }
+    // Pattern 3: alternating 0/~0 both sides
+    {
+        uint64_t a[16], b[16];
+        for (int i = 0; i < 16; ++i) {
+            a[i] = (i & 1) ? ~uint64_t{0} : 0;
+            b[i] = (i & 1) ? 0 : ~uint64_t{0};
+        }
+        one_pattern("alternating", a, b);
+    }
+    // Pattern 4: a one-hot at position 7, random b
+    {
+        std::mt19937_64 rng(0xC0DE'7777ull);
+        uint64_t a[16] = {};
+        a[7] = ~uint64_t{0};
+        uint64_t b[16];
+        for (int i = 0; i < 16; ++i) b[i] = rng();
+        one_pattern("a one-hot @7", a, b);
+    }
+    // Pattern 5: b one-hot at position 15 (stresses carry propagation
+    // to the very top of the output window).
+    {
+        std::mt19937_64 rng(0xC0DE'FF0Full);
+        uint64_t a[16];
+        for (int i = 0; i < 16; ++i) a[i] = rng();
+        uint64_t b[16] = {};
+        b[15] = ~uint64_t{0};
+        one_pattern("b one-hot @15", a, b);
+    }
+    // Pattern 6: zero high-half on both sides (exercises the "carries
+    // propagate through zeros" path inside the row tail fold).
+    {
+        std::mt19937_64 rng(0xC0DE'0F0Full);
+        uint64_t a[16] = {};
+        uint64_t b[16] = {};
+        for (int i = 0; i < 8; ++i) { a[i] = rng(); b[i] = rng(); }
+        one_pattern("zero high-half", a, b);
+    }
+    // Pattern 7: dispatch path — call mul_limbs directly to confirm
+    // the C++ seam wires correctly and the returned `used` count
+    // trims leading zeros exactly like the portable path.
+    {
+        std::mt19937_64 rng(0xDEAD'BEEFull);
+        uint64_t a[16], b[16];
+        for (int i = 0; i < 16; ++i) { a[i] = rng(); b[i] = rng(); }
+        uint64_t out_ref[32], out_asm[32];
+        mul_limbs_16x16_scalar_reference(a, b, out_ref);
+        uint32_t asm_used = hydra::detail::mul_limbs(a, 16, b, 16, out_asm);
+        uint32_t ref_used = 32;
+        while (ref_used > 0 && out_ref[ref_used - 1] == 0) --ref_used;
+        bool ok = (asm_used == ref_used);
+        for (uint32_t k = 0; k < asm_used && ok; ++k)
+            if (out_ref[k] != out_asm[k]) ok = false;
+        CHECK(ok, "aarch64 mul_limbs(16,16) dispatch matches scalar (value + used)");
+    }
+}
+#endif  // HYDRA_AARCH64_ASM_LEAF
+
 static void test_fios_small_k_pow_mod_dispatch_widths() {
     auto make = [](uint32_t bits, uint64_t seed) {
         uint32_t n_limbs = (bits + 63) / 64;
@@ -4024,6 +4146,9 @@ int main() {
 
 #if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
     test_aarch64_mac_row_2_matches_scalar();
+#endif
+#if defined(HYDRA_AARCH64_ASM_LEAF) && (defined(__aarch64__) || defined(_M_ARM64))
+    test_aarch64_mul_limbs_16x16_matches_scalar();
 #endif
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);

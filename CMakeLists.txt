@@ -129,21 +129,36 @@ target_include_directories(hydra_core INTERFACE
 #
 # To enable:  cmake -B build-rel -DHYDRA_AARCH64_ASM=ON
 # ─────────────────────────────────────────────────────────
-option(HYDRA_AARCH64_ASM "Enable aarch64 asm kernels (null-result A/B target — OFF by default)" OFF)
+option(HYDRA_AARCH64_ASM      "Enable aarch64 row-level asm (mac_row_2 — null-result A/B target, OFF)" OFF)
+option(HYDRA_AARCH64_ASM_LEAF "Enable aarch64 full-leaf asm (mul_limbs 16×16 — follow-up seam, OFF)" OFF)
 
-if(HYDRA_AARCH64_ASM)
+if(HYDRA_AARCH64_ASM OR HYDRA_AARCH64_ASM_LEAF)
     if(NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AArch64"))
-        message(FATAL_ERROR "HYDRA_AARCH64_ASM=ON but target is not aarch64.")
+        message(FATAL_ERROR "HYDRA_AARCH64_ASM* option set but target is not aarch64.")
     endif()
     enable_language(ASM)
-    add_library(hydra_asm STATIC hydra_mac_aarch64.S)
-    set_target_properties(hydra_asm PROPERTIES
-        POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(hydra_core INTERFACE HYDRA_AARCH64_ASM)
+    add_library(hydra_asm STATIC)
+    set_target_properties(hydra_asm PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(hydra_core INTERFACE hydra_asm)
-    message(STATUS "  HYDRA_AARCH64_ASM : ON (mac_row_2 → hand-written aarch64 kernel)")
+
+    if(HYDRA_AARCH64_ASM)
+        target_sources(hydra_asm PRIVATE hydra_mac_aarch64.S)
+        target_compile_definitions(hydra_core INTERFACE HYDRA_AARCH64_ASM)
+        message(STATUS "  HYDRA_AARCH64_ASM      : ON  (mac_row_2 → hand-written aarch64 kernel)")
+    else()
+        message(STATUS "  HYDRA_AARCH64_ASM      : OFF (default — mac_row_2 on portable C++ fallback)")
+    endif()
+
+    if(HYDRA_AARCH64_ASM_LEAF)
+        target_sources(hydra_asm PRIVATE hydra_mul_leaf_aarch64.S)
+        target_compile_definitions(hydra_core INTERFACE HYDRA_AARCH64_ASM_LEAF)
+        message(STATUS "  HYDRA_AARCH64_ASM_LEAF : ON  (mul_limbs 16×16 → hand-written aarch64 kernel)")
+    else()
+        message(STATUS "  HYDRA_AARCH64_ASM_LEAF : OFF (default — 16×16 leaf on portable mul_limbs)")
+    endif()
 else()
-    message(STATUS "  HYDRA_AARCH64_ASM : OFF (default — mac_row_2 on portable C++ fallback)")
+    message(STATUS "  HYDRA_AARCH64_ASM      : OFF (default)")
+    message(STATUS "  HYDRA_AARCH64_ASM_LEAF : OFF (default)")
 endif()
 
 # ─────────────────────────────────────────────────────────

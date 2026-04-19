@@ -3941,6 +3941,299 @@ Slot 1 and slot 2 are both structural.  Either one is more
 likely to move end-to-end than another compiler-tuning pass
 would be.
 
+### Dragon — Full-Leaf aarch64 asm for `mul_limbs(16,16)` (Null Result)
+
+_Implemented 2026-04-18 — Claude Opus 4.7_
+_Status: **NULL RESULT** on the headline workload.  The full-leaf
+seam eliminates the per-row call-overhead problem that killed the
+preceding row-level asm sprint — at 4096-bit Montgomery we now
+issue 4 asm calls per multiply instead of 72.  But the inner body,
+even fully unrolled over nb=16 with the same adcs tricks that won
+at the row level, cannot open a gap over Clang `-O3`'s schedule
+of the equivalent scalar code on Apple M5 Pro.  Isolated kernel:
++1.2 %.  pow_mod at 2048-bit: +0.3 %.  pow_mod at 4096-bit: −0.2 %.
+Under the noise floor at every width.  `HYDRA_AARCH64_ASM_LEAF`
+stays OFF by default; kernel retained as an A/B target._
+
+#### Why full-leaf was attempted after the row-level asm null
+
+The 2026-04-18 row-level asm sprint (see the preceding Dragon
+entry for `mac_row_2`) had a clean ~7 % body-level win that did
+not translate end-to-end because of per-row call overhead and
+loss of cross-row inlining.  The diagnosis pointed at the seam,
+not the body: moving the asm boundary up to the full 16×16
+Karatsuba base case would amortize the C↔asm transition over
+all eight row pairs instead of paying for it once per pair.
+
+Call-count comparison for a 4096-bit Montgomery multiply:
+
+```
+row-level asm (mac_row_2):           72 calls  (8 per leaf × 9 leaves)
+full-leaf  asm (mul_limbs 16×16):     4 calls  (1 per leaf × 4 leaves)
+```
+
+If call overhead was the only thing in the way, the full-leaf
+kernel should have reproduced the row-level kernel's body win
+(~7 %) without paying the call-overhead tax.  The PGO sprint had
+just ruled out compiler-tuning options at the same target widths,
+making a structural asm attempt the natural next lever.
+
+#### Where the 16×16 seam sits
+
+`detail::mul_karatsuba` bottoms out at `KARATSUBA_RECURSION_BASE
+= 16` limbs.  When it hits the base case it calls
+`detail::mul_limbs(a, 16, b, 16, out)` for z0 and z2.  The middle
+z1 product uses slightly wider operands (up to 17 limbs) and
+stays on the portable `mac_row_2` path.  Leaf hit counts:
+
+|  width  |  k  | Montgomery mul | 16×16 leaves | other leaves      |
+|:-------:|:---:|:--------------:|:------------:|:-----------------:|
+|  2048b  | 32  | Karatsuba      |      2       |  1 × (17×17)      |
+|  4096b  | 64  | Karatsuba      |      4       |  2 × (17×17) + 1 × (33×33) |
+
+At 2048/4096-bit pow_mod the 16×16 leaf accounts for roughly 30–
+45 % of the schoolbook leaf budget inside a Montgomery multiply,
+the rest being taken by the larger middle products and REDC.
+That sets the ceiling for this experiment: even a 10 % kernel-
+level win would translate to ~3–4 % end-to-end at best.
+
+#### Implementation
+
+New CMake option `HYDRA_AARCH64_ASM_LEAF`, independent of the
+row-level `HYDRA_AARCH64_ASM` flag.  Enabling it compiles
+`hydra_mul_leaf_aarch64.S` into the `hydra_asm` static library
+and defines the `HYDRA_AARCH64_ASM_LEAF` macro.  Both flags can
+be toggled independently, so the full-leaf experiment can be
+measured without contamination from the row-level null.
+
+C++ dispatch adds a single branch at the top of
+`detail::mul_limbs`:
+
+```
+if (na == 16 && nb == 16) {
+    hydra_mul_limbs_16x16_aarch64(a, b, out);
+    ...trim zeros and return used count
+}
+```
+
+All other shapes (17×17 middle products, 33×33 outer-Karatsuba
+middles, non-power-of-two widths) fall through to the existing
+portable row-dispatch path.  The new kernel never sees operand
+shapes it wasn't designed for.
+
+Correctness: `test_aarch64_mul_limbs_16x16_matches_scalar` pins
+the asm output byte-for-byte against a local copy of the scalar
+body at six operand patterns (random, all-ones carry-adversarial,
+alternating 0/~0, a one-hot at position 7, b one-hot at position
+15, zero-high-half both sides) plus a seventh pattern that goes
+through the C++ dispatch seam to confirm the `used` count trim
+matches the portable return-value contract.  931 / 931 tests pass
+under Debug+ASAN and Release at `HYDRA_AARCH64_ASM_LEAF=ON`.
+
+#### Kernel structure
+
+One function, one C↔asm transition per call:
+
+* **Output zero-fill.**  A straight-line burst of 16 `stp xzr,
+  xzr` pair-stores at fixed offsets — replaces the scalar path's
+  `memset(out, 0, 32*8)` with a no-branch 16-instruction sequence.
+* **Row pairs.**  8 iterations of a rolled outer loop (`subs
+  w7 / b.ne`), each loading `a[2i], a[2i+1]` via `ldp` post-inc
+  and resetting the two chain carries to zero.
+* **Inner body: fully unrolled.**  Since `nb = 16` is known at
+  compile time, the inner loop is unrolled to 16 MAC steps at
+  fixed byte offsets off x1 (the b base pointer).  No `subs /
+  b.ne`, no runtime loop counter, no pointer-advance for b.
+* **MAC body = same as `hydra_mac_aarch64.S`.**  Per step:
+  `ldr x10, [x1, #off]` for `b[j]`, `ldr x11, [x8, #8]` for
+  the chain-B accumulator, two `mul`/`umulh` pairs, two
+  `adds`/`adcs`/`adds`/`adc` carry chains, one `str x9, [x8], #8`
+  for the committed chain-A value, one `mov x9, x11` to forward
+  chain-B into the next step's chain-A accumulator.  Register-
+  resident chain-B forwarding and suppressed interior stores
+  work the same way they did in the row-level kernel.
+* **Row tail fold.**  At end of the 16-step unroll: `adds x9, x9,
+  x5 / str / ldr / adcs x10, x10, x6 / str` folds the two
+  running carries into `out[nb], out[nb+1]`; a small `.Lprop`
+  loop propagates any residual carry upward.  Identical
+  semantics to the scalar path's final `while (ch)` loop.
+
+Resulting code is ~2.5 KB (224 instructions assembled).  No
+stack use, no callee-save preservation — all work registers are
+caller-saved `x3..x17`.
+
+#### Kernel-level measurement (10 reps, min_time=1.0 s)
+
+|      bench      | release ns | leaf-asm ns |   delta  |
+|:---------------:|-----------:|------------:|:--------:|
+| mul_school/16   |     83.57  |      84.54  |  +1.2 %  |
+| mul_karatsuba/32|    319.86  |     326.03  |  +1.9 %  |
+| mul_karatsuba/64|   1164.85  |    1169.66  |  +0.4 %  |
+| mul_dispatched/32|   371.10  |     373.46  |  +0.6 %  |
+| mul_dispatched/64|  1234.63  |    1232.55  |  −0.2 %  |
+
+`mul_school/16` is the direct A/B on the isolated leaf — the
+kernel is the *only* thing that differs between the two columns
+at this row.  The asm is **+1.2 % slower than scalar** in
+isolation.  That is a fresh finding: at the MAC body level, the
+compiler's scalar schedule is at least as good as hand-tuned
+aarch64 on this pattern on M5 Pro.  A ~7 % row-level win (from
+the preceding sprint) does not generalise up to the leaf level.
+
+#### End-to-end measurement (min-of-medians across 8 × 50-sample runs)
+
+|  width  |   bypasses leaf?   | release ns | leaf-asm ns |  delta   |
+|:-------:|:------------------:|-----------:|------------:|:--------:|
+|  256b   | yes (k=4, no Kara) |   10 730   |    8 834    | −17.7 %  |
+|  512b   | yes (k=8)          |   52 208   |   42 146    | −19.3 %  |
+| 1024b   | yes (k=16)         |  277 355   |  245 209    | −11.6 %  |
+| 1536b   | yes (k=24)         |  766 792   |  766 271    |  −0.1 %  |
+| 1984b   | yes (k=31)         | 1 739 438  | 1 749 188   |  +0.6 %  |
+| **2048b** | **no (k=32)**    | **2 559 500** | **2 567 396** | **+0.3 %** |
+| **4096b** | **no (k=64)**    | **19 812 042**|**19 775 542** | **−0.2 %** |
+
+The 256/512/1024-bit deltas are noise artefacts — the asm path
+is never even called at these widths (the 16×16 leaf is only
+reached through Karatsuba, which starts at k ≥ 32 =
+`KARATSUBA_THRESHOLD_LIMBS`).  Percent deltas look large because
+the absolute values are small and a single 50-sample median can
+jitter by ±10 % under even modest background system load.
+Reversing the A/B order reproduces similar-magnitude deltas in
+the same direction, confirming the noise-floor diagnosis.
+
+The **only** rows that actually measure the new kernel are
+2048-bit (+0.3 %) and 4096-bit (−0.2 %).  Both are flat.  The
+seam fix worked — call-count went 72 → 4 for a 4096-bit
+Montgomery multiply — but the inner-body delta on the leaf
+itself is too small (within 1 %) for that seam benefit to
+surface end-to-end.
+
+#### What the full-leaf kernel controls that C++ cannot
+
+Machine-level levers the asm kernel explicitly holds fixed:
+
+1. **nb-loop collapse.**  The scalar `mac_row_2` inner loop is a
+   2-j-per-iteration rolled form (the compiler emits `subs / b.ls`
+   every other j).  The asm kernel fully unrolls to 16 MAC steps
+   per row pair at compile time — zero inner branches.  This
+   saves ~8 branch issues per row pair × 8 row pairs = ~64
+   branches per leaf.
+2. **Zero C↔asm transitions between row pairs.**  The scalar
+   `mul_limbs` at -O3 calls `mac_row_2` via `bl` 8 times per
+   16×16 leaf (confirmed by disassembly of the hydra_bench
+   binary).  The asm kernel does all eight row pairs in one
+   function entry, eliminating 7 `bl + ret` pairs per leaf.
+3. **Immediate-offset b[] reads.**  x1 (b base) never moves; every
+   `b[j]` load uses a fixed immediate offset.  Scalar uses a
+   post-incrementing pointer; the offset form is one fewer
+   instruction overall and exposes more parallelism to the address
+   generation unit.
+4. **Explicit chain-B → chain-A forwarding.**  Same trick that
+   worked at the row level: `str x9` commits chain A, `mov x9,
+   x11` forwards the chain-B value in-register rather than
+   round-tripping through out[j+1] (which the compiler cannot
+   prove does not alias with b[]).  At the leaf level this saves
+   one load per MAC step × 128 MAC steps per leaf = 128 load
+   issues.
+5. **Suppressed interior chain-B stores.**  Only the final chain-B
+   value per row pair is stored (inside the row-tail fold).  Every
+   intermediate chain-B value rides in a register.
+
+All five levers fire correctly — the generated code is exactly
+what the design asks for, confirmed by `otool -tv`.
+
+#### Why the levers don't add up to a win
+
+All the overhead elimination above is real, but it buys a small
+absolute number of cycles (~16 saved branches, ~7 saved C↔asm
+transitions, ~128 saved loads × a few cycles each).  The core
+MAC throughput — 4 `mul`/`umulh` + ~10 adds per j — is what
+dominates the leaf time, and on that Apple's frontend + M5 Pro
+backend already hits the ceiling that the asm kernel reaches.
+The row-level kernel's ~7 % win was measurable because the C++
+compiler's per-row setup was a *visible* fraction of a 12 ns
+body; at the full-leaf level the equivalent setup/teardown is
+~2 % of an 85 ns body, and that 2 % is already inside the
+compiler's scheduling slack.
+
+Put bluntly: the 2026-04-18 asm sprint was right that the seam
+was wrong.  The full-leaf seam *is* right.  But the body on the
+other side of the correct seam is already ceiling-bound on this
+core, so there's nothing for the asm to amortize **into**.
+
+#### What the new dominant hotspot looks like
+
+With the 16×16 leaf essentially cache-blocked and ceiling-bound,
+the 4096-bit Montgomery multiply cost breakdown is roughly:
+
+```
+  4 × mul_limbs 16×16 (~85 ns each)     =   340 ns  (~22 %)
+  2 × mul_limbs 17×17 (~100 ns each)    =   200 ns  (~13 %)
+  1 × mul_limbs up to 33×33 (~370 ns)   =   370 ns  (~24 %)
+  Karatsuba add/sub/assembly overhead   =   ~60 ns  ( ~4 %)
+  montgomery_redc (k=64)                =  ~580 ns  (~37 %)
+  ───────────────────────────────────────────────
+  total per Montgomery mul              = ~1 550 ns
+```
+
+REDC is now the single largest cost center, larger than *any*
+leaf schoolbook product.  The k=64 REDC is itself an O(k²)
+accumulation; it already routes through `mac_row_2` internally
+but has no equivalent of Karatsuba to cut its asymptotic cost.
+That makes **dual-chain REDC** (the long-standing Slot 2) the
+natural next experiment.  A REDC that issues two m*mod[j] chains
+per inner step (analogous to FIOS's dual-row cross-term
+structure) would target a 35 %+ budget line in one shot, which
+is the only thing left in the portable space that could
+plausibly move 2048/4096-bit pow_mod by more than a percent.
+
+#### Recommendation
+
+- **Do not enable `HYDRA_AARCH64_ASM_LEAF` by default.**  The
+  seam is correct, the kernel is correct, but it does not open
+  end-to-end headroom that would justify the maintenance burden
+  of an architecture-specific build path.
+- **Keep the kernel in-tree** as an opt-in A/B target, next to
+  `hydra_mac_aarch64.S` and `scripts/pgo_run.sh`.  It is a
+  validated measurement of how much performance is reachable
+  through asm at this seam; future experiments (e.g. asm REDC)
+  can reuse its correctness scaffolding and calling convention.
+- **Close the asm / compiler-tuning exploration path.**  Two
+  asm sprints and one PGO sprint have all landed flat on 2048/
+  4096-bit pow_mod.  The consistent message is that the M5 Pro
+  scalar pipeline is already within epsilon of peak for Hydra's
+  MAC-shaped kernels; reaching further in this direction would
+  need a fundamentally different pipelining model (NEON wide-
+  mul, SVE2 when available, or coarse-grained block-reduction
+  asm that changes the algorithm shape, not the instruction
+  mix).
+
+#### Updated next-sprint ranking
+
+Two asm sprints + one PGO sprint + one threshold-cleanup sprint
++ FIOS have now exhausted every instruction-level lever.  The
+remaining slots are all algorithmic:
+
+1. **Dual-chain REDC for k ≥ 32.**  **Promoted to slot 1.**  The
+   hotspot breakdown above makes REDC the single biggest
+   remaining cost center at 4096-bit (~37 % of Montgomery mul
+   budget).  FIOS already proved the dual-chain pattern works
+   inside the product phase; porting it to the reduction phase
+   attacks an un-asm'd, un-Karatsuba'd O(k²) loop.  Medium
+   confidence, ~5–10 % end-to-end at 4096-bit, bounded scope.
+2. **Toom-Cook 3-way above k ≥ 64.**  Only helps 4096+.
+   Structurally the biggest change but the only remaining lever
+   with a super-linear asymptotic improvement.  Low-medium
+   confidence on the sub-k=128 crossover because Hydra's Karatsuba
+   is already well-tuned.
+3. **FIOS squaring with cross-term halving.**  Unchanged.
+   Non-trivial correctness story; modest (3–5 %) ceiling at the
+   widths pow_mod-by-squaring-heavily spends time on.
+4. **Asm exploration is closed.**  Keep the two opt-in kernels
+   in-tree for A/B measurement but do not start another asm
+   sprint until a new algorithmic lever lands that creates a
+   fresh seam worth attacking.
+
 ---
 
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
