@@ -45,6 +45,66 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 # ─────────────────────────────────────────────────────────
+# Profile-guided optimization (Clang IR-PGO)
+#
+# Two mutually exclusive modes, both driven by cache variables:
+#
+#   HYDRA_PGO_GEN_DIR   — absolute path to a directory for raw
+#                         profiles.  Injects `-fprofile-generate=<dir>`
+#                         into compile + link flags.  Build the usual
+#                         Release targets, run the training corpus,
+#                         then merge with `llvm-profdata merge`.
+#
+#   HYDRA_PGO_USE_FILE  — absolute path to a merged .profdata file.
+#                         Injects `-fprofile-use=<file>` plus
+#                         -Wno-profile-instr-unprofiled / -out-of-date
+#                         so stale-profile warnings don't spam during
+#                         benign code churn.
+#
+# The orchestrator script `scripts/pgo_run.sh` sets these for you
+# across two build trees (`build-pgo-gen` and `build-pgo-use`).  The
+# normal Release build (`build-rel`) is untouched.
+# ─────────────────────────────────────────────────────────
+set(HYDRA_PGO_GEN_DIR  "" CACHE PATH "Directory for -fprofile-generate raw profiles (unset to disable).")
+set(HYDRA_PGO_USE_FILE "" CACHE FILEPATH "Merged .profdata file for -fprofile-use (unset to disable).")
+
+if(HYDRA_PGO_GEN_DIR AND HYDRA_PGO_USE_FILE)
+    message(FATAL_ERROR "HYDRA_PGO_GEN_DIR and HYDRA_PGO_USE_FILE are mutually exclusive.")
+endif()
+
+if(HYDRA_PGO_GEN_DIR)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "HYDRA_PGO_GEN_DIR requires a Clang-family compiler (got ${CMAKE_CXX_COMPILER_ID}).")
+    endif()
+    file(MAKE_DIRECTORY "${HYDRA_PGO_GEN_DIR}")
+    add_compile_options(-fprofile-generate=${HYDRA_PGO_GEN_DIR})
+    add_link_options(-fprofile-generate=${HYDRA_PGO_GEN_DIR})
+    message(STATUS "  HYDRA_PGO     : INSTRUMENTED (raw dir = ${HYDRA_PGO_GEN_DIR})")
+endif()
+
+if(HYDRA_PGO_USE_FILE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "HYDRA_PGO_USE_FILE requires a Clang-family compiler (got ${CMAKE_CXX_COMPILER_ID}).")
+    endif()
+    if(NOT EXISTS "${HYDRA_PGO_USE_FILE}")
+        message(FATAL_ERROR "HYDRA_PGO_USE_FILE=${HYDRA_PGO_USE_FILE} does not exist.")
+    endif()
+    add_compile_options(
+        -fprofile-use=${HYDRA_PGO_USE_FILE}
+        -Wno-profile-instr-unprofiled
+        -Wno-profile-instr-out-of-date
+        # Google Benchmark compiles with -Werror; some of its own TUs
+        # will naturally hash-mismatch the profile (we only train our
+        # code).  Demote the PGO backend's hash-mismatch warning so
+        # vendored TUs don't break the build.
+        -Wno-error=backend-plugin
+        -Wno-backend-plugin
+    )
+    add_link_options(-fprofile-use=${HYDRA_PGO_USE_FILE})
+    message(STATUS "  HYDRA_PGO     : USE      (profdata = ${HYDRA_PGO_USE_FILE})")
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Core interface library  (header-only)
 # ─────────────────────────────────────────────────────────
 add_library(hydra_core INTERFACE)

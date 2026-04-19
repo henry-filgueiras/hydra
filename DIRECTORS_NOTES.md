@@ -3651,6 +3651,296 @@ entirely.**  Everything remaining either targets REDC (slot 2),
 widens the asm seam past the call-overhead threshold (slot 3),
 or leaves the O(k²) regime for O(k^1.46) Toom (slot 4).
 
+### Dragon — Profile-Guided Optimization (Null Result on pow_mod)
+
+_Implemented 2026-04-18 — Claude Opus 4.7_
+_Status: **NULL RESULT** on the headline workload — PGO produces
+mixed signals, with large wins on short factorial chains and small
+losses on many microbenches.  At the target `pow_mod` widths
+(1024…4096-bit) the delta is within ±5 %, essentially a wash.
+PGO is **not** recommended as a standing build option.  The
+reproducible train-use workflow (`scripts/pgo_run.sh`) is kept
+in-tree as a measurement tool, not a default._
+
+#### Why PGO was tried now
+
+The 2026-04-18 aarch64 asm sprint produced a clean null result on
+end-to-end `pow_mod` (kernel-level wins cancelled by out-of-line
+call overhead and loss of inlining — see the preceding Dragon
+entry).  That pushed the next-sprint recommendation to a PGO side
+quest: if the remaining ceiling at 2048/4096-bit is compiler
+scheduling / block layout (not raw instruction count), profile-
+guided code generation is the cheapest lever left.
+
+The hypothesis: with representative profile data, Clang might
+better choose (a) inlining at the dispatch seams, (b) cold-branch
+layout for the zero/small fast paths, and (c) block ordering
+inside `mac_row_2`, REDC, and Karatsuba.  Expected ceiling: 1-3 %
+end-to-end.  If that hit, portable headroom would be essentially
+exhausted and future work would be gated on structural changes
+(asm REDC, dual-chain REDC, Toom-Cook).
+
+#### Toolchain
+
+Apple Clang 21.0.0 (Xcode 16) with LLVM IR PGO
+(`-fprofile-generate=<dir>` / `-fprofile-use=<merged.profdata>`).
+Profile merge via `xcrun -f llvm-profdata` (bundled with the Xcode
+toolchain; no brew LLVM needed).  One clean supported path, no
+build-system refactor required.
+
+#### CMake surface
+
+Two new cache variables in `CMakeLists.txt`, mutually exclusive:
+
+```
+HYDRA_PGO_GEN_DIR   PATH      # if set: add -fprofile-generate=<dir>
+HYDRA_PGO_USE_FILE  FILEPATH  # if set: add -fprofile-use=<file>
+```
+
+Both inject the flag into `add_compile_options` and
+`add_link_options` at directory scope so every target (benchmark
+and test) is instrumented consistently.  `HYDRA_PGO_USE_FILE` also
+pulls in `-Wno-profile-instr-unprofiled`, `-Wno-profile-instr-out-
+of-date`, and `-Wno-error=backend-plugin` so (a) header-only code
+that wasn't exercised during training doesn't spam warnings and
+(b) Google Benchmark's own `-Werror=backend-plugin` doesn't break
+the build on vendored TUs that we deliberately did not train.
+
+The normal `build-rel/` Release build is untouched: invoke
+`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release` to keep the
+baseline clean.
+
+#### Orchestrator — `scripts/pgo_run.sh`
+
+One shell script, five subcommands (`gen` / `train` / `merge` /
+`use` / `clean`, plus `all` for the full cycle).  Output trees
+are all `.gitignore`-d:
+
+```
+build-pgo-gen/          # instrumented build
+pgo-profiles/           # default_*.profraw + merged.profdata
+build-pgo-use/          # final PGO-use release build
+```
+
+Full cycle is:
+
+```
+scripts/pgo_run.sh       # ~90 s total
+./build-pgo-use/bench_pow_mod --markdown
+./build-rel/bench_pow_mod --markdown
+```
+
+#### Training corpus
+
+Two workloads, in this order:
+
+1. **`bench_pow_mod`** — 7 widths (256, 512, 1024, 1536, 1984,
+   2048, 4096) × 50 samples × 1 Hydra pow_mod per sample = 350
+   end-to-end Montgomery exponentiations.  This is the headline
+   workload and the one that matters.  Exercises every depth of
+   the dispatch hierarchy: small→medium, FIOS for k=8..31,
+   Karatsuba-backed Montgomery for k≥32, schoolbook `mul_limbs`
+   inside Karatsuba leaves, `mac_row_2` at the bottom, and REDC
+   across all shapes.
+
+2. **`hydra_bench`** with `--benchmark_min_time=0.05s` and
+   `--benchmark_filter='^(?!boost/).*'` — ~30 Google Benchmark
+   registrations covering small/medium/large add, sub, mul, shift,
+   div, copy, move, allocation, and the mul_school / mul_karatsuba
+   / mul_dispatched / mul_below_threshold sweeps.  Short min_time
+   is deliberate: we want **coverage**, not stable times.  Every
+   `BENCHMARK()` runs ≥ 1000 iterations in 50 ms, which is
+   abundantly enough for PGO edge-weight decisions.
+
+**Excluded:**
+- `boost/*` comparators — they exercise Boost's code, not Hydra's;
+  training on them only pollutes the `-Wno-profile-instr-*`
+  suppression surface.
+- `hydra_test` — it's correctness-shaped (tiny operations, single
+  execution of each corner case).  Including it would bias the
+  profile toward test-shaped control flow (exhaustive branches in
+  the sanity asserts), not real steady-state usage.
+
+**Deliberately not optimised toward one bench:** the training mix
+contains both the pow_mod headline path *and* the per-kernel
+microbenches.  That way PGO doesn't get a free pass on
+factorial / microbench chains at the expense of the multi-limb
+routines or vice versa.  If anything the mix **under**-weights
+pow_mod relative to microbenches (350 full calls × ~1 ms each vs
+~30 benches × 50 ms each = ~0.35 s pow_mod vs ~1.5 s microbench).
+
+#### Measured benefit — `bench_pow_mod` (end-to-end)
+
+Five back-to-back runs of each binary on the same machine, 50
+samples per width per run.  **Minimum** of the five per-run
+medians per width (most robust to thermal / load noise):
+
+|   bits  | release min_ns | pgo min_ns |  delta  |
+|:-------:|---------------:|-----------:|:-------:|
+|    256  |         7 416  |     7 895  |  +6.5 % |
+|    512  |        35 958  |    38 709  |  +7.6 % |
+|   1024  |       243 834  |   244 229  |  +0.2 % |
+|   1536  |       791 687  |   783 458  |  −1.0 % |
+|   1984  |     1 801 375  | 1 712 874  |  −4.9 % |
+|   2048  |     2 620 187  | 2 603 875  |  −0.6 % |
+|   4096  |    20 360 937  | 19 938 708 |  −2.1 % |
+
+At the cryptographic widths (1024+) the range is −5 % to +0.2 %.
+1984-bit is the only outright win; 2048/4096 are small wins
+below the run-to-run noise floor (observed ±3 % at these widths);
+1024 is a wash; 256/512 genuinely regressed, probably because the
+tiny-operand path lost layout priority to the multi-limb code.
+
+The expected-ceiling "1-3 %" hypothesis landed.  It just wasn't
+decisively above the noise floor, and it came with regressions
+elsewhere.
+
+#### Measured benefit — `hydra_bench` (microbenchmarks)
+
+Median of 5 reps, `--benchmark_min_time=0.2s`.  Headline shifts
+only:
+
+```
+[wins]
+chain/factorial/10           27.34  ->   11.53 ns   −57.84 %
+chain/factorial/20           63.76  ->   26.34 ns   −58.69 %
+chain/factorial/30          153.79  ->  137.07 ns   −10.87 %
+mul_karatsuba/2               5.02  ->    4.52 ns   −10.01 %
+mul_below_threshold/5        36.85  ->   35.11 ns    −4.73 %
+mul_below_threshold/9        57.10  ->   54.04 ns    −5.36 %
+mul_school/2                  3.76  ->    3.50 ns    −7.08 %
+mul_school/3                  6.10  ->    5.74 ns    −5.99 %
+
+[losses]
+chain/large_add/8            51.77  ->   66.95 ns   +29.32 %
+hydra/medium_add              7.13  ->    9.15 ns   +28.35 %
+hydra/widening_mul_128        1.32  ->    1.50 ns   +13.93 %
+hydra/small_mul               4.17  ->    4.54 ns    +8.89 %
+mul_school/8                 23.09  ->   24.00 ns    +3.96 %
+
+[wash]  (most of mul_dispatched, mul_karatsuba/4..64, mul_school/16..64)
+mul_karatsuba/16             85.79  ->   87.52 ns    +2.02 %
+mul_karatsuba/64           1205.44  -> 1219.34 ns    +1.15 %
+mul_school/64              1451.27  -> 1472.27 ns    +1.45 %
+```
+
+The factorial wins are real and were re-verified with 10 reps at
+`--benchmark_min_time=0.5s`.  They come from PGO recognising the
+hot small→medium→large kind-transition pattern and shortening the
+dispatch chain.  The microbench losses are also real (re-verified
+with 10 reps): PGO biases code layout toward the multi-limb hot
+path (which dominates the profile in absolute cycles) and the
+tiny-operand paths become the "cold" side of the branch-weight
+decision.
+
+#### Where PGO helped and why
+
+1. **Chain-shaped workloads with varying kinds.**  Factorial is
+   the cleanest case — the same function touches Small, Medium,
+   and Large across iterations, so the dispatch branch has genuine
+   entropy and PGO's edge weights actually inform inlining.  58 %
+   on factorial/10-20 is a layout + inlining win, not a kernel
+   win (the kernels are unchanged).
+2. **Very small multi-limb shapes** (mul_school/2-3,
+   mul_karatsuba/2).  These are boundary cases whose generated
+   code had unexercised branches under profile-blind `-O3`; PGO
+   prunes the cold sides.
+3. **1984-bit pow_mod.**  The one end-to-end width with a real
+   ~5 % win.  1984-bit Montgomery hits a slightly different
+   Karatsuba padding pattern than 2048 and benefits from block
+   reordering.  Not reproducible at 2048 itself.
+
+#### Where PGO hurt and why
+
+1. **Isolated microbenches for small-kind operations.**  `hydra/
+   medium_add` (+28 %), `hydra/small_mul` (+9 %), `hydra/
+   widening_mul_128` (+14 %).  These run a tight 2-3 ns op in a
+   harness loop.  During training, they execute tens of thousands
+   of times, but each call is so cheap that the total cycle
+   contribution is dominated by the multi-limb benchmarks.  PGO
+   reads that as "these paths are cold" and de-prioritises their
+   block layout / inlining.
+2. **`chain/large_add/8`** (+29 %) — likely the same reason: an
+   8-limb chain is a short hot loop whose cycle weight in the
+   profile is dwarfed by the 2048/4096-bit pow_mod calls.
+3. **Small/medium pow_mod widths** (256/512 +6-8 %).  Same story
+   at the headline-workload level.  These widths exercise shallow
+   code paths whose per-call cost is small relative to 1024+.
+
+The root cause in every case is the same: PGO believes what the
+profile tells it, and the profile says the multi-limb paths are
+where the cycles live.  Weighting the training corpus differently
+(e.g. running `hydra_bench --benchmark_min_time=1s` and
+`bench_pow_mod` at only 4096-bit) could shift the trade-off, but
+doing so would be overfitting to a specific benchmark — exactly
+what the sprint scope flagged as a guardrail.
+
+#### Friction observed
+
+1. **Google Benchmark's `-Werror=backend-plugin`.**  Vendored via
+   FetchContent with its own `-Werror` defaults.  Once PGO's use
+   pass runs over a fresh gbench build, hash-mismatch warnings
+   surface as errors.  Resolved by injecting
+   `-Wno-error=backend-plugin` / `-Wno-backend-plugin` under
+   `HYDRA_PGO_USE_FILE`.  This is a known PGO + vendored-bench
+   interaction; documented inline in `CMakeLists.txt`.
+2. **Profile noise at 256/512-bit.**  Small-width pow_mod timings
+   have cv ~ 5-10 % between runs (a single transient system
+   perturbation in a 50-sample median is visible).  The first
+   post-training PGO run showed 256-bit = 13 000 ns (vs 7 400 ns
+   baseline — a phantom +75 %) purely from post-training thermal
+   load.  Subsequent runs settled to 7 900 ns.  The min-of-5
+   reporting above is what actually reflects the code; a single-
+   shot comparison would have mis-diagnosed this as a catastrophe.
+3. **Stale-profile warnings during code edits.**  Any edit to
+   `hydra.hpp` (the bulk of the code) invalidates the .profdata.
+   Without `-Wno-profile-instr-out-of-date` every rebuild emits
+   thousands of warnings.  Documented, handled.
+
+#### Recommendation
+
+- **Do not adopt PGO as the default Release build.**  At the
+  headline pow_mod widths (1024/2048/4096) the delta is −2 % to
+  +0 % — not enough to justify the build-system complexity and
+  the microbench regressions.
+- **Keep `scripts/pgo_run.sh` in-tree** as an A/B measurement
+  tool, next to `HYDRA_AARCH64_ASM` from the previous sprint.  If
+  a future structural change (asm REDC, dual-chain REDC, Toom)
+  lands and needs a "does the compiler have anything else to say"
+  check, the workflow is one `./scripts/pgo_run.sh` away.
+- **Don't re-run PGO after minor code changes.**  The cost of a
+  fresh train (≈ 60 s) plus the measurement noise at small widths
+  means single-commit PGO deltas are rarely interpretable.  Only
+  rebuild the profile at sprint boundaries.
+
+#### Updated recommendation for the next sprint
+
+The 2026-04-18 arc (FIOS + threshold cleanup + asm null + PGO
+null) firmly closes the portable / compiler-driven lever set.
+The remaining slots in priority order are now:
+
+1. **Full-schoolbook asm (`mul_limbs_16x16_asm`).**  One asm call
+   per Karatsuba leaf (9 per 4096-bit Montgomery multiply) vs 72
+   per-row calls under the previous sprint's null-result kernel.
+   The seam moves the per-call overhead from 3-15 % of body time
+   to well under 1 %.  Low-medium confidence, ~3-5 % ceiling at
+   2048/4096-bit, bounded scope, built on the existing correctness
+   scaffolding in `hydra_mac_aarch64.S`.  **Promoted to slot 1.**
+2. **Dual-chain REDC for Karatsuba-backed Montgomery (k ≥ 32).**
+   REDC is the other O(k²) cost center at 2048/4096; a FIOS-style
+   dual-chain REDC is structurally analogous to the current
+   `mac_row_2` inner dual chain but applied at the Montgomery
+   reduction layer.  Medium confidence, ~5-10 % ceiling at 4096-
+   bit.  Bigger change than slot 1 but targets a cost center that
+   neither the asm nor PGO sprints reached.
+3. **Toom-Cook 3-way above k=64.**  Only helps 4096+.  Unchanged.
+4. **FIOS squaring with cross-term halving.**  Unchanged; non-
+   trivial correctness story.
+
+Slot 1 and slot 2 are both structural.  Either one is more
+likely to move end-to-end than another compiler-tuning pass
+would be.
+
 ---
 
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
