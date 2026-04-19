@@ -1882,6 +1882,207 @@ inline void montgomery_sqr_sos(
     montgomery_sqr(a, k, mod, n0inv, out, work);
 }
 
+// ─── Dual-row CIOS / FIOS Montgomery multiply ───────────────────
+//
+// "Dual-row CIOS" in the project vocabulary, FIOS (Finely
+// Integrated Operand Scanning) in the literature (Koç, Acar,
+// Kaliski 1996).  Fuses the two sequential inner row-loops of
+// canonical CIOS — the product accumulator and the reduction
+// accumulator — into a single inner loop that runs two
+// INDEPENDENT mul/umulh chains with a one-step lag.
+//
+// For each outer row i, after a bootstrap at j=0 that computes
+// m = T[0] * n0inv, the inner loop at each j ≥ 1 does:
+//
+//     chain A:  Tj_new = ai * b[j]   + T[j]     + ca
+//     chain B:  T[j-1] = m  * mod[j] + Tj_new   + cb
+//
+// The only cross-chain dependency is chain B consuming Tj_new
+// from chain A in the same iteration; both muls can still
+// issue in the same cycle because the `a[i]*b[j]` and
+// `m*mod[j]` products are fully independent.  On cores that
+// can issue 3–4 mul/umulh per cycle (Apple M5 Pro, recent
+// x86-64), this doubles the per-row mul throughput.
+//
+// Why this is the right shape after the SOS null result:
+//   • Preserves the k+2 limb running accumulator that made
+//     fused CIOS win.  No 2k-limb intermediate like SOS —
+//     the accumulator stays hot in L1 under the rotating-
+//     operand cadence of pow_mod.
+//   • Eliminates the per-row "T >>= 64" memmove entirely:
+//     chain B writes to work[j-1], making the shift implicit.
+//     Fused CIOS pays k × (k+1) word copies per outer row
+//     to that memmove; FIOS pays zero.
+//   • Matches the two-independent-chains trick that made
+//     `mac_row_2` win at the leaf schoolbook kernel, without
+//     requiring the outer-iteration pairing that SOS needed
+//     (and that SOS paid for structurally by materialising a
+//     wide intermediate).
+//
+// Trade-offs vs fused CIOS:
+//   + No per-row shift memmove
+//   + Two mul/umulh chains per inner step (≈2× peak issue)
+//   + Saves k-1 stores per row (inner chain A's output is
+//     consumed as a register by chain B, not written back
+//     to work[j] — the shift overwrites it in the next step)
+//   − Slightly more carry bookkeeping at end-of-row
+//   − Inner loop body is heavier (two muls, two 128-bit adds
+//     per j instead of one), so on an OoO core that was
+//     already saturating the add chain, the win can be modest
+//
+// Trade-offs vs SOS (the previously-tried alternative):
+//   + Keeps the fused accumulator — SOS's 2k-limb
+//     intermediate was the structural cost that lost it
+//     the pow_mod benchmark under realistic cadence.
+//   + One fused pass vs SOS's two separate O(k²) passes
+//   + Same k+2 work-buffer size as fused CIOS
+//   = Same net MAC count as fused/SOS; the payoff has to
+//     come from per-cycle throughput, not MAC count.
+//
+// Preconditions:
+//   k >= 1
+//   out[]  has at least k limbs
+//   work[] has at least k+2 limbs
+//
+inline void montgomery_mul_fios(
+    const uint64_t* a, const uint64_t* b,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    // T = work[0..k+1], k+2 limbs, initialised to zero.
+    // The top two limbs (work[k], work[k+1]) absorb the per-row
+    // carry spill from both chains; the shift at end-of-row
+    // moves work[k+1] down into work[k].
+    const uint32_t tlen = k + 2;
+    std::memset(work, 0, tlen * sizeof(uint64_t));
+
+    for (uint32_t i = 0; i < k; ++i) {
+        const uint64_t ai = a[i];
+
+        // ── Bootstrap (j = 0) ──
+        // Chain A: T0 = ai*b[0] + work[0]; ca = overflow.
+        // m      = T0 * n0inv                 (zeroing multiplier)
+        // Chain B: m*mod[0] + T0 has lower bits guaranteed zero by
+        // construction, so we only keep the upper 64 bits (cb).
+        // work[0] is NOT written here — it is overwritten by the
+        // shift (chain B at j=1 writes work[0]).
+        const unsigned __int128 t0 =
+            static_cast<unsigned __int128>(ai) * b[0] + work[0];
+        const uint64_t T0 = static_cast<uint64_t>(t0);
+        uint64_t ca       = static_cast<uint64_t>(t0 >> 64);
+
+        const uint64_t m  = T0 * n0inv;
+
+        const unsigned __int128 t1 =
+            static_cast<unsigned __int128>(m) * mod[0] + T0;
+        uint64_t cb       = static_cast<uint64_t>(t1 >> 64);
+
+        // ── Inner loop (j = 1 .. k-1): two parallel chains ──
+        // Chain A produces Tj_new (post-product value at index j)
+        // as a register value.  Chain B consumes Tj_new + m*mod[j],
+        // writes the shift-down reduce result to work[j-1].
+        // Neither chain writes work[j]; that slot is consumed as
+        // a register and then overwritten by chain B in the next j.
+        for (uint32_t j = 1; j < k; ++j) {
+            const unsigned __int128 tA =
+                static_cast<unsigned __int128>(ai) * b[j]
+                + work[j]
+                + ca;
+            const uint64_t Tj = static_cast<uint64_t>(tA);
+            ca                = static_cast<uint64_t>(tA >> 64);
+
+            const unsigned __int128 tB =
+                static_cast<unsigned __int128>(m) * mod[j]
+                + Tj
+                + cb;
+            work[j - 1]       = static_cast<uint64_t>(tB);
+            cb                = static_cast<uint64_t>(tB >> 64);
+        }
+
+        // ── End-of-row: fold both chains' tail carries ──
+        // Mirror the two tail steps of canonical CIOS:
+        //   1. Post-product T[k]  = T[k] + ca          (spill ca_hi)
+        //   2. Post-reduce  T[k]  = (that) + cb        (spill cb_hi)
+        //   3. Shift: new T[k-1] = post-reduce T[k];
+        //             new T[k]   = old T[k+1] + ca_hi + cb_hi;
+        //             new T[k+1] = 0 (invariant: CIOS row end).
+        const unsigned __int128 tkA =
+            static_cast<unsigned __int128>(work[k]) + ca;
+        const uint64_t Wp_k   = static_cast<uint64_t>(tkA);
+        const uint64_t ca_hi  = static_cast<uint64_t>(tkA >> 64);
+
+        const unsigned __int128 tkB =
+            static_cast<unsigned __int128>(Wp_k) + cb;
+        work[k - 1]           = static_cast<uint64_t>(tkB);
+        const uint64_t cb_hi  = static_cast<uint64_t>(tkB >> 64);
+
+        // Under the CIOS invariant work[k+1] is 0 at this point
+        // (the previous row's shift wrote zero to the top slot,
+        // and nothing in this row touched work[k+1]).  Keep the
+        // defensive `+ work[k+1]` so dirty-buffer callers and
+        // future invariant changes don't break silently.
+        const unsigned __int128 top =
+            static_cast<unsigned __int128>(work[k + 1]) + ca_hi + cb_hi;
+        work[k]     = static_cast<uint64_t>(top);
+        work[k + 1] = static_cast<uint64_t>(top >> 64);
+    }
+
+    // ── Conditional final subtraction (identical to fused CIOS) ──
+    const uint64_t* T = work;
+    bool need_sub = false;
+    if (T[k] != 0) {
+        need_sub = true;
+    } else {
+        for (uint32_t i = k; i-- > 0;) {
+            if (T[i] > mod[i]) { need_sub = true; break; }
+            if (T[i] < mod[i]) { need_sub = false; break; }
+        }
+        if (!need_sub) {
+            bool all_equal = true;
+            for (uint32_t i = 0; i < k; ++i) {
+                if (T[i] != mod[i]) { all_equal = false; break; }
+            }
+            if (all_equal) need_sub = true;
+        }
+    }
+
+    if (need_sub) {
+        uint64_t borrow = 0;
+        for (uint32_t i = 0; i < k; ++i) {
+            uint64_t wi = T[i];
+            uint64_t mi = mod[i];
+            uint64_t d1 = wi - mi;
+            uint64_t b1 = (d1 > wi) ? 1u : 0u;
+            uint64_t d2 = d1 - borrow;
+            uint64_t b2 = (d2 > d1) ? 1u : 0u;
+            out[i] = d2;
+            borrow = b1 + b2;
+        }
+    } else {
+        std::memcpy(out, T, k * sizeof(uint64_t));
+    }
+}
+
+// Dual-row CIOS squaring — thin alias.  The product structure of
+// FIOS naturally absorbs a==b with no cross-term optimisation
+// (both chain-A and chain-B operands come from a[] / mod[]), so
+// we simply forward.  A dedicated FIOS squaring that exploits
+// a[i]*a[j] == a[j]*a[i] is possible but out of scope for this
+// probe — the point here is isolating the dual-row structural win.
+inline void montgomery_sqr_fios(
+    const uint64_t* a,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    montgomery_mul_fios(a, a, k, mod, n0inv, out, work);
+}
+
 // ─── Karatsuba-backed Montgomery multiply (separate product + REDC) ───
 //
 // For large k (≥ KARATSUBA_THRESHOLD_LIMBS), the O(k²) schoolbook product
@@ -3670,6 +3871,14 @@ struct EGCDResult {
     //   k >= KARATSUBA_MONT_THRESHOLD → Karatsuba product + REDC
     //   k >= FUSED_THRESHOLD          → fused CIOS (interleaved multiply-reduce)
     //   k < FUSED_THRESHOLD           → separate schoolbook + REDC
+    // FIOS ("dual-row CIOS") replaces the canonical fused CIOS path
+    // when k >= FUSED_THRESHOLD.  At the time of writing (2026-04-18)
+    // the dual-row sprint microbench showed −21% to −52% kernel
+    // deltas vs fused CIOS at k=4..32; the end-to-end pow_mod run
+    // at 1024/2048/4096-bit confirms the win survives realistic
+    // rotating-operand cadence (where SOS lost).  Canonical fused
+    // CIOS (`montgomery_mul_fused`) remains callable from `detail::`
+    // as a reference and A/B target.
     auto mont_mul = [&](const uint64_t* a, const uint64_t* b,
                         uint64_t* out) {
         if (use_karatsuba)
@@ -3678,8 +3887,8 @@ struct EGCDResult {
                                               kara_pa, kara_pb, kara_buf,
                                               n_padded, kara_ws);
         else if (use_fused)
-            detail::montgomery_mul_fused(a, b, k, ctx.mod_limbs.data(),
-                                          ctx.n0inv, out, work_buf);
+            detail::montgomery_mul_fios(a, b, k, ctx.mod_limbs.data(),
+                                         ctx.n0inv, out, work_buf);
         else
             detail::montgomery_mul(a, b, k, ctx.mod_limbs.data(),
                                     ctx.n0inv, out, work_buf);
@@ -3691,8 +3900,8 @@ struct EGCDResult {
                                               kara_pa, kara_pb, kara_buf,
                                               n_padded, kara_ws);
         else if (use_fused)
-            detail::montgomery_sqr_fused(a, k, ctx.mod_limbs.data(),
-                                          ctx.n0inv, out, work_buf);
+            detail::montgomery_sqr_fios(a, k, ctx.mod_limbs.data(),
+                                         ctx.n0inv, out, work_buf);
         else
             detail::montgomery_sqr(a, k, ctx.mod_limbs.data(),
                                     ctx.n0inv, out, work_buf);

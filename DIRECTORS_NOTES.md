@@ -2981,4 +2981,224 @@ row's shape.
 
 ---
 
+### Dual-Row CIOS / FIOS Montgomery Kernel
+
+_Implemented 2026-04-18 — Claude Opus 4.7_
+_Status: **shipped** — now the default dispatch for k=8..31
+(512-bit through 1984-bit pow_mod)._
+
+#### Hypothesis (carried forward from the SOS null result)
+
+The prior sprint confirmed that **SOS restructuring** was the wrong
+way to expose `mac_row_2`-style dual-chain throughput to Montgomery
+at k=8..31: materialising the 2k-limb intermediate cost more than
+the dual-row kernel could save under pow_mod's rotating-operand
+cadence.  The "Updated recommendation" at the bottom of that dragon
+named the next experiment: **preserve the fused (k+2) accumulator,
+but change the row-loop shape** so two independent mul/umulh chains
+issue per inner step.
+
+That shape is FIOS (Finely Integrated Operand Scanning — Koç/Acar/
+Kaliski 1996), which in the project vocabulary is "dual-row CIOS".
+
+#### Algorithm: FIOS
+
+Canonical fused CIOS runs two sequential inner loops per outer row:
+
+```
+for i in 0..k-1:
+    # product: one chain
+    for j in 0..k-1:  T[j] += a[i]*b[j] + carry
+    m = T[0] * n0inv
+    # reduce: one chain
+    for j in 0..k-1:  T[j] += m*mod[j] + carry    # T[0] becomes 0
+    T >>= 64                                      # memmove
+```
+
+FIOS merges the two inner loops into one, running both chains with
+a one-step lag:
+
+```
+for i in 0..k-1:
+    # bootstrap (j=0): one of each chain, serial, to compute m
+    T0 = a[i]*b[0] + T[0]                         # ca
+    m  = T0 * n0inv
+    t  = m*mod[0] + T0                            # cb   (lower bits = 0)
+
+    for j in 1..k-1:
+        Tj      = a[i]*b[j] + T[j] + ca           # chain A (product)
+        T[j-1]  = m*mod[j]   + Tj   + cb          # chain B (reduce, shifted)
+
+    # end-of-row: fold ca, cb into T[k], T[k+1]; shift implicit above.
+```
+
+The only cross-chain dependency is chain B consuming `Tj` from chain
+A in the same iteration; the two mul/umulh pairs are independent and
+can issue in parallel.  Chain B's write to `T[j-1]` makes the shift
+implicit — no per-row memmove, which canonical CIOS pays at
+`k × (k+1)` word-copies per row.
+
+#### Why this was the right shape after SOS
+
+The SOS dragon named three things to preserve:
+
+1. The `k+2` running-accumulator locality.  FIOS keeps `work[0..k+1]`
+   identical to fused — same k+2 limb footprint, same cache residency.
+2. No wide intermediate that evicts other pow_mod state.  FIOS does
+   not materialise a 2k-limb product.
+3. Single fused pass per row.  FIOS stays in one pass.
+
+What it adds on top: two mul/umulh chains per inner step, matching
+the `mac_row_2` trick but **without** requiring outer-iteration
+pairing (which would hit the same m-depends-on-T[0] serialisation
+that killed a cleaner row-pair design).
+
+#### What was built
+
+Two new primitives in `detail::` (right after the SOS block so the
+code order reads as: fused → mul → sqr → SOS → FIOS → Karatsuba):
+
+- `montgomery_mul_fios(a, b, k, mod, n0inv, out, work)` — k+2 work
+  limbs, requires k ≥ 1.
+- `montgomery_sqr_fios(a, k, …)` — thin alias to `montgomery_mul_fios
+  (a, a, …)`; no dedicated cross-term halving (out of scope for this
+  probe; the point was to isolate the dual-row structural win).
+
+Tests added in `hydra_test.cpp` (modelled on the SOS test suite):
+
+- `test_fios_mont_mul_vs_fused_sweep` — k = 1, 2, 3, 4, 8, 12, 16,
+  24, 31 cross-check against the prior dispatch winner at each k.
+- `test_fios_mont_mul_carry_adversarial` — `(mod-1)²` operands at
+  every carry-stress k; exercises the two-chain carry pipeline.
+- `test_fios_mont_mul_dirty_work_buffer` — pre-fills `work[]` with
+  `0xBADC0FFEE0DDF00D`.
+- `test_fios_mont_sqr_cross` — FIOS squaring vs fused squaring at
+  every carry-stress k.
+
+All tests pass (917 total, including the new FIOS cases).
+
+#### Measurement
+
+`bench/probe_mont_fios.cpp` — kernel-level A/B, fixed operands:
+
+| k  | `montgomery_mul_fused` | `montgomery_mul_fios` | Δ       |
+|---:|-----------------------:|----------------------:|--------:|
+|  4 |               44.6 ns  |              21.4 ns  | **−52 %** |
+|  6 |               60.6 ns  |              36.0 ns  | **−41 %** |
+|  8 |               83.3 ns  |              54.4 ns  | **−35 %** |
+| 12 |              134.4 ns  |             103.0 ns  | **−23 %** |
+| 16 |              235.9 ns  |             181.6 ns  | **−23 %** |
+| 24 |              591.3 ns  |             425.2 ns  | **−28 %** |
+| 31 |             1049.3 ns  |             826.5 ns  | **−21 %** |
+| 32 |             1111.0 ns  |             869.1 ns  | **−22 %** |
+
+End-to-end `bench_pow_mod` (min-of-6 runs, 50-sample median per run):
+
+| bits | k  | fused_pow_mod | fios_pow_mod | Δ        |
+|-----:|---:|--------------:|-------------:|---------:|
+|  256 |  4 |      9.67 µs  |     9.60 µs  |    −1 %  |
+|  512 |  8 |     52.06 µs  |    35.35 µs  | **−32 %**|
+| 1024 | 16 |    309.23 µs  |   232.33 µs  | **−25 %**|
+| 1536 | 24 |      1.14 ms  |   775.35 µs  | **−32 %**|
+| 1984 | 31 |      2.51 ms  |     1.78 ms  | **−29 %**|
+| 2048 | 32 |      2.59 ms  |     2.59 ms  |     0 %  |
+| 4096 | 64 |     19.93 ms  |    20.08 ms  |    +1 %  |
+
+**1024-bit moved materially** (the target the prior sprint missed):
+−25 % end-to-end.  256-bit is unchanged because the dispatch still
+routes k < 8 through separate-schoolbook+REDC.  2048/4096-bit are
+unchanged because those use Karatsuba+REDC, which FIOS does not
+touch.
+
+The structural contrast with SOS is the whole story: SOS had
+kernel-probe wins of 7–35 % at k=4..31 (fixed operands) that
+**inverted to +4 % to +30 % regressions** under pow_mod cadence —
+because the 2k-limb working set broke L1 residency across
+`mont_mul`/`mont_sqr` calls.  FIOS wins by 21–52 % on the kernel
+probe **and** carries the win end-to-end, precisely because it
+doesn't materialise a wider buffer.
+
+#### What moved
+
+- Dispatch in `pow_mod_montgomery` now calls `montgomery_mul_fios`
+  / `montgomery_sqr_fios` for the `use_fused` band (k=8..31).
+  `montgomery_mul_fused` / `montgomery_sqr_fused` stay in-tree as
+  callable alternates and serve as the A-side for future A/B probes.
+- `perf_snapshot.md` reflects the new pow_mod table (512/1024/1536/
+  1984-bit columns all moved; 256/2048/4096 unchanged).
+- The SOS primitives remain in-tree; they were never on the default
+  dispatch, and nothing about FIOS invalidates their correctness.
+
+#### Why fused-only callers still benefit from keeping the old path
+
+`montgomery_mul_fused` is still the canonical CIOS reference used
+by:
+
+- the new FIOS unit tests (`test_fios_mont_mul_vs_fused_sweep`,
+  `test_fios_mont_mul_carry_adversarial`, `test_fios_mont_mul_dirty
+  _work_buffer`),
+- the existing SOS unit tests (same reference role),
+- `bench/probe_mont_sos.cpp` and `bench/probe_mont_fios.cpp` as the
+  A-side comparator.
+
+Deleting it would force every future Montgomery experiment to
+re-derive a known-correct baseline.  Cost of keeping it: one
+inline function, zero runtime overhead (never called on the
+dispatch path).
+
+#### What this sprint *learned* (worth banking)
+
+1. **Fused accumulator locality is the tightest Montgomery invariant
+   at k ≤ 31.**  Both SOS (lost) and FIOS (won) confirm the same
+   thing from opposite sides: the restructuring that preserves `k+2`
+   limbs wins, the one that doesn't loses.  Any future portable
+   Montgomery lever must preserve this or have an extremely good
+   reason not to.
+2. **Two mul/umulh chains per inner step is worth ~20–30 % end-to-end
+   when the chains share no memory.**  FIOS's chains share only one
+   register-carried value (`Tj`) per iteration, so the M5 Pro's
+   4-wide MUL issue isn't bottlenecked on memory ordering — hence
+   the win survives cache-cadence workloads.
+3. **Portable C++ is enough to close a ~30 % gap at 1024-bit.**  The
+   FIOS kernel is pure `unsigned __int128` with no NEON intrinsics
+   and no inline asm; Clang-19 on Apple M5 Pro schedules the two
+   chains well.  Future inline-asm work should be measured against
+   FIOS, not against canonical fused CIOS — the remaining gap is
+   smaller than it was an hour ago.
+
+#### Updated recommendation for next sprint
+
+Ranked by confidence-of-win, **after** FIOS landed:
+
+1. **`FUSED_THRESHOLD` sweep down from 8.**  The FIOS kernel probe
+   shows −52 % / −41 % at k=4/6 vs fused CIOS, but dispatch at those
+   k's still uses separate-schoolbook+REDC (`montgomery_mul`).  If
+   FIOS also beats `montgomery_mul` at k=4..7 — unmeasured — lowering
+   `FUSED_THRESHOLD` is a nearly-free win at 256/384-bit.  A day's work.
+2. **Hand-tuned aarch64 `mul_limbs_base` (inline asm)** — still the
+   highest-ceiling remaining lever for 2048+ Karatsuba+REDC widths,
+   but the expected 1024-bit win shrinks from 10–15 % to "whatever
+   is left after FIOS," which is probably 5–10 %.  Demoted from slot
+   1 to slot 2.
+3. **PGO side quest.**  Compile with `-fprofile-generate`, run
+   `bench_pow_mod`, rebuild with `-fprofile-use`.  Low ceiling
+   (a few % at most) but cheap to try; could land in the same
+   week as slot 1.
+4. **Dual-chain REDC for Karatsuba-backed Montgomery (k ≥ 32).**
+   The Karatsuba path still uses the sequential `montgomery_redc`
+   for its reduction phase.  An analogous dual-chain REDC could
+   give a modest win at 2048/4096-bit; but the effective ILP
+   benefit is smaller there because the product phase (Karatsuba)
+   already dominates the cost at those widths.  Medium confidence;
+   worth scoping only after slots 1–3.
+5. **Toom-Cook 3-way above k=64.**  Unchanged — only helps 4096+,
+   still deferred.
+
+This sprint probably **exhausted the last obvious portable
+Montgomery lever at k=8..31**.  Everything from here either
+re-targets a different k band (slot 1: k < 8; slot 4: k ≥ 32) or
+leaves portable-C++ territory (slot 2: inline asm).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

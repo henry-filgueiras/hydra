@@ -681,7 +681,7 @@ int main(int argc, char** argv) {
     }
 
     // Target widths
-    const uint32_t widths[] = { 256, 512, 1024, 2048, 4096 };
+    const uint32_t widths[] = { 256, 512, 1024, 1536, 1984, 2048, 4096 };
     const int n_widths = sizeof(widths) / sizeof(widths[0]);
 
     // Banner to stderr (doesn't pollute stdout data)
@@ -697,7 +697,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, " | OpenSSL");
 #endif
     fprintf(stderr, "\n");
-    fprintf(stderr, "Widths: 256, 512, 1024, 2048, 4096 bits\n");
+    fprintf(stderr, "Widths: 256, 512, 1024, 1536, 1984, 2048, 4096 bits\n");
     fprintf(stderr, "Samples per width: %d (+ %d warmup)\n\n", SAMPLE_COUNT, WARMUP_ITERS);
 
     std::vector<BenchRow> rows;

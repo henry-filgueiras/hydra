@@ -3339,6 +3339,166 @@ static void test_sos_mont_sqr_cross() {
     }
 }
 
+// ─── Dual-row CIOS / FIOS Montgomery kernel tests ──────────────────
+//
+// montgomery_mul_fios fuses the product and reduction row-loops of
+// fused CIOS into a single inner loop with two independent mul/umulh
+// chains.  These tests pin algebraic equivalence to the canonical
+// fused path at the k values where FIOS would replace it (k >= 1),
+// including the carry-stress widths that broke SOS earlier.
+//
+static void test_fios_mont_mul_vs_fused_sweep() {
+    std::mt19937_64 rng(0xF105000A1ull);
+    for (uint32_t k : {1u, 2u, 3u, 4u, 8u, 12u, 16u, 24u, 31u}) {
+        std::vector<uint64_t> mod(k), a(k), b(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1u;
+        mod[k - 1] |= (1ull << 63);
+        for (auto& l : a) l = rng();
+        for (auto& l : b) l = rng();
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_ref(k), work_ref(k + 2, 0);
+        if (k >= 8) {
+            hydra::detail::montgomery_mul_fused(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_wide(2 * k + 1, 0);
+            hydra::detail::montgomery_mul(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_wide.data());
+        }
+
+        std::vector<uint64_t> out_fios(k), work_fios(k + 2, 0);
+        hydra::detail::montgomery_mul_fios(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_fios.data(), work_fios.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_fios[i]) { match = false; break; }
+        }
+        std::string label = "fios mont_mul vs reference at k=" +
+                            std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
+static void test_fios_mont_mul_carry_adversarial() {
+    // (mod-1)² operands — drives the two-chain carry pipeline to
+    // its structural maximum.  Exactly the shape that breaks shift-
+    // and-fold bugs, where FIOS's shift-is-implicit design differs
+    // most from canonical CIOS.
+    for (uint32_t k : {1u, 2u, 4u, 8u, 16u, 24u}) {
+        std::vector<uint64_t> mod(k), a(k), b(k);
+        for (auto& l : mod) l = ~uint64_t{0};
+        mod[0] -= 2;
+        for (uint32_t i = 0; i < k; ++i) { a[i] = mod[i]; b[i] = mod[i]; }
+        a[0] -= 1; b[0] -= 1;
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_ref(k);
+        if (k >= 8) {
+            std::vector<uint64_t> work_ref(k + 2, 0);
+            hydra::detail::montgomery_mul_fused(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_ref(2 * k + 1, 0);
+            hydra::detail::montgomery_mul(
+                a.data(), b.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        }
+
+        std::vector<uint64_t> out_fios(k), work_fios(k + 2, 0);
+        hydra::detail::montgomery_mul_fios(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_fios.data(), work_fios.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_fios[i]) { match = false; break; }
+        }
+        std::string label = "fios mont_mul adversarial (mod-1)² at k=" +
+                            std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
+static void test_fios_mont_mul_dirty_work_buffer() {
+    // FIOS memsets work[0..k+1] on entry like fused CIOS.  Pre-fill
+    // with garbage to confirm no initial-state read bug slipped in.
+    const uint32_t k = 16;
+    std::mt19937_64 rng(0xF105000DDull);
+    std::vector<uint64_t> mod(k), a(k), b(k);
+    for (auto& l : mod) l = rng();
+    mod[0] |= 1u;
+    mod[k - 1] |= (1ull << 63);
+    for (auto& l : a) l = rng();
+    for (auto& l : b) l = rng();
+    uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+    std::vector<uint64_t> out_ref(k), work_ref(k + 2, 0);
+    hydra::detail::montgomery_mul_fused(
+        a.data(), b.data(), k, mod.data(),
+        n0inv, out_ref.data(), work_ref.data());
+
+    std::vector<uint64_t> out_fios(k), work_fios(k + 2);
+    for (auto& l : work_fios) l = 0xBADC0FFEE0DDF00Dull;
+    hydra::detail::montgomery_mul_fios(
+        a.data(), b.data(), k, mod.data(),
+        n0inv, out_fios.data(), work_fios.data());
+
+    bool match = true;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (out_ref[i] != out_fios[i]) { match = false; break; }
+    }
+    CHECK(match, "fios mont_mul tolerates dirty work buffer at k=16");
+}
+
+static void test_fios_mont_sqr_cross() {
+    // FIOS squaring forwards to montgomery_mul_fios(a, a, ...) — no
+    // dedicated cross-term halving.  Verify this matches the canonical
+    // squaring output at carry-stress widths.
+    std::mt19937_64 rng(0xF10505A1ull);
+    for (uint32_t k : {2u, 4u, 8u, 16u, 24u}) {
+        std::vector<uint64_t> mod(k), a(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1u;
+        mod[k - 1] |= (1ull << 63);
+        for (auto& l : a) l = rng();
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_ref(k);
+        if (k >= 8) {
+            std::vector<uint64_t> work_ref(k + 2, 0);
+            hydra::detail::montgomery_sqr_fused(
+                a.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        } else {
+            std::vector<uint64_t> work_ref(2 * k + 1, 0);
+            hydra::detail::montgomery_sqr(
+                a.data(), k, mod.data(),
+                n0inv, out_ref.data(), work_ref.data());
+        }
+
+        std::vector<uint64_t> out_fios(k), work_fios(k + 2, 0);
+        hydra::detail::montgomery_sqr_fios(
+            a.data(), k, mod.data(),
+            n0inv, out_fios.data(), work_fios.data());
+
+        bool match = true;
+        for (uint32_t i = 0; i < k; ++i) {
+            if (out_ref[i] != out_fios[i]) { match = false; break; }
+        }
+        std::string label = "fios mont_sqr vs fused at k=" + std::to_string(k);
+        CHECK(match, label.c_str());
+    }
+}
+
 static void test_sos_pow_mod_dispatch_widths() {
     // End-to-end pow_mod at the widths the SOS path now owns
     // (256/512/1024/1536-bit).  Cross-check against the naive divisor
@@ -3746,6 +3906,12 @@ int main() {
     test_sos_mont_mul_dirty_work_buffer();
     test_sos_mont_sqr_cross();
     test_sos_pow_mod_dispatch_widths();
+
+    // Dual-row CIOS / FIOS Montgomery tests
+    test_fios_mont_mul_vs_fused_sweep();
+    test_fios_mont_mul_carry_adversarial();
+    test_fios_mont_mul_dirty_work_buffer();
+    test_fios_mont_sqr_cross();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

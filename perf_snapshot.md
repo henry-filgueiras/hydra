@@ -3,30 +3,60 @@
 Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
 > Current state after the **scratch-workspace** (pow_mod allocator removal),
-> **dual-row schoolbook leaf kernel**, and **SOS Montgomery null-result**
-> sprints.  No `pow_mod` numbers moved in the SOS sprint; the SOS primitives
-> ship as callable alternates in `detail::` but the default dispatch still
-> uses fused CIOS for k=8..31 because the SOS structure costs more
-> end-to-end than fused CIOS in that range.  See `DIRECTORS_NOTES.md` for
-> hypothesis / design / rationale history.
+> **dual-row schoolbook leaf kernel**, **SOS Montgomery null-result**, and
+> **dual-row CIOS / FIOS** sprints.  `pow_mod` at every width in the
+> fused-CIOS band (k=8..31, i.e. 512-bit through 1984-bit) moved
+> materially in the FIOS sprint; the canonical fused CIOS
+> (`montgomery_mul_fused`) now stays in-tree as a reference and is
+> called as the benchmark A-side for future experiments, but dispatch
+> routes through `montgomery_mul_fios` instead.  Karatsuba-backed
+> widths (k ≥ 32, 2048-bit and 4096-bit) and the sub-fused band
+> (k < 8, 256-bit) were not touched and are unchanged.
+> See `DIRECTORS_NOTES.md` for hypothesis / design / rationale history.
 
 ---
 
 ### pow_mod — Modular Exponentiation
 
-_10-run median; `bench_pow_mod --json`_
+_Min-of-6 runs, 50-sample median per run; `bench_pow_mod --markdown`_
 
-| Width | Hydra     | GMP      | OpenSSL  | Hydra / GMP | Hydra / OpenSSL |
-|------:|----------:|---------:|---------:|------------:|----------------:|
-|   256 |   9.98 µs |  7.33 µs |  5.40 µs |       1.36× |           1.85× |
-|   512 |  51.63 µs | 27.58 µs | 20.54 µs |       1.87× |           2.51× |
-|  1024 | 317.15 µs | 161.40 µs | 127.90 µs |     1.96× |           2.48× |
-|  2048 |  2.71 ms  |  1.11 ms |  0.79 ms |       2.42× |           3.43× |
-|  4096 | 20.09 ms  |  7.69 ms |  5.92 ms |       2.62× |           3.40× |
+| Width | Hydra (FIOS) | Hydra (was)  | Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
+|------:|-------------:|-------------:|-----------:|----------:|----------:|------------:|----------------:|
+|   256 |    9.60 µs   |    9.67 µs   |      −1 %  |  7.21 µs  |  5.29 µs  |       1.33× |           1.82× |
+|   512 |   35.35 µs   |   52.06 µs   |     −32 %  | 27.58 µs  | 19.00 µs  |       1.28× |           1.86× |
+|  1024 |  232.33 µs   |  309.23 µs   |     −25 %  | 152.63 µs | 109.75 µs |       1.52× |           2.12× |
+|  1536 |  775.35 µs   |    1.14 ms   |     −32 %  | 461.67 µs | 336.75 µs |       1.68× |           2.30× |
+|  1984 |    1.78 ms   |    2.51 ms   |     −29 %  |   1.03 ms |   1.65 ms |       1.73× |           1.08× |
+|  2048 |    2.59 ms   |    2.59 ms   |       0 %  |   1.09 ms |  782.9 µs |       2.38× |           3.31× |
+|  4096 |   20.08 ms   |   19.93 ms   |      +1 %  |   7.47 ms |   5.82 ms |       2.69× |           3.45× |
 
-_2048/4096-bit improved by −16.6 % / −15.9 % in the dual-row sprint.
-Below k ≥ 32 (2048-bit) Hydra stays on the fused-CIOS path, untouched
-by the recent sprints._
+_1024-bit moved from −1.96× to −1.52× vs GMP (from +96 % to +52 % gap); 1536
+and 1984 gained similarly.  Karatsuba-backed widths (2048/4096) unchanged.
+256-bit is below `FUSED_THRESHOLD = 8` and stays on the separate
+schoolbook + REDC path, untouched by this sprint._
+
+---
+
+### Montgomery kernel A/B (fixed operands, no pow_mod rotation)
+
+_`build-rel/probe_mont_fios`, median of warmup+hot reps at each k._
+
+| k  | `montgomery_mul_fused` | `montgomery_mul_fios` | Δ fios / fused |
+|---:|-----------------------:|----------------------:|---------------:|
+|  4 |               44.6 ns  |              21.4 ns  |        −52 %   |
+|  6 |               60.6 ns  |              36.0 ns  |        −41 %   |
+|  8 |               83.3 ns  |              54.4 ns  |        −35 %   |
+| 12 |              134.4 ns  |             103.0 ns  |        −23 %   |
+| 16 |              235.9 ns  |             181.6 ns  |        −23 %   |
+| 24 |              591.3 ns  |             425.2 ns  |        −28 %   |
+| 31 |             1049.3 ns  |             826.5 ns  |        −21 %   |
+| 32 |             1111.0 ns  |             869.1 ns  |        −22 %   |
+
+_The k=4 and k=6 entries show FIOS's structural advantage over fused
+CIOS at small widths — but dispatch at those k's routes through
+`montgomery_mul` (separate schoolbook + REDC), not fused, so the
+kernel win does not translate to the end-to-end 256-bit column.
+Whether to lower `FUSED_THRESHOLD` below 8 is a potential follow-up._
 
 ---
 
@@ -76,22 +106,28 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
-### Hot-path hotspots after the last three sprints
+### Hot-path hotspots after the FIOS sprint
 
-1. **CIOS Montgomery row loop** — still the dominant cost at 1024-bit
-   (k=16), where Karatsuba doesn't engage.  The SOS sprint
-   (2026-04-18) confirmed that restructuring the multiply phase to
-   reuse `mac_row_2` does *not* help — fused CIOS is structurally
-   tighter at k=8..31 (smaller working set, single accumulator stays
-   in L1).  Remaining options are inline asm on the row loop or a
-   dual-row CIOS variant that keeps the fused accumulator.  See the
-   "Dragon — SOS Montgomery (Null Result)" entry in
-   `DIRECTORS_NOTES.md`.
-2. **Schoolbook leaf at k=16** — the dual-row kernel at n=16 shows
-   only a −3 % delta vs. the old scalar (whereas k=32 / k=64 are −40 %).
-   Compiler auto-vectorization of the baseline narrows the gap.
-   Marginal interest — maybe addressable via explicit 4-row unroll.
-3. **mul_general dispatch overhead at k=32** — Karatsuba path is
+1. **Sub-fused band (k < 8, 256-bit) separate schoolbook + REDC** —
+   still the dominant cost at 256-bit.  The FIOS kernel probe shows
+   the dual-row structure would also help at k=4,6 (−52 % / −41 %
+   vs fused CIOS), but the current dispatch routes k < 8 through
+   `montgomery_mul` (separate schoolbook + REDC), not FIOS.  Whether
+   to lower `FUSED_THRESHOLD` below 8 depends on FIOS also beating
+   the separate path at k=4,6 — not yet measured.
+2. **Karatsuba-backed Montgomery REDC (k ≥ 32, 2048+)** — after FIOS
+   moved the fused band, the 2048/4096-bit columns are unchanged
+   and GMP/OpenSSL gaps there remain the largest deltas
+   (Hydra/OpenSSL ≈ 3.3–3.5×).  The REDC phase of Karatsuba-backed
+   Montgomery still uses the sequential `montgomery_redc` word-by-
+   word reduce.  A "dual-chain REDC" analogous to FIOS's reduce half
+   is a candidate follow-up.
+3. **Schoolbook leaf at k=16** — the dual-row leaf kernel at n=16
+   shows only a −3 % delta vs. the old scalar (whereas k=32 / k=64
+   are −40 %).  Compiler auto-vectorization of the baseline narrows
+   the gap.  Largely superseded as a pow_mod bottleneck by the FIOS
+   win, but still marginal interest for raw `Hydra * Hydra` at 1024-bit.
+4. **`mul_general` dispatch overhead at k=32** — Karatsuba path is
    5 % slower than raw schoolbook because the padding glue isn't
    free.  Only affects public `operator*`; `pow_mod_montgomery` has
    its own stack-buffered padding so this doesn't leak into the hot
