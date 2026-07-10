@@ -163,6 +163,26 @@ timing, ~150 KB total:
        width="760">
 </picture>
 
+### 📦 `hydra-bignum` — JavaScript's missing `powMod`, as an npm package
+
+JavaScript `BigInt` ships no modular exponentiation, no `modInverse`,
+no primality test.  [`pkg/`](pkg/) wraps Hydra's wasm build in a pure
+`bigint → bigint` API (nothing to allocate or free) and beats the
+square-and-multiply loop you'd write over native `BigInt` — V8's own
+optimized bignum — by **2.6× at 256-bit through 1.3× at 2048-bit**
+(at 4096-bit V8's subquadratic multiply wins; table and caveats in
+[pkg/README.md](pkg/README.md)):
+
+```js
+import { init, powMod, isProbablePrime, nextPrime } from 'hydra-bignum';
+await init();
+powMod(2n, 2n ** 127n - 2n, 2n ** 127n - 1n);  // 1n — Fermat on M127
+nextPrime(2n ** 64n);                          // 18446744073709551629n
+```
+
+Build locally with `scripts/wasm_pkg.sh --test` (~96 KB shipped, MIT,
+no GMP inside).
+
 ---
 
 ## Visual Hydra Performance Story

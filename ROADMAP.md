@@ -34,16 +34,29 @@ flowchart TD
 
     classDef done fill:#2e7d32,color:#fff,stroke:#1b5e20
     classDef next fill:#1565c0,color:#fff,stroke:#0d47a1
-    class A1 next
+    class A1 done
 ```
 
 Solid arrows are prerequisites; dashed arrows are "enhances, not
 required".  A3, B1, B2, C2 have no prerequisites and can start any
-time.  **A1 is in flight** (2026-07-10).
+time.  **A1 landed 2026-07-10** (npm publish itself left to a human);
+A2 is unblocked.
 
 ## Track A — Adoption
 
-### A1 · npm package: become JavaScript's missing `powmod` — **in flight**
+### A1 · npm package: become JavaScript's missing `powmod` — **done except `npm publish` (human step)**
+
+_2026-07-10 outcome: `pkg/` ships `hydra-bignum` — pure `bigint→bigint`
+API (powMod, modInverse, gcd, isProbablePrime, nextPrime, isqrt,
+isPerfectSquare), 151-check node suite, CI job, ~96 KB dist.  Headline
+(node 26, M5 Pro): **2.6×/2.0×/1.5×/1.3× faster than native BigInt at
+256/512/1024/2048-bit; honest 0.8× at 4096** (V8 multiplies
+subquadratically — Toom-Cook is Track B fodder).  Big side discovery:
+emcc's post-link `wasm-opt -O2` pessimizes Hydra kernels up to 60 % —
+the package ships an LLVM-only pipeline; **follow-up: re-bench the
+shootout + demo under the same pipeline** (perf_snapshot tables are
+currently understated).  Publishing to npm is deliberately left to a
+human (account, name claim, provenance)._
 JS `BigInt` has no modular-exponentiation primitive; `(a ** e) % m` is
 non-modular and hand-rolled square-and-multiply over BigInt is slow and
 allocation-heavy.  Hydra is already the fastest bignum measured in wasm

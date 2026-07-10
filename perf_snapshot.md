@@ -137,6 +137,39 @@ dominated by software lowering of the 64×64→128 multiply.
 `-fwasm-exceptions` costs Hydra a further ~15 % and is left off for
 benches (nothing throws in the timed path); the test suite needs it._
 
+_**Caveat discovered 2026-07-10 (binaryen):** the numbers above went
+through emcc's default post-link `wasm-opt -O2`, which pessimizes
+Hydra's kernels — the LLVM-only pipeline used by `scripts/wasm_pkg.sh`
+measures 17.5 µs / 5.76 ms / 48.1 ms at 256/2048/4096-bit on the same
+machine (−22 % / −22 % / −7 % vs this table).  The comparators would
+need re-benching under the same pipeline before the table is updated —
+see "Dragon — binaryen wasm-opt pessimizes the Montgomery kernels" in
+DIRECTORS_NOTES._
+
+---
+
+### hydra-bignum (npm) vs native JS BigInt (2026-07-10)
+
+_`pkg/bench/bench_vs_bigint.mjs --runs 6` — node 26, Apple M5 Pro.
+Baseline: square-and-multiply modexp over native `BigInt` (V8's
+optimized bignum — the loop JS developers actually write, since the
+language has no built-in `powMod`).  Hydra side is the shipped
+`pkg/dist` module: LLVM `-O2`, binaryen limited to a passes-free
+DWARF strip, EH-free, end-to-end through the BigInt⇄limbs wrapper._
+
+| Width | native `BigInt` | hydra-bignum (wasm) | speedup |
+|------:|----------------:|--------------------:|--------:|
+|  256  |        48.3 µs  |            18.3 µs  | **2.6×** |
+|  512  |       204.9 µs  |           102.3 µs  | **2.0×** |
+| 1024  |        1.13 ms  |           732.9 µs  | **1.5×** |
+| 2048  |        7.24 ms  |            5.57 ms  | **1.3×** |
+| 4096  |       37.38 ms  |           48.66 ms  |   0.8×   |
+
+_Honest loss at 4096-bit: V8 multiplies subquadratically (Karatsuba+
+Toom band) while Hydra's FIOS is O(k²) and pays the wasm i128-lowering
+tax.  Wrapper interop costs ~1 µs/call (18.3 µs end-to-end vs 17.5 µs
+in-wasm at 256-bit)._
+
 ---
 
 ### Hot-path hotspots after the threshold retirement + halved squaring

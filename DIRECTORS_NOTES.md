@@ -4996,6 +4996,98 @@ push-to-main only, with a `pages-deploy` concurrency group.
 
 ---
 
+### npm Package Layer (`pkg/` — hydra-bignum)
+
+_Landed 2026-07-10 — Claude Fable 5 (roadmap A1).  Status lives in
+ROADMAP.md; this section is the design record._
+
+**API shape decision:** pure `bigint → bigint` free functions
+(powMod, modInverse, gcd, isProbablePrime, nextPrime, isqrt,
+isPerfectSquare) — NO handle/class objects.  JS BigInt already does
+fast add/mul natively; Hydra's value to JS is the number-theory layer
+missing from the language.  Consequences: zero lifetime management
+for consumers, and the wasm module never sees a negative number or
+zero modulus (the wrapper normalizes signs and validates), so **no
+C++ path can throw → the module builds EH-free** (wasm EH costs
+~15–35 %).
+
+**Interop:** LSB-first u64 limb arrays over the wasm stack
+(`stackAlloc` + `HEAPU64` BigUint64Array view; re-fetched per call —
+memory growth invalidates views).  `Hydra::from_limbs`/`limb_view`
+are the exact native shape, so crossing is memcpy-flat; measured
+wrapper overhead ~1 µs/call at 256-bit.  BigInt→limbs via
+`asUintN`-style mask/shift loop (O(n²/64), negligible ≤4096-bit);
+4 MiB/number cap guards the 8 MiB stack.
+
+**Files:** `pkg/hydra_binding.cpp` (C ABI, capacities documented
+per function), `pkg/index.mjs` + hand-written `index.d.ts`,
+`pkg/test/test.mjs` (151 checks: BigInt oracles for powMod/gcd,
+pseudoprime landmarks, egcd/inverse invariants, floor-sqrt
+properties, error contracts), `pkg/bench/bench_vs_bigint.mjs`
+(min-of-medians, cross-checks before timing),
+`scripts/wasm_pkg.sh`, CI step in the wasm job.  Publish to npm is
+deliberately a human step (account, name claim, provenance).
+
+**Headline** (node 26, M5 Pro, vs square-and-multiply over native
+BigInt): 2.6× @256b, 2.0× @512b, 1.5× @1024b, 1.3× @2048b, **0.8×
+@4096b — an honest loss**: V8 multiplies subquadratically while FIOS
+is O(k²) under the wasm i128 tax.  Table in perf_snapshot.md and
+pkg/README.md, both of which state the loss explicitly.
+
+---
+
+### Dragon — binaryen wasm-opt pessimizes the Montgomery kernels (npm package sprint)
+
+_2026-07-10 — Claude Fable 5.  Found while chasing a 77 ms 4096-bit
+pow_mod in the npm module vs 51 ms in the recorded shootout._
+
+**Symptom:** identical source, flags, and machine — the package
+module ran 4096-bit pow_mod at 78 ms while the shootout binary ran
+49 ms.  Bisection trail (each step measured, min of 5):
+
+1. Not the JS boundary: raw `_hydra_pow_mod` call = full wrapper
+   (79 ms both).
+2. Not module-level flags: SINGLE_FILE/MODULARIZE/EXPORT_ES6/
+   WASM_BIGINT on a self-timed `main()` probe → 48 ms.
+3. **Trigger = EXPORTED_FUNCTIONS:** adding the 7 hydra exports to
+   the probe build → 79 ms; exporting only `_hydra_pow_mod` → 48 ms.
+4. Not LLVM per-TU codegen: EXPORTED_FUNCTIONS is link-stage only
+   (objects identical), and a 3-TU source split changed nothing.
+5. `-mllvm -inline-threshold=2000` partially recovered one probe
+   (53 ms) but not a multi-width probe (76 ms) — inlining-lottery
+   noise, not a fix.  10000 made it *worse* (85 ms).  -O3: 57 ms.
+   -flto: null (80 ms).
+6. **Culprit = emcc's post-link `wasm-opt -O2`:** building with `-g`
+   (limits binaryen to "limited postlink optimizations") gave
+   **17.5 µs / 5.66 ms / 49.1 ms** at 256/2048/4096-bit — faster
+   than every other configuration *including the export-free
+   reference* (21.9 µs / 7.0 ms / 48.9 ms).  LLVM's -O2 output is
+   already right; binaryen's function-level rewrites (likely its
+   inliner refusing multi-caller kernels + local churn in the FIOS
+   loop) cost +39 % / +43 % / +60 % with exports present.
+
+**Fix shipped** (`scripts/wasm_pkg.sh`): `emcc -O2 -g` + a
+**passes-free** `wasm-opt --all-features --strip-dwarf
+--strip-producers` (1.2 MB → 68 KB wasm).  Two-file dist (.mjs +
+.wasm) instead of SINGLE_FILE.
+
+**Open follow-ups:** (a) the recorded wasm shootout and the live
+demo went through the default pessimizing pipeline — re-bench all
+three backends under LLVM-only flags and update perf_snapshot/README
+(comparators may shift too; the demo module's 5 exports make it
+likely Hydra is understated there); (b) pass-level bisection of
+which binaryen pass does the damage (candidate: `inlining-optimizing`
++ `precompute`/local coalescing) would make a good upstream report;
+(c) the wasm-vs-native tax narrative ("~3-4×, i128 lowering")
+overstates the lowering share — at 2048-bit the true tax is ~3.1×
+(5.66 ms vs 1.80 ms).
+
+**Hard-won rule:** on emscripten, never trust `-O2/-O3` end-to-end —
+A/B the post-link binaryen stage (`-g` build + manual strip) before
+attributing wasm slowness to wasm itself.
+
+---
+
 ### Moonshot Roadmap Catalogued (ROADMAP.md)
 
 _2026-07-10 — Claude Fable 5_

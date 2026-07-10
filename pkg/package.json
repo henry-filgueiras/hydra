@@ -1,0 +1,50 @@
+{
+  "name": "hydra-bignum",
+  "version": "0.1.0",
+  "description": "Fast number theory for JavaScript BigInt — modular exponentiation, modular inverse, Baillie–PSW primality, next-prime, integer sqrt — the Hydra C++ bignum compiled to WebAssembly.",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "dist/hydra_core.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bash ../scripts/wasm_pkg.sh",
+    "test": "node test/test.mjs",
+    "bench": "node bench/bench_vs_bigint.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henry-filgueiras/hydra.git",
+    "directory": "pkg"
+  },
+  "keywords": [
+    "bigint",
+    "bignum",
+    "modular-exponentiation",
+    "powmod",
+    "modinverse",
+    "primality",
+    "baillie-psw",
+    "prime",
+    "number-theory",
+    "wasm",
+    "webassembly",
+    "vdf",
+    "rsa"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

@@ -65,6 +65,12 @@ jobs:
             -o hydra_test_wasm.js
           node hydra_test_wasm.js
 
+      # wasm_pkg.sh needs wasm-opt for the DWARF strip; emsdk ships
+      # binaryen but not on PATH — em-config fallback inside the script
+      # handles it.
+      - name: npm package — build + test (pkg/)
+        run: scripts/wasm_pkg.sh --test
+
       - name: Demo module — Hydra and mini-gmp agree
         run: |
           scripts/fetch_minigmp.sh
