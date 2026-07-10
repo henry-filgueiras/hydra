@@ -3845,52 +3845,41 @@ struct EGCDResult {
     // ── Stack-based scratch buffers ──
     // MONTGOMERY_MAX_LIMBS is 64 (4096 bits).  All buffers fit on stack.
     //
-    // Two Montgomery multiply backends on the dispatch:
-    //   1. FIOS (dual-row CIOS)        (k < KARATSUBA_MONT_THRESHOLD)
-    //   2. Separate Karatsuba + REDC   (k >= KARATSUBA_MONT_THRESHOLD)
+    // Single Montgomery multiply backend on the dispatch: FIOS
+    // (dual-row CIOS) owns the entire band k = 1..64.
     //
-    // FIOS owns the entire non-Karatsuba band.  The 2026-04-18 threshold
-    // sweep (probe_fios_small_k) showed FIOS beating the previously-used
-    // separate-schoolbook+REDC path by −19% to −36% end-to-end at
-    // 64/128/192/256/320/384/448 bits — at every k from 1 through 7.
-    // Before that sweep, FUSED_THRESHOLD was 8 as a holdover from the
-    // pre-FIOS fused-CIOS sprint, which was only tested at k >= 8.
+    // The 2026-04-18 threshold sweep (probe_fios_small_k) showed FIOS
+    // beating the previously-used separate-schoolbook+REDC path by
+    // −19% to −36% end-to-end at every k from 1 through 7.  The
+    // 2026-07-10 sweep (probe_mont_k32_band) retired the Karatsuba+REDC
+    // backend that previously owned k >= KARATSUBA_MONT_THRESHOLD = 32:
+    // FIOS beats it at every k in 31..64 with no crossover — −22.6%
+    // mul at k=32 and −28.0% at k=64 kernel-level, −20.3% / −19.0%
+    // under pow_mod cadence.  That threshold had been derived against
+    // *fused CIOS* (pre-FIOS) and carried forward silently when FIOS
+    // replaced fused on the other side of the boundary — the same trap
+    // the FUSED_THRESHOLD cleanup documented.  Karatsuba's O(k^1.585)
+    // product cannot compensate for its second O(k²) REDC pass, the
+    // 2k-limb intermediate, and the copy/padding overhead at k <= 64;
+    // its asymptotic edge would only matter well above MONTGOMERY_MAX_
+    // LIMBS.
     //
-    // The Karatsuba backend replaces the O(k²) product phase with
-    // O(k^1.585), then runs the same word-by-word REDC.  The REDC
-    // itself is still O(k²), but at large k the product phase dominates
-    // total cost in the fused path (both multiply-accumulate and reduce
-    // are O(k²) per row × k rows).
-    //
-    // `montgomery_mul` / `montgomery_sqr` (separate schoolbook + REDC)
-    // and `montgomery_mul_fused` / `montgomery_mul_sos` remain callable
-    // from `detail::` as correctness references for the FIOS tests —
-    // they are NOT reachable via dispatch.  The null result for SOS is
-    // documented in DIRECTORS_NOTES.md; the primitives stay in-tree so
-    // future experiments can build on them without rederiving correctness.
+    // `montgomery_mul` / `montgomery_sqr` (separate schoolbook + REDC),
+    // `montgomery_mul_fused`, `montgomery_mul_sos`, and
+    // `montgomery_mul_karatsuba` / `montgomery_sqr_karatsuba` remain
+    // callable from `detail::` as correctness references and A/B
+    // targets for future experiments — they are NOT reachable via
+    // dispatch.  The null results for SOS and per-row/full-leaf asm,
+    // and the Karatsuba retirement, are documented in DIRECTORS_NOTES.md.
     constexpr uint32_t MAX_K = 64;
-    // FUSED_THRESHOLD = 1 → FIOS owns every non-Karatsuba k.
-    // Kept as a named constant so the dispatch reads symmetrically and
-    // future experiments have an obvious knob.  Setting it >1 would
-    // route k < FUSED_THRESHOLD through the separate schoolbook+REDC
-    // reference path, which is strictly slower at every k we tested.
+    // FUSED_THRESHOLD = 1 → FIOS owns every k.  Kept as a named
+    // constant so future experiments have an obvious knob.  Setting it
+    // >1 would route k < FUSED_THRESHOLD through the separate
+    // schoolbook+REDC reference path, which is strictly slower at
+    // every k we tested.
     constexpr uint32_t FUSED_THRESHOLD = 1;
-    // Next power of 2 >= MAX_K for Karatsuba padding
-    constexpr uint32_t MAX_K_PADDED = 64;    // MAX_K is already a power of 2
 
-    // KARATSUBA_MONT_THRESHOLD: minimum k for Karatsuba-backed Montgomery.
-    // Benchmark-derived: Karatsuba + REDC beats fused CIOS at k=32 (−9%)
-    // and k=64 (−16%), but LOSES at k=48 (+22%) because 48 pads to 64.
-    // Guard: only use Karatsuba when the padding overhead is bounded —
-    // n_padded / k <= 1.25 (i.e. at most 25% wasted work from padding).
-    constexpr uint32_t KARATSUBA_MONT_THRESHOLD = 32;
-
-    uint32_t n_padded_test = 1;
-    while (n_padded_test < k) n_padded_test <<= 1;
-    // Padding ratio guard: reject if padding would waste > 25% of work
-    const bool pad_ok = (n_padded_test <= k + k / 4);
-    const bool use_karatsuba = (k >= KARATSUBA_MONT_THRESHOLD && pad_ok);
-    const bool use_fused = (!use_karatsuba && k >= FUSED_THRESHOLD);
+    const bool use_fused = (k >= FUSED_THRESHOLD);
 
     uint64_t work_buf[2 * MAX_K + 1];
     uint64_t temp_buf[MAX_K];
@@ -3901,30 +3890,6 @@ struct EGCDResult {
     std::memset(temp_buf, 0, k * sizeof(uint64_t));
     std::memset(result_mont_buf, 0, k * sizeof(uint64_t));
 
-    // ── Karatsuba scratch buffers (only used when use_karatsuba) ──
-    // n_padded = next power of 2 >= k (Karatsuba requires power-of-2 sizes)
-    uint32_t n_padded = 1;
-    if (use_karatsuba) {
-        while (n_padded < k) n_padded <<= 1;
-    }
-    // Stack-allocate at MAX_K_PADDED for bounded stack usage.
-    // pa, pb: padded operand copies (n_padded limbs each)
-    // kara_buf: Karatsuba output (2 * n_padded limbs)
-    uint64_t kara_pa[MAX_K_PADDED];
-    uint64_t kara_pb[MAX_K_PADDED];
-    uint64_t kara_buf[2 * MAX_K_PADDED];
-
-    // Karatsuba recursion scratch — one heap block, reused across
-    // every mont_mul / mont_sqr call in the entire exponentiation
-    // loop.  Without this, the old code paid ~3 std::vector allocs
-    // per frame × 12 frames per mul × ~1000 muls per pow_mod at
-    // 4096-bit.  We pre-reserve the exact worst-case depth bound
-    // once; no further allocation occurs.
-    detail::ScratchWorkspace kara_ws;
-    if (use_karatsuba) {
-        kara_ws.reserve_limbs(detail::karatsuba_scratch_limbs(n_padded));
-    }
-
     // ── Sliding window precomputation ──
     // Window size W=4: precompute base^1, base^3, base^5, ..., base^15
     // in Montgomery form.  table[i] = base^(2i+1) for i in [0..7].
@@ -3933,25 +3898,21 @@ struct EGCDResult {
     uint64_t table[TABLE_SIZE][MAX_K];
 
     // ── Montgomery mul/sqr dispatch helpers ──
-    // Two-tier dispatch:
-    //   k >= KARATSUBA_MONT_THRESHOLD → Karatsuba product + REDC
-    //   otherwise                     → FIOS (dual-row CIOS)
-    // FIOS ("dual-row CIOS") owns the entire non-Karatsuba band.
+    // Single-tier dispatch: FIOS (dual-row CIOS) at every k = 1..64.
     // The 2026-04-18 FIOS sprint microbench showed −21% to −52% kernel
     // deltas vs fused CIOS at k=4..32; the threshold-cleanup sprint
     // that same day (probe_fios_small_k) extended FIOS down through
-    // k=1..7 with end-to-end pow_mod wins of −19% to −36%.  Canonical
-    // fused CIOS (`montgomery_mul_fused`) and the separate schoolbook
-    // path (`montgomery_mul`/`_sqr`) remain callable from `detail::`
-    // as correctness references and A/B targets.
+    // k=1..7 with end-to-end pow_mod wins of −19% to −36%; the
+    // 2026-07-10 sweep (probe_mont_k32_band) retired Karatsuba+REDC
+    // at k=32..64 (FIOS −19% to −53% at every k, no crossover).
+    // Canonical fused CIOS (`montgomery_mul_fused`), the separate
+    // schoolbook path (`montgomery_mul`/`_sqr`), and the Karatsuba
+    // backend (`montgomery_mul_karatsuba`/`_sqr_karatsuba`) remain
+    // callable from `detail::` as correctness references and A/B
+    // targets.
     auto mont_mul = [&](const uint64_t* a, const uint64_t* b,
                         uint64_t* out) {
-        if (use_karatsuba)
-            detail::montgomery_mul_karatsuba(a, b, k, ctx.mod_limbs.data(),
-                                              ctx.n0inv, out, work_buf,
-                                              kara_pa, kara_pb, kara_buf,
-                                              n_padded, kara_ws);
-        else if (use_fused)
+        if (use_fused)
             detail::montgomery_mul_fios(a, b, k, ctx.mod_limbs.data(),
                                          ctx.n0inv, out, work_buf);
         else
@@ -3959,12 +3920,7 @@ struct EGCDResult {
                                     ctx.n0inv, out, work_buf);
     };
     auto mont_sqr = [&](const uint64_t* a, uint64_t* out) {
-        if (use_karatsuba)
-            detail::montgomery_sqr_karatsuba(a, k, ctx.mod_limbs.data(),
-                                              ctx.n0inv, out, work_buf,
-                                              kara_pa, kara_pb, kara_buf,
-                                              n_padded, kara_ws);
-        else if (use_fused)
+        if (use_fused)
             detail::montgomery_sqr_fios(a, k, ctx.mod_limbs.data(),
                                          ctx.n0inv, out, work_buf);
         else

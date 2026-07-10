@@ -3386,6 +3386,88 @@ static void test_fios_mont_mul_vs_fused_sweep() {
     }
 }
 
+// FIOS at k=32..64 — the band Karatsuba+REDC owned until the
+// 2026-07-10 threshold retirement (probe_mont_k32_band showed FIOS
+// faster at every k in 31..64, no crossover).  Cross-check FIOS
+// against BOTH retired backends at every k the dispatch can now
+// route through FIOS, including the former pad_ok Karatsuba band
+// (k=52..64) and the former pad-rejected band (k=33..51).
+static void test_fios_mont_large_k_band() {
+    std::mt19937_64 rng(0xF1050B16ull);
+    for (uint32_t k : {32u, 33u, 40u, 48u, 52u, 56u, 63u, 64u}) {
+        std::vector<uint64_t> mod(k), a(k), b(k);
+        for (auto& l : mod) l = rng();
+        mod[0] |= 1u;
+        mod[k - 1] |= (1ull << 63);
+        for (auto& l : a) l = rng();
+        for (auto& l : b) l = rng();
+
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        // Reference 1: canonical fused CIOS
+        std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+        hydra::detail::montgomery_mul_fused(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_fused.data(), work_fused.data());
+
+        // Reference 2: Karatsuba + REDC (the retired dispatch backend)
+        uint32_t n_padded = 1;
+        while (n_padded < k) n_padded <<= 1;
+        std::vector<uint64_t> out_kara(k), work_wide(2 * k + 1, 0);
+        std::vector<uint64_t> pa(n_padded), pb(n_padded),
+                              kara_buf(2 * n_padded);
+        hydra::detail::ScratchWorkspace ws;
+        hydra::detail::montgomery_mul_karatsuba(
+            a.data(), b.data(), k, mod.data(), n0inv, out_kara.data(),
+            work_wide.data(), pa.data(), pb.data(), kara_buf.data(),
+            n_padded, ws);
+
+        std::vector<uint64_t> out_fios(k), work_fios(k + 2, 0);
+        hydra::detail::montgomery_mul_fios(
+            a.data(), b.data(), k, mod.data(),
+            n0inv, out_fios.data(), work_fios.data());
+
+        std::vector<uint64_t> sqr_fios(k), sqr_fused(k);
+        hydra::detail::montgomery_sqr_fios(
+            a.data(), k, mod.data(), n0inv,
+            sqr_fios.data(), work_fios.data());
+        hydra::detail::montgomery_sqr_fused(
+            a.data(), k, mod.data(), n0inv,
+            sqr_fused.data(), work_fused.data());
+
+        bool mul_ok = (out_fios == out_fused) && (out_fios == out_kara);
+        bool sqr_ok = (sqr_fios == sqr_fused);
+        std::string label = "fios mont mul vs fused+karatsuba at k=" +
+                            std::to_string(k);
+        CHECK(mul_ok, label.c_str());
+        label = "fios mont sqr vs fused at k=" + std::to_string(k);
+        CHECK(sqr_ok, label.c_str());
+    }
+
+    // Carry-adversarial (mod-1)² at the top of the band.
+    {
+        constexpr uint32_t k = 64;
+        std::vector<uint64_t> mod(k, ~0ull), a(k);
+        mod[0] = ~0ull - 2;              // odd
+        for (uint32_t i = 0; i < k; ++i) a[i] = mod[i];
+        a[0] -= 1;                       // a = mod - 1
+        uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+        std::vector<uint64_t> out_fused(k), work_fused(k + 2, 0);
+        hydra::detail::montgomery_mul_fused(
+            a.data(), a.data(), k, mod.data(),
+            n0inv, out_fused.data(), work_fused.data());
+
+        std::vector<uint64_t> out_fios(k), work_fios(k + 2, 0);
+        hydra::detail::montgomery_mul_fios(
+            a.data(), a.data(), k, mod.data(),
+            n0inv, out_fios.data(), work_fios.data());
+
+        CHECK(out_fios == out_fused,
+              "fios mont mul carry-adversarial (mod-1)^2 at k=64");
+    }
+}
+
 static void test_fios_mont_mul_carry_adversarial() {
     // (mod-1)² operands — drives the two-chain carry pipeline to
     // its structural maximum.  Exactly the shape that breaks shift-
@@ -4139,6 +4221,7 @@ int main() {
 
     // Dual-row CIOS / FIOS Montgomery tests
     test_fios_mont_mul_vs_fused_sweep();
+    test_fios_mont_large_k_band();
     test_fios_mont_mul_carry_adversarial();
     test_fios_mont_mul_dirty_work_buffer();
     test_fios_mont_sqr_cross();

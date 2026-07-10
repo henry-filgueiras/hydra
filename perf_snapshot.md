@@ -1,46 +1,43 @@
 # Hydra Benchmark Report
 
-Generated: `2026-04-18`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
+Generated: `2026-07-10`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
-> Current state after the **scratch-workspace** (pow_mod allocator removal),
-> **dual-row schoolbook leaf kernel**, **SOS Montgomery null-result**,
-> **dual-row CIOS / FIOS**, **FUSED_THRESHOLD cleanup**, and
-> **aarch64 asm null-result** sprints.  The asm experiment probed
-> whether hand-written `mac_row_2` could close part of the 2048/4096
-> gap vs GMP/OpenSSL; it beats the C++ fallback by ~7 % in isolated
-> microbench but *regresses* `mul_karatsuba` by ~7-8 % due to
-> out-of-line call overhead, leaving pow_mod unchanged end-to-end.
-> The kernel stays in tree behind `HYDRA_AARCH64_ASM` (default OFF)
-> as a correctness-tested A/B target for future asm experiments.
-> FIOS now owns the entire non-Karatsuba band (k=1..31) after the
-> threshold sweep lowered `FUSED_THRESHOLD` from 8 to 1.  The canonical
-> fused CIOS (`montgomery_mul_fused`) and the separate schoolbook path
-> (`montgomery_mul` / `montgomery_sqr`) stay in-tree as correctness
-> references but are no longer reachable via dispatch.  Karatsuba-backed
-> widths (k ≥ 32, 2048-bit and 4096-bit) are untouched and unchanged.
+> Current state after the **KARATSUBA_MONT_THRESHOLD retirement**
+> (2026-07-10): FIOS (dual-row CIOS) now owns the entire Montgomery
+> band k = 1..64.  The Karatsuba+REDC tier that previously served
+> k ≥ 32 was benchmark-retired — FIOS beats it at every k in 31..64
+> with no crossover (−22.6 % at k=32, −28.0 % at k=64 kernel-level),
+> worth **−26 % at 2048-bit and −24 % at 4096-bit** end-to-end.  The
+> threshold had been derived against fused CIOS (pre-FIOS) and was
+> never re-measured after FIOS landed.  `montgomery_mul_karatsuba`,
+> canonical fused CIOS, separate schoolbook+REDC, and SOS all stay
+> in-tree as correctness references, not reachable via dispatch.
+> `bench_pow_mod` gained `--runs N` (min-of-medians + cross-run CV),
+> institutionalizing the manual 6-run A/B protocol.
 > See `DIRECTORS_NOTES.md` for hypothesis / design / rationale history.
 
 ---
 
 ### pow_mod — Modular Exponentiation
 
-_Min-of-6 runs, 50-sample median per run; `bench_pow_mod --markdown`_
+_`bench_pow_mod --runs 6` (min-of-6-medians, 50 samples/run); GMP and
+OpenSSL columns carried from the 2026-04-18 report (those backends
+were not rebuilt this pass; their code is unchanged)._
 
 | Width | Hydra (now)  | Hydra (prior)| Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
 |------:|-------------:|-------------:|-----------:|----------:|----------:|------------:|----------------:|
-|   256 |    7.29 µs   |    9.60 µs   |     −24 %  |  7.21 µs  |  5.29 µs  |       1.01× |           1.38× |
-|   512 |   36.42 µs   |   35.35 µs   |      +3 %  | 27.58 µs  | 19.00 µs  |       1.32× |           1.92× |
-|  1024 |  234.56 µs   |  232.33 µs   |      +1 %  | 152.63 µs | 109.75 µs |       1.54× |           2.14× |
-|  1536 |  781.12 µs   |  775.35 µs   |      +1 %  | 461.67 µs | 336.75 µs |       1.69× |           2.32× |
+|   256 |    7.42 µs   |    7.29 µs   |     ~0 %   |  7.21 µs  |  5.29 µs  |       1.03× |           1.40× |
+|   512 |   36.33 µs   |   36.42 µs   |     ~0 %   | 27.58 µs  | 19.00 µs  |       1.32× |           1.91× |
+|  1024 |  229.21 µs   |  234.56 µs   |      −2 %  | 152.63 µs | 109.75 µs |       1.50× |           2.09× |
+|  1536 |  766.77 µs   |  781.12 µs   |      −2 %  | 461.67 µs | 336.75 µs |       1.66× |           2.28× |
 |  1984 |    1.78 ms   |    1.78 ms   |       0 %  |   1.03 ms |   1.65 ms |       1.73× |           1.08× |
-|  2048 |    2.59 ms   |    2.59 ms   |       0 %  |   1.09 ms |  782.9 µs |       2.38× |           3.31× |
-|  4096 |   20.13 ms   |   20.08 ms   |       0 %  |   7.47 ms |   5.82 ms |       2.69× |           3.46× |
+|  2048 |    1.94 ms   |    2.59 ms   |   **−25 %**|   1.09 ms |  782.9 µs |       1.78× |           2.48× |
+|  4096 |   15.35 ms   |   20.13 ms   |   **−24 %**|   7.47 ms |   5.82 ms |       2.05× |           2.64× |
 
-_256-bit moved from essentially level with GMP to within noise of
-GMP — the FIOS path beats the separate schoolbook + REDC path it
-replaces by −24 %.  Non-Karatsuba widths ≥ 512-bit are within
-noise of the FIOS-sprint numbers (they already used FIOS).
-Karatsuba widths (2048, 4096) unchanged by construction._
+_2048/4096-bit moved from Karatsuba+REDC to FIOS.  The 1984→2048-bit
+cliff (1.78 → 2.59 ms, +45 % for a 3 % width step) is gone — the curve
+is now smooth across the old backend boundary (1.78 → 1.94 ms).
+Cross-run CV at these widths: 1.6 % / 0.4 %._
 
 ---
 
@@ -115,27 +112,24 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
-### Hot-path hotspots after the FIOS sprint
+### Hot-path hotspots after the threshold retirement
 
-1. **Sub-fused band (k < 8, 256-bit) separate schoolbook + REDC** —
-   still the dominant cost at 256-bit.  The FIOS kernel probe shows
-   the dual-row structure would also help at k=4,6 (−52 % / −41 %
-   vs fused CIOS), but the current dispatch routes k < 8 through
-   `montgomery_mul` (separate schoolbook + REDC), not FIOS.  Whether
-   to lower `FUSED_THRESHOLD` below 8 depends on FIOS also beating
-   the separate path at k=4,6 — not yet measured.
-2. **Karatsuba-backed Montgomery REDC (k ≥ 32, 2048+)** — after FIOS
-   moved the fused band, the 2048/4096-bit columns are unchanged
-   and GMP/OpenSSL gaps there remain the largest deltas
-   (Hydra/OpenSSL ≈ 3.3–3.5×).  The REDC phase of Karatsuba-backed
-   Montgomery still uses the sequential `montgomery_redc` word-by-
-   word reduce.  A "dual-chain REDC" analogous to FIOS's reduce half
-   is a candidate follow-up.
+1. **FIOS squaring has no cross-term halving** — pow_mod is ~5:1
+   sqr:mul and `montgomery_sqr_fios` forwards to the full mul.  A
+   dual-chain squaring that exploits `a[i]·a[j] == a[j]·a[i]` is the
+   largest single line item left, at every width (the whole k = 1..64
+   band now runs FIOS).  Non-trivial correctness story; see the
+   2026-07-10 dragon's next-sprint ranking.
+2. **GMP/OpenSSL gap at 2048/4096-bit** — narrowed to 1.78×/2.05×
+   (GMP) and 2.48×/2.64× (OpenSSL) after the retirement, from
+   2.38×/2.69× and 3.31×/3.46×.  What remains is squaring
+   specialization (they have it, Hydra doesn't) plus hand-tuned asm
+   (exploration closed after two null results — portable levers only).
 3. **Schoolbook leaf at k=16** — the dual-row leaf kernel at n=16
    shows only a −3 % delta vs. the old scalar (whereas k=32 / k=64
    are −40 %).  Compiler auto-vectorization of the baseline narrows
-   the gap.  Largely superseded as a pow_mod bottleneck by the FIOS
-   win, but still marginal interest for raw `Hydra * Hydra` at 1024-bit.
+   the gap.  Only affects raw `Hydra * Hydra`; pow_mod no longer
+   calls the schoolbook leaves at all (Karatsuba tier retired).
 4. **`mul_general` dispatch overhead at k=32** — Karatsuba path is
    5 % slower than raw schoolbook because the padding glue isn't
    free.  Only affects public `operator*`; `pow_mod_montgomery` has

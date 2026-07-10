@@ -1349,101 +1349,30 @@ and at `-O2`.
 
 ---
 
-### Karatsuba-Backed Montgomery Multiply
+### Montgomery Dispatch — FIOS Owns the Entire Band (k = 1..64)
 
-_Implemented 2026-04-16 — Claude Opus 4.6_
+_Updated 2026-07-10 — Claude Fable 5.  Supersedes "Karatsuba-Backed
+Montgomery Multiply" (2026-04-16), demoted verbatim to Resolved
+Dragons._
 
-#### Hypothesis
+`pow_mod_montgomery` uses a **single Montgomery multiply backend**:
+`montgomery_mul_fios` / `montgomery_sqr_fios` (dual-row CIOS) at every
+k from 1 to `MONTGOMERY_MAX_LIMBS = 64`.  There is no Karatsuba tier
+on the dispatch anymore.
 
-The O(k²) schoolbook product inside the fused CIOS Montgomery multiply
-is the dominant remaining cost at large widths (k ≥ 32).  Replacing
-it with a Karatsuba product (O(k^1.585)) in a separate product + REDC
-shape should improve pow_mod at 2048+ bits.
+The `KARATSUBA_MONT_THRESHOLD = 32` tier was retired after
+`bench/probe_mont_k32_band.cpp` (2026-07-10) showed FIOS beating
+Karatsuba+REDC at **every** k in 31..64 with no crossover — the
+threshold had been derived against *fused CIOS* (pre-FIOS) and carried
+forward silently when FIOS replaced fused on the other side of the
+boundary.  End-to-end: **−26 % at 2048-bit, −24 % at 4096-bit**.
+Full data in the 2026-07-10 Resolved Dragons entry.
 
-#### Intervention
-
-Added `montgomery_mul_karatsuba` and `montgomery_sqr_karatsuba` to
-`hydra::detail`.  These compute the full 2k-limb product via the
-existing `mul_karatsuba` kernel (which uses `std::vector` per recursion
-frame — the same prototype from the earlier Karatsuba integration
-sprint), then apply word-by-word `montgomery_redc`.
-
-Three-tier dispatch in `pow_mod_montgomery`:
-
-```
-k < 8                      → separate schoolbook + REDC
-8 ≤ k < KARATSUBA_MONT_THRESHOLD  → fused CIOS
-k ≥ KARATSUBA_MONT_THRESHOLD && pad_ok → Karatsuba + REDC
-otherwise                  → fused CIOS (fallback)
-```
-
-`KARATSUBA_MONT_THRESHOLD = 32` (benchmark-derived).
-
-**Padding guard:** Karatsuba requires power-of-2 operand sizes.  When
-`n_padded / k > 1.25` (more than 25% wasted work from zero-padding),
-the dispatch falls back to fused CIOS.  This prevents the k=48 case
-(pads to 64, +22% regression) while allowing k=32 and k=64 (no padding
-overhead).
-
-Stack-allocated Karatsuba scratch (pa, pb, kara_buf) at MAX_K_PADDED=64
-avoids heap allocation for all widths up to 4096 bits.
-
-#### Benchmark Results
-
-**Kernel-level** (single montgomery_mul call, sandbox VM, g++ -O3):
-
-| k (limbs) | Fused CIOS | Karatsuba+REDC | K/F delta |
-|----------:|----------:|---------------:|----------:|
-|        32 |   1.24 µs |        1.13 µs |      −9%  |
-|        48 |   2.86 µs |        3.49 µs |     +22%  |
-|        64 |   5.33 µs |        4.45 µs |     −16%  |
-
-**End-to-end pow_mod** (50 samples, median):
-
-| Width | Fused CIOS only | With Karatsuba | Delta |
-|------:|----------------:|---------------:|------:|
-|  2048 |        ~2.80 ms |       ~2.85 ms |  flat |
-|  4096 |       ~24.8 ms  |       ~21.9 ms | **−12%** |
-
-#### Whether the Hypothesis Was Confirmed
-
-**Partially confirmed.**
-
-The Karatsuba product is 9–16% faster than fused CIOS at the kernel
-level for power-of-2 widths (k=32, k=64).  However, the REDC phase
-is itself O(k²) and unchanged, so the total Montgomery multiply sees
-only a fraction of the product-phase win.  At k=32 the e2e pow_mod
-improvement is lost in noise.  At k=64 the −12% e2e win is clean.
-
-The true bottleneck decomposition is:
-- Product phase: ~40–50% of total montgomery_mul cost (varies with k)
-- REDC phase: ~50–60% of total montgomery_mul cost
-- A 15% product-phase speedup translates to ~6–8% total montgomery_mul
-  win, which translates to ~5–12% e2e pow_mod win depending on width.
-
-The padding penalty for non-power-of-2 k is severe (+22% at k=48).
-The pad guard catches this cleanly.
-
-#### Correctness
-
-33 new tests, 855 total (822 prior + 33 new):
-
-- Kernel cross-checks: Karatsuba vs fused CIOS at k=32, 64, 33
-- Squaring cross-check at k=32
-- End-to-end pow_mod at 2048 and 4096 bits vs naive
-- Random sweep: 5 trials each at k=32, 40, 48, 56, 64
-- Threshold boundary: k=31 (fused) vs k=32 (Karatsuba)
-
-All pass at `-O0 -fsanitize=address,undefined` and at `-O3`.
-
-#### Recommended Next Step
-
-The REDC phase is now the dominant remaining cost, not the product phase.
-Karatsuba-accelerated REDC (or eliminating the separate REDC entirely via
-a Karatsuba-native Montgomery approach like FIPS or Comba) would be the
-next high-value target.  Alternatively, arena-backed Karatsuba scratch
-could push the crossover threshold down to k=16 (1024 bits) by eliminating
-the per-recursion `std::vector` allocation cost.
+Retired-but-callable correctness references in `detail::` (never
+dispatched): `montgomery_mul` / `montgomery_sqr` (separate schoolbook
++ REDC), `montgomery_mul_fused` / `montgomery_sqr_fused` (canonical
+CIOS), `montgomery_mul_sos`, and `montgomery_mul_karatsuba` /
+`montgomery_sqr_karatsuba`.
 
 ---
 
@@ -4233,6 +4162,296 @@ remaining slots are all algorithmic:
    in-tree for A/B measurement but do not start another asm
    sprint until a new algorithmic lever lands that creates a
    fresh seam worth attacking.
+
+---
+### Demoted from Canon 2026-07-10 — Karatsuba-Backed Montgomery Multiply
+
+_Demoted 2026-07-10 — Claude Fable 5.  This section was Canon from
+2026-04-16 until the KARATSUBA_MONT_THRESHOLD retirement (see the
+2026-07-10 dragon entry below).  Text preserved verbatim:_
+
+_Implemented 2026-04-16 — Claude Opus 4.6_
+
+#### Hypothesis
+
+The O(k²) schoolbook product inside the fused CIOS Montgomery multiply
+is the dominant remaining cost at large widths (k ≥ 32).  Replacing
+it with a Karatsuba product (O(k^1.585)) in a separate product + REDC
+shape should improve pow_mod at 2048+ bits.
+
+#### Intervention
+
+Added `montgomery_mul_karatsuba` and `montgomery_sqr_karatsuba` to
+`hydra::detail`.  These compute the full 2k-limb product via the
+existing `mul_karatsuba` kernel (which uses `std::vector` per recursion
+frame — the same prototype from the earlier Karatsuba integration
+sprint), then apply word-by-word `montgomery_redc`.
+
+Three-tier dispatch in `pow_mod_montgomery`:
+
+```
+k < 8                      → separate schoolbook + REDC
+8 ≤ k < KARATSUBA_MONT_THRESHOLD  → fused CIOS
+k ≥ KARATSUBA_MONT_THRESHOLD && pad_ok → Karatsuba + REDC
+otherwise                  → fused CIOS (fallback)
+```
+
+`KARATSUBA_MONT_THRESHOLD = 32` (benchmark-derived).
+
+**Padding guard:** Karatsuba requires power-of-2 operand sizes.  When
+`n_padded / k > 1.25` (more than 25% wasted work from zero-padding),
+the dispatch falls back to fused CIOS.  This prevents the k=48 case
+(pads to 64, +22% regression) while allowing k=32 and k=64 (no padding
+overhead).
+
+Stack-allocated Karatsuba scratch (pa, pb, kara_buf) at MAX_K_PADDED=64
+avoids heap allocation for all widths up to 4096 bits.
+
+#### Benchmark Results
+
+**Kernel-level** (single montgomery_mul call, sandbox VM, g++ -O3):
+
+| k (limbs) | Fused CIOS | Karatsuba+REDC | K/F delta |
+|----------:|----------:|---------------:|----------:|
+|        32 |   1.24 µs |        1.13 µs |      −9%  |
+|        48 |   2.86 µs |        3.49 µs |     +22%  |
+|        64 |   5.33 µs |        4.45 µs |     −16%  |
+
+**End-to-end pow_mod** (50 samples, median):
+
+| Width | Fused CIOS only | With Karatsuba | Delta |
+|------:|----------------:|---------------:|------:|
+|  2048 |        ~2.80 ms |       ~2.85 ms |  flat |
+|  4096 |       ~24.8 ms  |       ~21.9 ms | **−12%** |
+
+#### Whether the Hypothesis Was Confirmed
+
+**Partially confirmed.**
+
+The Karatsuba product is 9–16% faster than fused CIOS at the kernel
+level for power-of-2 widths (k=32, k=64).  However, the REDC phase
+is itself O(k²) and unchanged, so the total Montgomery multiply sees
+only a fraction of the product-phase win.  At k=32 the e2e pow_mod
+improvement is lost in noise.  At k=64 the −12% e2e win is clean.
+
+The true bottleneck decomposition is:
+- Product phase: ~40–50% of total montgomery_mul cost (varies with k)
+- REDC phase: ~50–60% of total montgomery_mul cost
+- A 15% product-phase speedup translates to ~6–8% total montgomery_mul
+  win, which translates to ~5–12% e2e pow_mod win depending on width.
+
+The padding penalty for non-power-of-2 k is severe (+22% at k=48).
+The pad guard catches this cleanly.
+
+#### Correctness
+
+33 new tests, 855 total (822 prior + 33 new):
+
+- Kernel cross-checks: Karatsuba vs fused CIOS at k=32, 64, 33
+- Squaring cross-check at k=32
+- End-to-end pow_mod at 2048 and 4096 bits vs naive
+- Random sweep: 5 trials each at k=32, 40, 48, 56, 64
+- Threshold boundary: k=31 (fused) vs k=32 (Karatsuba)
+
+All pass at `-O0 -fsanitize=address,undefined` and at `-O3`.
+
+#### Recommended Next Step
+
+The REDC phase is now the dominant remaining cost, not the product phase.
+Karatsuba-accelerated REDC (or eliminating the separate REDC entirely via
+a Karatsuba-native Montgomery approach like FIPS or Comba) would be the
+next high-value target.  Alternatively, arena-backed Karatsuba scratch
+could push the crossover threshold down to k=16 (1024 bits) by eliminating
+the per-recursion `std::vector` allocation cost.
+
+---
+
+### Stale KARATSUBA_MONT_THRESHOLD — FIOS Beats Karatsuba+REDC at Every k ≤ 64
+
+_Implemented 2026-07-10 — Claude Fable 5_
+_Status: **shipped** — the Karatsuba-backed Montgomery tier is retired
+from dispatch; FIOS owns the entire k = 1..64 band.
+**−26 % at 2048-bit, −24 % at 4096-bit end-to-end** — the largest
+single move at the crypto widths in the project's history._
+
+#### Hypothesis
+
+`KARATSUBA_MONT_THRESHOLD = 32` was benchmark-derived on 2026-04-16
+**against fused CIOS** (Karatsuba+REDC won −9 % at k=32, −16 % at
+k=64).  When FIOS replaced fused CIOS for k = 1..31 two days later
+(−22 % vs fused at k=32 on the kernel probe), the k ≥ 32 boundary was
+never re-measured — the FIOS sprint's end-to-end table showed 2048/
+4096-bit "unchanged by construction" because dispatch never routed
+FIOS there.  Arithmetic on the existing tables already suggested the
+threshold was stale: FIOS at k=32 (869 ns) vs Karatsuba+REDC
+(~1.0–1.1 µs implied).  This is precisely the trap the
+FUSED_THRESHOLD cleanup documented: *threshold constants carry
+forward silently when the backend on one side of the boundary
+changes.*
+
+#### What was measured
+
+`bench/probe_mont_k32_band.cpp` (added this sprint), two layers at
+k = 31, 32, 36, 40, 48, 52, 56, 60, 64:
+
+1. Isolated kernel A/B — FIOS mul/sqr vs `montgomery_mul_karatsuba` /
+   `montgomery_sqr_karatsuba` (median of 5 × 40k reps).
+2. pow_mod cadence — 5 sqr + 1 mul per iteration, rotating the
+   accumulator (the measurement that decided both the SOS null and
+   the FIOS win).
+
+Then end-to-end `bench_pow_mod`, 6 interleaved runs of baseline
+(HEAD) vs modified binaries, min of per-run 50-sample medians.
+
+#### Results (M5 Pro, clang -O3 -march=native)
+
+**Layer 1 — isolated kernel (mul; sqr deltas within 3 % of mul):**
+
+| k  | Karatsuba+REDC | FIOS      | Δ        |
+|---:|---------------:|----------:|---------:|
+| 31 |       918.5 ns |  700.1 ns |  −23.8 % |
+| 32 |       982.5 ns |  760.7 ns |  −22.6 % |
+| 36 |      1994.7 ns |  936.3 ns |  −53.1 % |
+| 40 |      2257.5 ns | 1152.5 ns |  −48.9 % |
+| 48 |      2665.2 ns | 1859.8 ns |  −30.2 % |
+| 52 |      2979.7 ns | 1989.9 ns |  −33.2 % |
+| 56 |      3250.7 ns | 2267.1 ns |  −30.3 % |
+| 60 |      3612.2 ns | 2634.3 ns |  −27.1 % |
+| 64 |      4146.6 ns | 2985.4 ns |  −28.0 % |
+
+**Layer 2 — pow_mod cadence:** same shape, −16 % (k=31) to −48 %
+(k=36), −20.3 % at k=32 and −19.0 % at k=64.  **No crossover at any
+k in the band, either layer.**
+
+Sanity anchor: 4096-bit pow_mod at HEAD (19.8 ms / ~4780 Montgomery
+ops) implies ~4.1 µs per op — matching the measured 4146 ns for the
+Karatsuba backend almost exactly, so the probe reflects dispatch-path
+reality, not a harness artifact.
+
+**End-to-end `bench_pow_mod` (min of 6 interleaved 50-sample medians):**
+
+| Width | baseline  | FIOS-only dispatch | Δ        |
+|------:|----------:|-------------------:|---------:|
+|  256  |   7.6 µs  |            7.5 µs  |   −0.8 % |
+|  512  |  36.0 µs  |           36.4 µs  |   +1.1 % |
+| 1024  | 238.2 µs  |          229.6 µs  |   −3.6 % |
+| 1536  | 774.6 µs  |          774.7 µs  |    0.0 % |
+| 1984  |  1.76 ms  |           1.76 ms  |    0.0 % |
+| **2048** | **2.59 ms** | **1.91 ms**   | **−26.3 %** |
+| **4096** | **20.22 ms** | **15.29 ms** | **−24.4 %** |
+
+Every FIOS-unchanged width is flat — clean attribution to the
+dispatch change.  The long-standing 1984→2048-bit cliff (1.78 ms →
+2.59 ms, a +45 % step for a 3 % width increase) is gone; the curve is
+now smooth across the old Karatsuba boundary (1.78 ms → 1.94 ms).
+
+#### Why Karatsuba+REDC loses everywhere in-band
+
+The asymptotic product win (O(k^1.585) vs O(k²)) is real but small at
+k ≤ 64 (one or two recursion levels), and it has to pay for:
+
+1. a **second full O(k²) pass** — REDC re-reads and re-writes the
+   2k-limb intermediate that FIOS never materialises;
+2. the **2k+1-limb working set** vs FIOS's k+2 (the same locality
+   argument that decided SOS vs FIOS);
+3. **copy/pad overhead** — pa/pb memcpy+memset, kara_buf → work
+   memcpy per call;
+4. **single-chain REDC** — the reduce pass has no dual-issue
+   structure, while FIOS overlaps product and reduce chains
+   throughout.
+
+The k=36/40 rows (−49…−53 %) additionally show the pad-to-64 penalty,
+but the pad_ok guard already excluded those from dispatch; the
+decisive rows are the unpadded k=32 and k=64, and Karatsuba loses
+those too.
+
+#### What changed in-tree
+
+1. `hydra.hpp` — `pow_mod_montgomery` dispatch is single-tier: FIOS
+   for every k.  `KARATSUBA_MONT_THRESHOLD`, the pad_ok guard, the
+   kara_pa/kara_pb/kara_buf stack buffers, and the per-call
+   `ScratchWorkspace` are gone from the hot function.
+   `montgomery_mul_karatsuba` / `montgomery_sqr_karatsuba` remain in
+   `detail::` as callable correctness references (project convention:
+   SOS, fused CIOS, and separate mul+REDC are all retained the same
+   way).
+2. `hydra_test.cpp` — `test_fios_mont_large_k_band`: FIOS
+   cross-checked against BOTH retired backends (fused CIOS and
+   Karatsuba+REDC) at k = 32, 33, 40, 48, 52, 56, 63, 64, FIOS sqr vs
+   fused sqr at the same k's, plus a (mod−1)² carry-adversarial case
+   at k=64.  941 tests pass under Debug ASan+UBSan and Release.
+3. `bench/probe_mont_k32_band.cpp` — the two-layer probe, kept for
+   re-measurement when a new backend lands.
+4. `bench/bench_pow_mod.cpp` — new `--runs N` flag (see below).
+5. `perf_snapshot.md` — updated tables.
+
+#### Benchmark methodology upgrade — `--runs N`
+
+Every A/B sprint since FIOS has hand-rolled the same protocol:
+invoke `bench_pow_mod` 6–8 times per binary, collect the per-run
+medians, take the minimum ("min-of-6 medians").  The PGO dragon
+documented why single runs are untrustworthy (a phantom +75 % at
+256-bit from post-training thermal load).  That protocol now lives
+in the binary:
+
+```
+bench_pow_mod --runs 6
+  ...
+  2048 bits ... hydra=1.94 ms (cv 1.6%)
+  4096 bits ... hydra=15.35 ms (cv 0.4%)
+```
+
+`--runs N` repeats the 50-sample loop N times per width (backends
+stay interleaved within a run so thermal drift hits both sides),
+reports the min-median run, and prints the cross-run CV of medians —
+so a noisy measurement announces itself instead of masquerading as a
+result.  JSON output gains `"runs"` and `"median_cv_pct"` fields.
+Single-invocation behaviour (`--runs 1`, the default) is unchanged.
+
+The measured CVs also quantify the known noise structure in one
+line: 8.7 % at 256-bit down to 0.4 % at 4096-bit — matching the
+"small widths jitter ±10 %" folklore scattered across prior entries.
+
+#### Lessons
+
+1. **Re-measure every threshold whose *other side* changed.**  Second
+   consecutive instance of the same dragon species (FUSED_THRESHOLD
+   was the first).  A threshold constant is an equality assertion
+   between two backends at one k; replacing either backend voids it.
+   After any kernel replacement, sweep every dispatch boundary that
+   references the replaced path — the sweep is minutes, the unclaimed
+   win here sat for almost three months.
+2. **Asymptotics need room.**  Karatsuba's exponent advantage at
+   k ≤ 64 is worth less than one fused pass + k+2-limb locality.
+   Sub-quadratic Montgomery (Karatsuba or Toom product, or
+   sub-quadratic REDC) should be re-benchmarked only if
+   MONTGOMERY_MAX_LIMBS ever grows past 64.
+3. **The e2e-implied per-op cost is a free sanity check.**  total_ms /
+   (bits + bits/window) caught the notes' earlier ~1.55 µs/op
+   breakdown estimate being off by 2.7× vs the real ~4.1 µs — the
+   full-leaf dragon's cost model was built from isolated-kernel
+   numbers that didn't include cadence effects.
+
+#### Updated recommendation for next sprint
+
+The retirement changes the optimization landscape at 2048/4096-bit —
+the cost is now 100 % FIOS, so:
+
+1. **FIOS squaring with cross-term halving** — promoted to slot 1.
+   pow_mod is ~5:1 sqr:mul; a dual-chain squaring that halves the
+   product-half MACs attacks the largest single line item at every
+   width.  Non-trivial correctness story, but the payoff band is now
+   the entire k = 1..64.
+2. **Dual-chain REDC** — demoted.  It targeted the Karatsuba path's
+   separate REDC pass, which no longer executes; FIOS's reduce chain
+   is already dual-issued against the product chain.
+3. **Toom-Cook 3-way** — unchanged, and now further out: it would
+   have to beat FIOS (not Karatsuba+REDC) at k=64, a gap of −28 %
+   rather than the −16 % previously assumed.
+4. **Asm exploration stays closed** (two nulls + PGO null), though
+   the new all-FIOS dispatch is a single uniform kernel — if any
+   future asm attempt is ever justified, a whole-FIOS-row kernel is
+   the only seam left.
 
 ---
 
