@@ -1496,9 +1496,19 @@ library someone reaches for.  Ordered by expected leverage.  None are
 started; whoever picks one up should demote/annotate its entry._
 
 1. **WebAssembly target + benchmark story.**  _2026-07-10 status:
-   blocked on toolchain — no emcc/wasmtime on the dev machine; needs
-   a `brew install emscripten wasmtime` (or CI-side setup) before the
-   build target can be validated._  Hydra's biggest
+   toolchain bootstrap landed and validated — `scripts/wasm_bootstrap.sh`
+   installs emscripten + wasmtime via Homebrew (idempotent, `--check`
+   for dry-run), verifies `unsigned __int128` lowering with a smoke
+   test, and with `--full` compiles `hydra_test` to wasm
+   (`-fwasm-exceptions` required: emcc aborts on `throw` by default)
+   and runs it under node: **989/989 pass under wasm, zero source
+   changes** (emscripten 6.0.2, node 26).  First wasm pow_mod
+   numbers (emcc -O2, node, --runs 2): 19.8 µs / 827 µs / 6.29 ms /
+   51.97 ms at 256/1024/2048/4096-bit — a ~3× tax vs native M5 Pro,
+   from lowering the 64×64→128 multiply.  Remaining work: CMake
+   target or CI job wrapping the script, and the bench-vs-
+   mini-gmp-in-wasm comparison that anchors the "fastest bignum you
+   can ship in a browser" claim._  Hydra's biggest
    competitive positioning insight: compiled to wasm, GMP loses its
    hand-written asm and falls back to portable C (or projects use
    mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf
