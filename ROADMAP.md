@@ -96,13 +96,22 @@ to impact; no prerequisites.
 
 ## Track B — Deep engineering
 
-### B1 · Batched `pow_mod` — SIMD across independent exponentiations
+### B1 · Batched `pow_mod` — interleave independent exponentiations — **probe: FUNDED (native)**
 The hard-won rule says single-op asm/PGO are measured nulls; don't
 retry **without a structural change**.  Batching is the structural
 change: verification workloads (signature batches, accumulator checks,
 VDF aggregation) present many independent modexps, and 2–4 interleaved
 Montgomery ladders break the serial dependency chain that made
 single-op NEON a null.
+
+_2026-07-10 probe result (`bench/probe_mont_interleave.cpp`): fused
+2-lane FIOS = **1.54× throughput at 2048-bit, 1.50× at 4096-bit**
+(native M5 Pro); call-level interleaving is a null (fused kernel
+required); 4 lanes ≈ 2 lanes (register ceiling — 2 is the design
+point); **wasm is a null** (1.02–1.08×, i128 lowering burns the
+registers).  Remaining before an API: fused×2 of the halved squaring
+(the ladder is mostly squarings at k≤32), then e2e A/B watching for
+cadence inversion.  Full write-up in DIRECTORS_NOTES._
 
 - **API sketch (tiered):** tier 1 `pow_mod_batch(span<const Hydra>
   bases, exp, mod)` — shared exponent+modulus, the RSA-verify/VDF

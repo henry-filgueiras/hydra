@@ -73,7 +73,9 @@
 - Kernel-probe wins can invert e2e; the k+2-limb fused accumulator locality is
   the decisive Montgomery invariant; 2k-limb intermediates lose under cadence.
 - asm/PGO/__restrict at these kernels: all measured null on M5 Pro — don't retry
-  without a structural change (see Resolved Dragons).
+  without a structural change (see Resolved Dragons). The structural change that
+  DOES work: fused 2-lane FIOS (probe_mont_interleave) = 1.5× throughput at
+  2048/4096-bit native (wasm null; call-level null; 4 lanes ≈ 2). B1 roadmap.
 - Browser timing: performance.now clamps to 100µs–1ms → batch ≥15ms per sample.
 - emcc's post-link `wasm-opt -O2` PESSIMIZES the kernels (+39%@256b…+60%@4096b
   with multiple exports). Ship LLVM-O2 only: `-g` build + passes-free

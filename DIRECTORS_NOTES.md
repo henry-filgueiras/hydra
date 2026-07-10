@@ -5220,4 +5220,50 @@ damage (upstream-report material).
 
 ---
 
+### B1 Opening Probe — Fused 2-Lane FIOS: +50 % Throughput at Crypto Widths (Native); wasm Null
+
+_2026-07-10 — Claude Fable 5.  `bench/probe_mont_interleave.cpp`,
+executes the measurement plan from the B1 design digression above.
+Kernel layer only — e2e can invert (house rule); this FUNDS
+`pow_mod_batch`, it does not conclude it._
+
+Three variants vs a serial chained baseline (x = mont(x, b), the
+ladder dependency shape), all bit-identity-checked against production
+`montgomery_mul_fios` before timing.  Native (M5 Pro, clang -O3
+-march=native), ns per mont-mul, min of 5 samples:
+
+| k | bits | serial | call×2 | call×4 | fused×2 | fused×4 |
+|--:|-----:|-------:|-------:|-------:|--------:|--------:|
+|  4 |  256 |  18.4 | 1.17× | 1.13× | **1.28×** | 1.22× |
+|  8 |  512 |  50.8 | 1.00× | 0.94× | **1.28×** | 1.27× |
+| 16 | 1024 | 180.7 | 1.00× | 1.00× | **1.24×** | 1.24× |
+| 32 | 2048 | 847.6 | 1.00× | 1.00× | **1.54×** | 1.53× |
+| 64 | 4096 | 3217.0 | 1.00× | 1.00× | **1.50×** | 1.49× |
+
+**Findings:**
+1. **Call-level interleaving is dead** (≥k=8: 1.00×).  The OoO window
+   does not overlap adjacent kernel calls — a batch API that loops
+   single-op calls gains nothing; a fused kernel is required.
+2. **Fused×2 hits the B1 target**: 1.54× at 2048-bit, 1.50× at
+   4096-bit — the serial-carry-latency bubbles are real and a second
+   lane fills them.  Biggest wins exactly where the GMP gap lives.
+3. **Fused×4 ≈ fused×2** at every k — register pressure ceilings the
+   win at two lanes (predicted in the digression).  Two lanes is the
+   design point; ×4 buys nothing and costs API complexity.
+4. **wasm is a null**: 1.02–1.08× across the board (emcc LLVM-only
+   pipeline, node 26).  The software i128 lowering burns the register
+   budget the interleave needs.  Batch is a NATIVE feature; the npm
+   4096-bit loss will not flip via batching.
+
+**Open before e2e:** the ladder is mostly *squarings*, and production
+squaring at k≤32 is `montgomery_sqr_fios_halved` (~1.5k² MACs with its
+own carry structure) — a fused×2 variant of the halved squaring is
+required for the e2e win to materialize at ≤2048-bit; at k=64
+(sqr-as-mul) fused×2 mul covers it directly.  Then:
+`pow_mod_batch(bases, exp, mod)` e2e A/B vs N× single-op, min-of-
+medians, watching for cadence/L1 inversion (fixed-operand probes
+overstate locality — two lanes' operands compete for L1).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
