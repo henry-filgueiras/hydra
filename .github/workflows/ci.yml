@@ -1,0 +1,90 @@
+# CI for Hydra — native test matrix + WebAssembly gate.
+#
+# native: Debug (ASan+UBSan, wired in by CMakeLists for Debug builds)
+#         and Release, on Linux and macOS.
+# wasm:   the full test suite compiled with emscripten and run under
+#         node (-fwasm-exceptions required — the suite exercises throw
+#         paths), plus a cross-implementation smoke of the demo module
+#         (Hydra vs mini-gmp must agree bit-for-bit at three widths).
+#         Boost is deliberately absent from the wasm job: passing the
+#         host /usr/include to emcc lets glibc headers shadow the wasm
+#         sysroot.  The three-way Boost comparison runs via
+#         scripts/wasm_bench.sh on a dev machine instead.
+#
+# Benchmarks are never gated in CI — shared runners are too noisy for
+# perf assertions; see DIRECTORS_NOTES.md for the measurement protocol.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  native:
+    name: native ${{ matrix.os }} / ${{ matrix.build }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        build: [Debug, Release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build-ci -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DHYDRA_BENCH_BOOST=OFF
+
+      - name: Build tests
+        run: cmake --build build-ci --target hydra_test -j 4
+
+      - name: Run tests
+        run: ./build-ci/hydra_test
+
+  wasm:
+    name: wasm (emscripten + node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Full test suite under wasm
+        run: |
+          emcc -std=c++20 -O2 -DNDEBUG -I. -fwasm-exceptions \
+            hydra_test.cpp hydra.cpp \
+            -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
+            -o hydra_test_wasm.js
+          node hydra_test_wasm.js
+
+      - name: Demo module — Hydra and mini-gmp agree
+        run: |
+          scripts/fetch_minigmp.sh
+          emcc -O2 -DNDEBUG -c build-wasm/minigmp/mini-gmp.c \
+            -o build-wasm/minigmp/mini-gmp.o
+          mkdir -p build-wasm/demo
+          emcc -std=c++20 -O2 -DNDEBUG -I. \
+            -DHYDRA_POWMOD_GMP \
+            -Ibuild-wasm/minigmp \
+            demo/bench_web.cpp hydra.cpp build-wasm/minigmp/mini-gmp.o \
+            -sSINGLE_FILE=1 -sMODULARIZE=1 -sEXPORT_NAME=HydraBench \
+            -sENVIRONMENT=web,node \
+            -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
+            -sEXPORTED_FUNCTIONS=_hydra_bench_cell,_hydra_validate \
+            -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+            -o build-wasm/demo/bench_web.js
+          node -e "
+            require('./build-wasm/demo/bench_web.js')().then(m => {
+              const v = m.cwrap('hydra_validate', 'number', ['number']);
+              for (const bits of [256, 1024, 2048]) {
+                if (v(bits) !== 1) {
+                  console.error('backend MISMATCH at', bits, 'bits');
+                  process.exit(1);
+                }
+              }
+              console.log('backends agree at 256/1024/2048-bit');
+            });
+          "

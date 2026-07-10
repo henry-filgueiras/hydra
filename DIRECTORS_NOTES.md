@@ -1521,7 +1521,25 @@ started; whoever picks one up should demote/annotate its entry._
    frozen-clock escape hatch caps calibration at 64 reps.
    Validated: node smoke (timings match wasm_bench) and headless
    Chrome running the full UI flow to "Done ✓".
-   Remaining: a CI job wrapping the three scripts._  Hydra's biggest
+   **CI landed** (`.github/workflows/ci.yml`): native matrix
+   (ubuntu/macos × Debug-ASan-UBSan/Release, `hydra_test` with
+   `-DHYDRA_BENCH_BOOST=OFF`), wasm job (full suite under node via
+   setup-emsdk, plus a Hydra-vs-mini-gmp bit-agreement smoke of the
+   demo module — Boost is deliberately absent from the wasm job
+   because host `/usr/include` shadows emcc's sysroot; benchmarks
+   are never perf-gated on shared runners).  mini-gmp fetching was
+   factored into portable `scripts/fetch_minigmp.sh` (shasum or
+   sha256sum), shared by wasm_bench.sh, wasm_demo.sh, and CI.  The
+   demo gained `#reference` (recorded results without benching, for
+   screenshots/docs), `prefers-reduced-motion` support, and a
+   no-anim paint path — a headless screenshot caught bars being
+   captured mid-CSS-transition, i.e. bars not matching their own
+   labels.  Theme-aware README screenshots (light/dark `<picture>`)
+   live in assets/, captured via headless Chrome.  **Item 1 is now
+   complete** except for whatever runner-side surprises the first
+   real Actions run turns up — the wasm steps were executed verbatim
+   locally, the native ubuntu leg only config-checked._
+   Hydra's biggest
    competitive positioning insight: compiled to wasm, GMP loses its
    hand-written asm and falls back to portable C (or projects use
    mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf

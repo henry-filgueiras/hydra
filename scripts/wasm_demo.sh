@@ -23,10 +23,6 @@ cd "$HERE"
 
 WASM_DIR="$HERE/build-wasm"
 DEMO_OUT="$WASM_DIR/demo"
-GMP_VER="6.3.0"
-GMP_TARBALL="gmp-$GMP_VER.tar.xz"
-GMP_URL="https://ftp.gnu.org/gnu/gmp/$GMP_TARBALL"
-GMP_SHA256="a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
 MINIGMP_DIR="$WASM_DIR/minigmp"
 BOOST_INC="/opt/homebrew/include"
 
@@ -39,19 +35,8 @@ command -v emcc >/dev/null 2>&1 || fail "emcc not found — run scripts/wasm_boo
 
 mkdir -p "$MINIGMP_DIR" "$DEMO_OUT"
 
-# ── mini-gmp (same cache as wasm_bench.sh) ───────────────────
-if [[ ! -f "$MINIGMP_DIR/mini-gmp.c" ]]; then
-    say "downloading $GMP_TARBALL (mini-gmp is bundled inside)…"
-    /usr/bin/curl -sL --max-time 120 -o "$WASM_DIR/$GMP_TARBALL" "$GMP_URL"
-    echo "$GMP_SHA256  $WASM_DIR/$GMP_TARBALL" | shasum -a 256 -c - >/dev/null \
-        || fail "checksum mismatch on $GMP_TARBALL"
-    tar -xf "$WASM_DIR/$GMP_TARBALL" -C "$WASM_DIR" \
-        "gmp-$GMP_VER/mini-gmp/mini-gmp.c" "gmp-$GMP_VER/mini-gmp/mini-gmp.h"
-    cp "$WASM_DIR/gmp-$GMP_VER/mini-gmp/mini-gmp.c" \
-       "$WASM_DIR/gmp-$GMP_VER/mini-gmp/mini-gmp.h" "$MINIGMP_DIR/"
-    printf '// gmp.h shim: route the GMP backend through mini-gmp.\n#include "mini-gmp.h"\n' \
-        > "$MINIGMP_DIR/gmp.h"
-fi
+# ── mini-gmp (shared fetcher, same cache as wasm_bench.sh) ───
+"$HERE/scripts/fetch_minigmp.sh"
 if [[ ! -f "$MINIGMP_DIR/mini-gmp.o" || "$MINIGMP_DIR/mini-gmp.c" -nt "$MINIGMP_DIR/mini-gmp.o" ]]; then
     say "compiling mini-gmp.c → wasm object…"
     emcc -O2 -DNDEBUG -c "$MINIGMP_DIR/mini-gmp.c" -o "$MINIGMP_DIR/mini-gmp.o"

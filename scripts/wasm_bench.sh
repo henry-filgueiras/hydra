@@ -26,10 +26,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
 WASM_DIR="$HERE/build-wasm"
-GMP_VER="6.3.0"
-GMP_TARBALL="gmp-$GMP_VER.tar.xz"
-GMP_URL="https://ftp.gnu.org/gnu/gmp/$GMP_TARBALL"
-GMP_SHA256="a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
 MINIGMP_DIR="$WASM_DIR/minigmp"
 BOOST_INC="/opt/homebrew/include"
 if [[ "$#" -eq 0 ]]; then RUNS_ARGS=(--runs 2); else RUNS_ARGS=("$@"); fi
@@ -44,24 +40,8 @@ command -v node >/dev/null 2>&1 || fail "node not found — run scripts/wasm_boo
 
 mkdir -p "$MINIGMP_DIR"
 
-# ── Fetch + verify mini-gmp (cached across runs) ─────────────
-if [[ ! -f "$MINIGMP_DIR/mini-gmp.c" ]]; then
-    say "downloading $GMP_TARBALL from ftp.gnu.org (mini-gmp is bundled inside)…"
-    /usr/bin/curl -sL --max-time 120 -o "$WASM_DIR/$GMP_TARBALL" "$GMP_URL"
-    echo "$GMP_SHA256  $WASM_DIR/$GMP_TARBALL" | shasum -a 256 -c - >/dev/null \
-        || fail "checksum mismatch on $GMP_TARBALL"
-    tar -xf "$WASM_DIR/$GMP_TARBALL" -C "$WASM_DIR" \
-        "gmp-$GMP_VER/mini-gmp/mini-gmp.c" "gmp-$GMP_VER/mini-gmp/mini-gmp.h"
-    cp "$WASM_DIR/gmp-$GMP_VER/mini-gmp/mini-gmp.c" \
-       "$WASM_DIR/gmp-$GMP_VER/mini-gmp/mini-gmp.h" "$MINIGMP_DIR/"
-    # gmp.h shim: bench_pow_mod's GMP backend includes <gmp.h> and uses
-    # only the mpz_* subset mini-gmp implements.
-    printf '// gmp.h shim: route the GMP backend through mini-gmp.\n#include "mini-gmp.h"\n' \
-        > "$MINIGMP_DIR/gmp.h"
-    say "mini-gmp $GMP_VER ready (checksum verified)"
-else
-    say "mini-gmp already present in $MINIGMP_DIR (cached)"
-fi
+# ── Fetch + verify mini-gmp (shared fetcher, cached) ─────────
+"$HERE/scripts/fetch_minigmp.sh"
 
 # ── Build ────────────────────────────────────────────────────
 # mini-gmp.c is C — compile separately (no -std=c++20).

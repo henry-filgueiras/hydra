@@ -2,6 +2,8 @@
 
 ![Hydra Sigil](assets/hydra_sigil.svg)
 
+[![CI](https://github.com/henry-filgueiras/hydra/actions/workflows/ci.yml/badge.svg)](https://github.com/henry-filgueiras/hydra/actions/workflows/ci.yml)
+
 **A high-performance arbitrary-precision integer library for modern C++**
 *competitive modular arithmetic · clean systems-first architecture · small values move at native speed*
 
@@ -132,11 +134,18 @@ under node (emscripten `-O2`, `pow_mod`, median latency,
 | 4096  |    **51.7 ms**   |        139 ms        |      326 ms     |   2.7×   |    6.3×     |
 
 The full 989-test suite passes under wasm with zero source changes
-(`scripts/wasm_bootstrap.sh --full`).  Try it yourself:
-`scripts/wasm_demo.sh --serve` builds a self-contained page
-(`demo/`) that runs this exact shootout live in your browser —
-three backends, cross-checked for agreement before timing, ~150 KB
-total.
+(`scripts/wasm_bootstrap.sh --full`; CI runs it on every push).
+Try it yourself: `scripts/wasm_demo.sh --serve` builds a
+self-contained page (`demo/`) that runs this exact shootout live in
+your browser — three backends, cross-checked for agreement before
+timing, ~150 KB total:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/demo_reference_dark.png">
+  <img src="assets/demo_reference_light.png"
+       alt="In-browser benchmark demo: grouped bars per width showing Hydra 2.6–3.5× faster than Boost cpp_int and 4.2–6.3× faster than mini-gmp from 256-bit to 4096-bit"
+       width="760">
+</picture>
 
 ---
 

@@ -98,6 +98,8 @@
     min-width: 2px;
   }
   .bar.empty { background: var(--track); width: 14%; }
+  .no-anim .bar { transition: none; }
+  @media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
   .val {
     position: absolute; top: 50%; transform: translateY(-50%);
     font-size: 12.5px; color: var(--ink-1);
@@ -290,9 +292,11 @@
   }
 
   function showReference(note) {
+    chart.classList.add('no-anim');   // deterministic paint (screenshots)
     for (const bits of WIDTHS) { results[bits] = REFERENCE[bits].slice(); paint(bits); }
     paintTable();
     status.innerHTML = note;
+    setTimeout(() => chart.classList.remove('no-anim'), 50);
   }
 
   // ── Live run ────────────────────────────────────────────────
@@ -353,6 +357,13 @@
         document.getElementById('samples').value = '6';
         document.getElementById('w4096').checked = false;
         run();
+      }
+      // #reference: populate the recorded run without benchmarking
+      // (screenshots, docs, environments where a live run is unwanted).
+      if (location.hash === '#reference') {
+        showReference('Recorded reference run — Apple M5 Pro, node 26, ' +
+                      '2026-07-10.  Press “Run benchmark” for live numbers ' +
+                      'on this device.');
       }
     }).catch(e => enableFallback('wasm failed to initialize (' + e.message + ').'));
   } catch (e) {
