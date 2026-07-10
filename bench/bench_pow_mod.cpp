@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -228,7 +229,38 @@ struct TimingResult {
         // Ops/sec from median
         ops_per_sec = 1e9 / median_ns;
     }
+
+    // Cross-run stats — populated by min_of_medians() when --runs > 1.
+    // run_count == 1 means single-run mode (both fields stay 0/1).
+    int    run_count      = 1;
+    double median_cv_pct  = 0;  // CV of per-run medians, in percent
 };
+
+// Reduce N independent runs to one result: keep the run with the lowest
+// median (most robust to thermal / background-load noise — the protocol
+// every A/B sprint in DIRECTORS_NOTES.md has been hand-rolling by
+// invoking the binary 6-8 times), and record the cross-run CV of the
+// medians so single-invocation noise artifacts (like the phantom +75%
+// documented in the PGO dragon) are visible instead of silent.
+static TimingResult min_of_medians(std::vector<TimingResult>& runs) {
+    size_t best = 0;
+    double sum = 0, sum_sq = 0;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        if (runs[i].median_ns < runs[best].median_ns) best = i;
+        sum += runs[i].median_ns;
+        sum_sq += runs[i].median_ns * runs[i].median_ns;
+    }
+    TimingResult r = std::move(runs[best]);
+    r.run_count = static_cast<int>(runs.size());
+    if (runs.size() > 1) {
+        const double n = static_cast<double>(runs.size());
+        const double mean = sum / n;
+        const double var = (sum_sq / n) - (mean * mean);
+        r.median_cv_pct = (mean > 0 && var > 0)
+                              ? (std::sqrt(var) / mean) * 100.0 : 0.0;
+    }
+    return r;
+}
 
 static constexpr int WARMUP_ITERS  = 3;
 static constexpr int SAMPLE_COUNT  = 50;  // per-width, per-backend
@@ -453,6 +485,10 @@ static void print_json(const std::vector<BenchRow>& rows) {
             printf("        \"median_ns\": %.1f,\n", t.median_ns);
             printf("        \"p95_ns\": %.1f,\n", t.p95_ns);
             printf("        \"mean_ns\": %.1f,\n", t.mean_ns);
+            if (t.run_count > 1) {
+                printf("        \"runs\": %d,\n", t.run_count);
+                printf("        \"median_cv_pct\": %.2f,\n", t.median_cv_pct);
+            }
             printf("        \"ops_per_sec\": %.1f\n", t.ops_per_sec);
             printf("      }%s\n", last ? "" : ",");
         };
@@ -671,6 +707,7 @@ static void print_csv(const std::vector<BenchRow>& rows) {
 int main(int argc, char** argv) {
     // Parse args
     enum class OutputMode { json, markdown, csv } mode = OutputMode::json;
+    int n_runs = 1;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--markdown" || std::string(argv[i]) == "--md")
             mode = OutputMode::markdown;
@@ -678,6 +715,8 @@ int main(int argc, char** argv) {
             mode = OutputMode::csv;
         else if (std::string(argv[i]) == "--json")
             mode = OutputMode::json;
+        else if (std::string(argv[i]) == "--runs" && i + 1 < argc)
+            n_runs = std::max(1, std::atoi(argv[++i]));
     }
 
     // Target widths
@@ -698,7 +737,11 @@ int main(int argc, char** argv) {
 #endif
     fprintf(stderr, "\n");
     fprintf(stderr, "Widths: 256, 512, 1024, 1536, 1984, 2048, 4096 bits\n");
-    fprintf(stderr, "Samples per width: %d (+ %d warmup)\n\n", SAMPLE_COUNT, WARMUP_ITERS);
+    fprintf(stderr, "Samples per width: %d (+ %d warmup)\n", SAMPLE_COUNT, WARMUP_ITERS);
+    if (n_runs > 1)
+        fprintf(stderr, "Runs per width: %d (reporting min-of-medians, "
+                        "cv = cross-run spread of medians)\n", n_runs);
+    fprintf(stderr, "\n");
 
     std::vector<BenchRow> rows;
 
@@ -717,21 +760,49 @@ int main(int argc, char** argv) {
         BenchRow row;
         row.bits = bits;
 
-        row.hydra = bench_hydra(ops);
+        // Backends stay interleaved *within* a run (hydra, then boost,
+        // …) and the whole set repeats --runs times, so slow thermal /
+        // load drift hits all backends roughly equally.
+        std::vector<TimingResult> hydra_runs;
+#ifdef HYDRA_POWMOD_BOOST
+        std::vector<TimingResult> boost_runs;
+#endif
+#ifdef HYDRA_POWMOD_GMP
+        std::vector<TimingResult> gmp_runs;
+#endif
+#ifdef HYDRA_POWMOD_OPENSSL
+        std::vector<TimingResult> openssl_runs;
+#endif
+        for (int run = 0; run < n_runs; ++run) {
+            hydra_runs.push_back(bench_hydra(ops));
+#ifdef HYDRA_POWMOD_BOOST
+            boost_runs.push_back(bench_boost(ops));
+#endif
+#ifdef HYDRA_POWMOD_GMP
+            gmp_runs.push_back(bench_gmp(ops));
+#endif
+#ifdef HYDRA_POWMOD_OPENSSL
+            openssl_runs.push_back(bench_openssl(ops));
+#endif
+        }
+
+        row.hydra = min_of_medians(hydra_runs);
         fprintf(stderr, "hydra=%s", format_ns(row.hydra.median_ns).c_str());
+        if (n_runs > 1)
+            fprintf(stderr, " (cv %.1f%%)", row.hydra.median_cv_pct);
 
 #ifdef HYDRA_POWMOD_BOOST
-        row.boost = bench_boost(ops);
+        row.boost = min_of_medians(boost_runs);
         fprintf(stderr, "  boost=%s", format_ns(row.boost.median_ns).c_str());
 #endif
 
 #ifdef HYDRA_POWMOD_GMP
-        row.gmp = bench_gmp(ops);
+        row.gmp = min_of_medians(gmp_runs);
         fprintf(stderr, "  gmp=%s", format_ns(row.gmp.median_ns).c_str());
 #endif
 
 #ifdef HYDRA_POWMOD_OPENSSL
-        row.openssl = bench_openssl(ops);
+        row.openssl = min_of_medians(openssl_runs);
         fprintf(stderr, "  openssl=%s", format_ns(row.openssl.median_ns).c_str());
 #endif
 
