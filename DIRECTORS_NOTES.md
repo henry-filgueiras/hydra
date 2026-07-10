@@ -1420,6 +1420,74 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 
 ---
 
+### Primality Layer (Baillie–PSW)
+
+_Implemented 2026-07-10 — Claude Fable 5 (Phase 3 roadmap item 2,
+picked over the wasm target because the dev machine lacks the wasm
+toolchain)._
+
+Four new façade functions at the bottom of `hydra.hpp` (after
+`pow_mod`), plus supporting `detail::` helpers:
+
+| Function                          | Semantics                                    |
+|-----------------------------------|----------------------------------------------|
+| `isqrt(n)`                        | floor sqrt via Newton; throws on negative    |
+| `is_perfect_square(n)`            | `isqrt(n)² == n`                             |
+| `is_probable_prime(n, extra=0)`   | BPSW; optional extra MR rounds, fixed bases  |
+| `next_prime(n)`                   | smallest prime strictly greater than n       |
+
+#### BPSW pipeline
+
+1. **Trial division** by the 53 odd primes < 256 (`mod_u64`, zero
+   heap) — *exact* for n < 257² = 66049, so small inputs never reach
+   the probabilistic stages.
+2. **Strong Miller–Rabin, base 2** — one `pow_mod` (the Montgomery
+   engine is the whole cost).
+3. **Strong Lucas, Selfridge Method A** — D from 5, −7, 9, −11, …
+   with (D/n) = −1 (perfect-square check after 12 failed candidates,
+   per Baillie's recommendation), P = 1, Q = (1−D)/4.  U/V ladder is
+   MSB-first double-and-add on the bits of d where n+1 = d·2^s, with
+   plain `(a*b) % n` modular arithmetic — this path is correctness-
+   critical, not perf-critical (one Lucas ≈ a small multiple of one
+   pow_mod).  Jacobi symbols collapse the big operand to word size
+   after a single `mod_u64` and finish in a u64 loop.
+
+BPSW has no known counterexample and is exhaustively verified exact
+below 2^64.  Variable-time, like the rest of the library — the README
+now carries an explicit not-constant-time disclaimer.
+
+#### Test strategy (47 new checks, 989 total)
+
+The two probabilistic stages are **pinned to the literature's
+pseudoprime lists**: the base-2 strong pseudoprimes (A001262 prefix)
+must *pass* our MR stage in isolation, and the Selfridge strong Lucas
+pseudoprimes (A217255 prefix) must *pass* our Lucas stage in
+isolation — proving each stage implements the standard test — while
+`is_probable_prime` rejects all of them.  On top of that: exhaustive
+sieve agreement on [0, 100000] (covers the 66049 = 257² exactness
+boundary), differential agreement with an independently-implemented
+deterministic MR (bases 2..37, exact < 3.3e24) on 400 random 63-bit
+odds, Mersenne primes 2^{61,89,107,127,521,607}−1 and composite
+Mersennes 2^{67,83,97,101}−1, 2^255−19, an M61·M89 semiprime
+(nothing but MR can catch it), Fermat numbers F4/F5/F6, and
+`next_prime` landmarks including 2^64 + 13 and 2^256 + 297.
+
+#### Representative timings (M5 Pro, -O3)
+
+```
+is_probable_prime(2^255 - 19)    0.28 ms
+is_probable_prime(2^607 - 1)     0.31 ms
+is_probable_prime(2^1279 - 1)    1.73 ms
+is_probable_prime(2^2203 - 1)    9.06 ms
+next_prime(2^256)                0.43 ms   (→ 2^256 + 297)
+```
+
+The whole suite rides on the Montgomery pow_mod engine, so every
+Montgomery win to date compounds here — this is the first user-facing
+feature whose latency *is* the pow_mod benchmark.
+
+---
+
 ### Phase 3 Roadmap — Adoption & Ecosystem ("Shininess Backlog")
 
 _Catalogued 2026-07-10 — Claude Fable 5, at the director's request.
@@ -1427,7 +1495,10 @@ These are adoption levers, not perf levers: things that make Hydra the
 library someone reaches for.  Ordered by expected leverage.  None are
 started; whoever picks one up should demote/annotate its entry._
 
-1. **WebAssembly target + benchmark story.**  Hydra's biggest
+1. **WebAssembly target + benchmark story.**  _2026-07-10 status:
+   blocked on toolchain — no emcc/wasmtime on the dev machine; needs
+   a `brew install emscripten wasmtime` (or CI-side setup) before the
+   build target can be validated._  Hydra's biggest
    competitive positioning insight: compiled to wasm, GMP loses its
    hand-written asm and falls back to portable C (or projects use
    mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf
@@ -1446,16 +1517,10 @@ started; whoever picks one up should demote/annotate its entry._
      quality under wasm first; if it's poor, a 32-bit-limb build
      profile is the fallback (bigger change, measure first).
 
-2. **`is_probable_prime` public API.**  Miller–Rabin is repeated
-   pow_mod at exactly the widths the engine is tuned for — this is
-   simultaneously a showcase feature and genuinely useful (test-data
-   generation, DH/RSA parameter validation, hash-to-prime).  Do
-   **BPSW** (2 + strong Lucas), the industry standard (no known
-   pseudoprimes, deterministic < 2^64), with optional extra
-   Miller–Rabin rounds for paranoia.  Needs: small-prime trial
-   division (cheap with `mod_u64`), one Lucas sequence implementation.
-   A `next_prime` follow-up is nearly free once this exists.
-   Fits naturally next to `pow_mod` in the number-theory façade.
+2. ~~**`is_probable_prime` public API.**~~  **Landed 2026-07-10**
+   (same day it was catalogued) — BPSW with Selfridge Method-A
+   parameters, plus `next_prime`, `isqrt`, and `is_perfect_square`.
+   See "Primality Layer (Baillie–PSW)" in Current Canon.
 
 3. **README repositioning around the honest niches.**  The current
    README leads with the GMP/OpenSSL gap closing.  The killer

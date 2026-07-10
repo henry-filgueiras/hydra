@@ -61,6 +61,15 @@ std::cout << a + b << "\n";   // 123456788993898934827525016274
 std::cout << gcd(a, b) << "\n";  // 2
 ```
 
+Primality testing built on the same engine (Baillie–PSW — no known
+counterexample, exact below 2⁶⁴):
+
+```cpp
+Hydra p = (Hydra(1) << 255) - 19;          // curve25519 field prime
+is_probable_prime(p);                      // true, ~0.3 ms
+next_prime(Hydra(1) << 256);               // 2^256 + 297, ~0.4 ms
+```
+
 ---
 
 ## ⚡ Performance Snapshot — Modular Exponentiation
@@ -272,14 +281,21 @@ Completed:
 * [x] string parse / format with chunked base-10¹⁸ extraction
 * [x] Karatsuba multiplication (production-dispatched at ≥32 limbs)
 * [x] number theory primitives (`gcd`, `extended_gcd`, `pow_mod`)
+* [x] primality: `is_probable_prime` (Baillie–PSW), `next_prime`, `isqrt`
 * [x] benchmarking vs `boost::multiprecision::cpp_int`
 
 Active roadmap:
 
+* [ ] WebAssembly build target + benchmark vs mini-gmp
 * [ ] Toom-Cook multiplication for ≥128-limb operands
 * [ ] arena-backed Karatsuba scratch (may lower threshold to 16 limbs)
 * [ ] `std::hash<Hydra>` specialisation
 * [ ] PMR-style allocator hook
+
+> **Not constant-time.** Hydra is variable-time by design and assumes
+> public inputs.  It is well-suited to verification workloads (RSA
+> signature verification, VDFs, accumulators), primality testing, and
+> general bignum arithmetic — not to secret-key operations.
 
 ---
 

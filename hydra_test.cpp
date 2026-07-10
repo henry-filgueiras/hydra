@@ -3914,6 +3914,248 @@ static void test_karatsuba_threshold_boundary() {
     }
 }
 
+// ═════════════════════════════════════════════════════════
+// Primality suite: isqrt, is_probable_prime (BPSW), next_prime
+// ═════════════════════════════════════════════════════════
+
+static void test_isqrt_basic() {
+    using hydra::Hydra;
+    CHECK(hydra::isqrt(Hydra{0u}) == Hydra{0u}, "isqrt(0) == 0");
+    CHECK(hydra::isqrt(Hydra{1u}) == Hydra{1u}, "isqrt(1) == 1");
+    CHECK(hydra::isqrt(Hydra{2u}) == Hydra{1u}, "isqrt(2) == 1");
+    CHECK(hydra::isqrt(Hydra{3u}) == Hydra{1u}, "isqrt(3) == 1");
+    CHECK(hydra::isqrt(Hydra{4u}) == Hydra{2u}, "isqrt(4) == 2");
+    CHECK(hydra::isqrt(Hydra{99u}) == Hydra{9u}, "isqrt(99) == 9");
+    CHECK(hydra::isqrt(Hydra{100u}) == Hydra{10u}, "isqrt(100) == 10");
+
+    // Exact on big perfect squares, and off-by-one neighbours.
+    std::mt19937_64 rng(0x15145ull);
+    bool ok = true;
+    for (int t = 0; t < 30; ++t) {
+        uint32_t limbs = 1 + (t % 8);
+        Hydra r{0u};
+        for (uint32_t i = 0; i < limbs; ++i)
+            r = (r << 64) + Hydra{rng() | 1ull};
+        Hydra sq = r * r;
+        if (hydra::isqrt(sq) != r) { ok = false; break; }
+        if (hydra::isqrt(sq - Hydra{1u}) != r - Hydra{1u}) { ok = false; break; }
+        if (hydra::isqrt(sq + Hydra{1u}) != r) { ok = false; break; }
+        if (!hydra::is_perfect_square(sq)) { ok = false; break; }
+        if (hydra::is_perfect_square(sq + Hydra{1u})) { ok = false; break; }
+    }
+    CHECK(ok, "isqrt exact on random squares up to 512-bit (+/-1 neighbours)");
+
+    // Floor invariant on random non-squares: r^2 <= n < (r+1)^2.
+    ok = true;
+    for (int t = 0; t < 30; ++t) {
+        Hydra n{0u};
+        for (uint32_t i = 0; i < 1 + (uint32_t)(t % 6); ++i)
+            n = (n << 64) + Hydra{rng()};
+        if (n.is_zero()) continue;
+        Hydra r = hydra::isqrt(n);
+        if (!(r * r <= n && n < (r + Hydra{1u}) * (r + Hydra{1u}))) {
+            ok = false; break;
+        }
+    }
+    CHECK(ok, "isqrt floor invariant on random inputs");
+
+    bool threw = false;
+    try { (void)hydra::isqrt(Hydra{-4}); } catch (const std::domain_error&) {
+        threw = true;
+    }
+    CHECK(threw, "isqrt throws on negative input");
+}
+
+// Exhaustive agreement with a sieve on [0, 100000].  Covers the
+// trial-division band, the exactness shortcut at 66049 = 257^2 (a
+// composite that survives trial division), and the first ~3000
+// primes that take the full MR+Lucas path.
+static void test_primality_exhaustive_sieve() {
+    constexpr uint32_t N = 100'000;
+    std::vector<bool> is_prime(N + 1, true);
+    is_prime[0] = is_prime[1] = false;
+    for (uint32_t p = 2; p * p <= N; ++p)
+        if (is_prime[p])
+            for (uint32_t q = p * p; q <= N; q += p) is_prime[q] = false;
+
+    for (uint32_t n = 0; n <= N; ++n) {
+        if (hydra::is_probable_prime(hydra::Hydra{n}) != is_prime[n]) {
+            std::string label = "primality sieve mismatch at n=" +
+                                std::to_string(n);
+            CHECK(false, label.c_str());
+            return;
+        }
+    }
+    CHECK(true, "is_probable_prime agrees with sieve on [0, 100000]");
+}
+
+// Differential check against deterministic Miller-Rabin (bases
+// 2..37 — proven exact for n < 3.3e24, so exact for all 64-bit n),
+// implemented independently below.
+static bool ref_mr_deterministic_u64(uint64_t n) {
+    using hydra::Hydra;
+    if (n < 2) return false;
+    for (uint64_t p : {2ull, 3ull, 5ull, 7ull}) {
+        if (n == p) return true;
+        if (n % p == 0) return false;
+    }
+    uint64_t d = n - 1;
+    uint32_t s = 0;
+    while ((d & 1) == 0) { d >>= 1; ++s; }
+    Hydra hn{n}, hn1{n - 1}, hd{d};
+    for (uint64_t b : {2ull, 3ull, 5ull, 7ull, 11ull, 13ull, 17ull,
+                       19ull, 23ull, 29ull, 31ull, 37ull}) {
+        Hydra x = hydra::pow_mod(Hydra{b}, hd, hn);
+        if (x == Hydra{1u} || x == hn1) continue;
+        bool passed = false;
+        for (uint32_t r = 1; r < s; ++r) {
+            x = (x * x) % hn;
+            if (x == hn1) { passed = true; break; }
+        }
+        if (!passed) return false;
+    }
+    return true;
+}
+
+static void test_primality_vs_deterministic_mr_random64() {
+    std::mt19937_64 rng(0xB5D50001ull);
+    for (int t = 0; t < 400; ++t) {
+        uint64_t n = (rng() | 1ull) & ((1ull << 63) - 1);
+        bool got = hydra::is_probable_prime(hydra::Hydra{n});
+        bool want = ref_mr_deterministic_u64(n);
+        if (got != want) {
+            std::string label = "BPSW vs deterministic MR mismatch at n=" +
+                                std::to_string(n);
+            CHECK(false, label.c_str());
+            return;
+        }
+    }
+    CHECK(true, "BPSW agrees with deterministic MR on 400 random 63-bit odds");
+}
+
+// Pin the Miller-Rabin stage to the literature: the classic base-2
+// strong pseudoprimes (OEIS A001262) must PASS our base-2 MR round
+// (proving we implement the standard test) while is_probable_prime
+// rejects them (the other stages catch what MR base 2 misses).
+static void test_primality_spsp2_pinned() {
+    const uint64_t spsp2[] = {2047, 3277, 4033, 4681, 8321, 15841,
+                              29341, 42799, 49141, 52633, 65281,
+                              74665, 80581, 85489, 88357, 90751};
+    for (uint64_t v : spsp2) {
+        hydra::Hydra n{v};
+        hydra::Hydra n1 = n - hydra::Hydra{1u};
+        uint32_t s = hydra::detail::trailing_zero_bits(n1);
+        hydra::Hydra d = n1 >> s;
+        bool mr = hydra::detail::mr_strong_round(n, n1, d, s,
+                                                 hydra::Hydra{2u});
+        bool prp = hydra::is_probable_prime(n);
+        if (!mr || prp) {
+            std::string label = "spsp(2) handling wrong at n=" +
+                                std::to_string(v);
+            CHECK(false, label.c_str());
+            return;
+        }
+    }
+    CHECK(true, "base-2 strong pseudoprimes pass MR stage, rejected overall");
+}
+
+// Pin the Lucas stage the same way: known strong Lucas pseudoprimes
+// for the Selfridge parametrization (OEIS A217255) must PASS our
+// strong Lucas test while is_probable_prime rejects them.
+static void test_primality_lucas_pseudoprimes_pinned() {
+    const uint64_t slpsp[] = {5459, 5777, 10877, 16109, 18971, 22499,
+                              24569, 25199, 40309, 58519, 75077, 97439};
+    for (uint64_t v : slpsp) {
+        hydra::Hydra n{v};
+        bool lucas = hydra::detail::strong_lucas_prp(n);
+        bool prp = hydra::is_probable_prime(n);
+        if (!lucas || prp) {
+            std::string label = "strong Lucas pseudoprime handling wrong "
+                                "at n=" + std::to_string(v);
+            CHECK(false, label.c_str());
+            return;
+        }
+    }
+    CHECK(true, "strong Lucas pseudoprimes pass Lucas stage, rejected overall");
+}
+
+static void test_primality_mersenne_and_friends() {
+    using hydra::Hydra;
+    auto mersenne = [](uint32_t e) { return (Hydra{1u} << e) - Hydra{1u}; };
+
+    // Mersenne primes (exponents from the known list)
+    for (uint32_t e : {61u, 89u, 107u, 127u, 521u, 607u}) {
+        std::string label = "2^" + std::to_string(e) + "-1 is prime";
+        CHECK(hydra::is_probable_prime(mersenne(e)), label.c_str());
+    }
+    // Composite Mersenne numbers (prime exponent, composite value)
+    for (uint32_t e : {67u, 83u, 97u, 101u}) {
+        std::string label = "2^" + std::to_string(e) + "-1 is composite";
+        CHECK(!hydra::is_probable_prime(mersenne(e)), label.c_str());
+    }
+
+    // curve25519 field prime
+    Hydra p25519 = (Hydra{1u} << 255) - Hydra{19};
+    CHECK(hydra::is_probable_prime(p25519), "2^255 - 19 is prime");
+
+    // Semiprime with ~2^61 and ~2^89 factors: trial division can't
+    // touch it; MR must reject.
+    Hydra semi = mersenne(61) * mersenne(89);
+    CHECK(!hydra::is_probable_prime(semi),
+          "M61 * M89 semiprime is composite");
+
+    // Fermat numbers: F4 prime (via the trial-division exactness
+    // shortcut), F5/F6 composite with smallest factors 641 and
+    // 274177 — both beyond the trial table, so MR does the work.
+    CHECK(hydra::is_probable_prime(Hydra{65537u}), "F4 = 65537 is prime");
+    CHECK(!hydra::is_probable_prime((Hydra{1u} << 32) + Hydra{1u}),
+          "F5 is composite");
+    CHECK(!hydra::is_probable_prime((Hydra{1u} << 64) + Hydra{1u}),
+          "F6 is composite");
+
+    // extra_mr_rounds must not change verdicts.
+    CHECK(hydra::is_probable_prime(p25519, 5),
+          "extra MR rounds keep 2^255-19 prime");
+    CHECK(!hydra::is_probable_prime(semi, 5),
+          "extra MR rounds keep semiprime composite");
+}
+
+static void test_next_prime() {
+    using hydra::Hydra;
+    CHECK(hydra::next_prime(Hydra{0u}) == Hydra{2u}, "next_prime(0) == 2");
+    CHECK(hydra::next_prime(Hydra{1u}) == Hydra{2u}, "next_prime(1) == 2");
+    CHECK(hydra::next_prime(Hydra{2u}) == Hydra{3u}, "next_prime(2) == 3");
+    CHECK(hydra::next_prime(Hydra{3u}) == Hydra{5u}, "next_prime(3) == 5");
+    CHECK(hydra::next_prime(Hydra{7u}) == Hydra{11u}, "next_prime(7) == 11");
+    CHECK(hydra::next_prime(Hydra{89u}) == Hydra{97u}, "next_prime(89) == 97");
+    CHECK(hydra::next_prime(Hydra{1'000'000u}) == Hydra{1'000'003u},
+          "next_prime(10^6) == 1000003");
+    // First prime above 2^64 is 2^64 + 13.
+    Hydra two64 = Hydra{1u} << 64;
+    CHECK(hydra::next_prime(two64) == two64 + Hydra{13u},
+          "next_prime(2^64) == 2^64 + 13");
+    // Lands exactly on a Mersenne prime.
+    Hydra m61 = (Hydra{1u} << 61) - Hydra{1u};
+    CHECK(hydra::next_prime(m61 - Hydra{1u}) == m61,
+          "next_prime(M61 - 1) == M61");
+}
+
+static void test_primality_edges() {
+    using hydra::Hydra;
+    CHECK(!hydra::is_probable_prime(Hydra{0u}), "0 is not prime");
+    CHECK(!hydra::is_probable_prime(Hydra{1u}), "1 is not prime");
+    CHECK(hydra::is_probable_prime(Hydra{2u}), "2 is prime");
+    CHECK(hydra::is_probable_prime(Hydra{3u}), "3 is prime");
+    CHECK(!hydra::is_probable_prime(Hydra{-7}), "negatives are not prime");
+    CHECK(!hydra::is_probable_prime((Hydra{1u} << 128)),
+          "big even number is composite");
+    // 66049 = 257^2: survives the trial table (257 > 256), sits
+    // exactly on the exactness boundary, must take the BPSW path
+    // and come back composite.
+    CHECK(!hydra::is_probable_prime(Hydra{66049u}),
+          "66049 = 257^2 boundary case is composite");
+}
+
 int main() {
     test_small_add();
     test_small_add_inplace();
@@ -4272,6 +4514,16 @@ int main() {
     test_fios_mont_mul_dirty_work_buffer();
     test_fios_mont_sqr_cross();
     test_fios_small_k_pow_mod_dispatch_widths();
+
+    // Primality suite (isqrt, BPSW, next_prime)
+    test_isqrt_basic();
+    test_primality_exhaustive_sieve();
+    test_primality_vs_deterministic_mr_random64();
+    test_primality_spsp2_pinned();
+    test_primality_lucas_pseudoprimes_pinned();
+    test_primality_mersenne_and_friends();
+    test_next_prime();
+    test_primality_edges();
 
 #if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
     test_aarch64_mac_row_2_matches_scalar();

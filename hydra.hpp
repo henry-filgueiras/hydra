@@ -4310,6 +4310,271 @@ struct EGCDResult {
 }
 
 // ─────────────────────────────────────────────────────────
+// Integer square root
+// ─────────────────────────────────────────────────────────
+
+// Floor square root via Newton's method.  Throws std::domain_error on
+// negative input.  Converges in O(log bits) divisions; the `y >= x`
+// stop condition yields exactly floor(sqrt(n)).
+[[nodiscard]] inline Hydra isqrt(const Hydra& n) {
+    if (n.is_negative())
+        throw std::domain_error("isqrt: negative input");
+    if (n <= Hydra{1u}) return n;
+
+    auto lv = n.limb_view();
+    const uint32_t bits =
+        64u * (lv.count - 1)
+        + (64u - static_cast<uint32_t>(__builtin_clzll(lv.ptr[lv.count - 1])));
+
+    // Initial guess: 2^ceil(bits/2) >= sqrt(n), so Newton descends
+    // monotonically to the floor root.
+    Hydra x = Hydra{1u} << ((bits + 1) / 2);
+    for (;;) {
+        Hydra y = (x + n / x) >> 1;
+        if (y >= x) return x;
+        x = std::move(y);
+    }
+}
+
+[[nodiscard]] inline bool is_perfect_square(const Hydra& n) {
+    if (n.is_negative()) return false;
+    Hydra r = isqrt(n);
+    return r * r == n;
+}
+
+// ─────────────────────────────────────────────────────────
+// Primality testing — Baillie–PSW
+// ─────────────────────────────────────────────────────────
+//
+// is_probable_prime(n) runs the BPSW test:
+//
+//   1. trial division by the odd primes < 256 (exact for n < 257²)
+//   2. one strong Miller–Rabin round, base 2
+//   3. one strong Lucas test with Selfridge (Method A) parameters
+//
+// BPSW has NO known counterexample, and is proven exact for all
+// n < 2^64 (exhaustively verified in the literature).  The base-2
+// strong-pseudoprime and strong-Lucas-pseudoprime sets are disjoint
+// as far as anyone has ever searched; every mainstream bignum
+// library's default primality test is this construction.
+//
+// `extra_mr_rounds` appends additional Miller–Rabin rounds with the
+// fixed bases 3, 5, 7, … for callers who want defense in depth.
+// Deterministic — repeated calls agree.
+//
+// Variable-time, like the rest of Hydra: inputs are assumed public.
+
+namespace detail {
+
+// Odd primes below 256.  Trial division by these is exact for
+// n < 257² = 66049 (any composite below the square has a factor
+// in the table).
+inline constexpr uint16_t SMALL_ODD_PRIMES[] = {
+      3,   5,   7,  11,  13,  17,  19,  23,  29,  31,  37,  41,
+     43,  47,  53,  59,  61,  67,  71,  73,  79,  83,  89,  97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
+    163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227,
+    229, 233, 239, 241, 251,
+};
+
+// Jacobi symbol (a/n) for word-sized operands, n odd >= 1.
+inline int jacobi_u64(uint64_t a, uint64_t n) noexcept {
+    int result = 1;
+    a %= n;
+    while (a != 0) {
+        while ((a & 1) == 0) {
+            a >>= 1;
+            const uint64_t m = n & 7;
+            if (m == 3 || m == 5) result = -result;
+        }
+        std::swap(a, n);
+        if ((a & 3) == 3 && (n & 3) == 3) result = -result;
+        a %= n;
+    }
+    return (n == 1) ? result : 0;
+}
+
+// Jacobi symbol (D/n) for small signed D and big odd n >= 3.
+// One n.mod_u64() collapses the big operand to word size, then the
+// u64 loop finishes.
+inline int jacobi_small(int64_t D, const Hydra& n) {
+    const uint64_t n_low = n.limb_view().ptr[0];
+    int result = 1;
+    uint64_t a;
+    if (D < 0) {
+        a = static_cast<uint64_t>(-D);
+        if ((n_low & 3) == 3) result = -result;      // (-1/n)
+    } else {
+        a = static_cast<uint64_t>(D);
+    }
+    if (a == 0) return 0;
+    while ((a & 1) == 0) {
+        a >>= 1;
+        const uint64_t m = n_low & 7;
+        if (m == 3 || m == 5) result = -result;      // (2/n)
+    }
+    if (a == 1) return result;
+    if ((a & 3) == 3 && (n_low & 3) == 3) result = -result;   // reciprocity
+    return result * jacobi_u64(n.mod_u64(a), a);
+}
+
+// Count trailing zero bits of a positive Hydra.
+inline uint32_t trailing_zero_bits(const Hydra& n) {
+    auto lv = n.limb_view();
+    uint32_t tz = 0;
+    for (uint32_t i = 0; i < lv.count; ++i) {
+        if (lv.ptr[i] == 0) { tz += 64; continue; }
+        return tz + static_cast<uint32_t>(__builtin_ctzll(lv.ptr[i]));
+    }
+    return tz;
+}
+
+// One strong Miller–Rabin round.  n odd >= 3, n-1 = d * 2^s.
+inline bool mr_strong_round(const Hydra& n, const Hydra& n_minus_1,
+                            const Hydra& d, uint32_t s,
+                            const Hydra& base) {
+    Hydra x = pow_mod(base, d, n);
+    if (x == Hydra{1u} || x == n_minus_1) return true;
+    for (uint32_t r = 1; r < s; ++r) {
+        x = (x * x) % n;
+        if (x == n_minus_1) return true;
+        if (x == Hydra{1u}) return false;   // nontrivial sqrt of 1
+    }
+    return false;
+}
+
+// Strong Lucas probable-prime test, Selfridge Method A parameters.
+// n odd, > 66049, not divisible by any prime < 256.
+inline bool strong_lucas_prp(const Hydra& n) {
+    // ── Select D: first of 5, -7, 9, -11, … with (D/n) == -1 ──
+    // If n is a perfect square no such D exists, so after a few
+    // failures run the (rare) square check.  (D/n) == 0 means a
+    // shared factor; with trial division done, D < n, so composite.
+    int64_t D = 5;
+    for (int attempts = 0;; ++attempts) {
+        const int j = jacobi_small(D, n);
+        if (j == 0) return false;
+        if (j == -1) break;
+        if (attempts == 12 && is_perfect_square(n)) return false;
+        D = (D > 0) ? -(D + 2) : -(D - 2);
+    }
+    const int64_t Q = (1 - D) / 4;               // P = 1
+
+    // ── n + 1 = d · 2^s ──
+    const Hydra n_plus_1 = n + Hydra{1u};
+    const uint32_t s = trailing_zero_bits(n_plus_1);
+    const Hydra d = n_plus_1 >> s;
+
+    // Reduce into [0, n) after signed ops.
+    auto norm = [&](Hydra x) {
+        x = x % n;
+        if (x.is_negative()) x = x + n;
+        return x;
+    };
+    // x/2 mod n for x in [0, n), n odd.
+    auto half = [&](Hydra x) {
+        if (!(x & Hydra{1u}).is_zero()) x = x + n;
+        return x >> 1;
+    };
+
+    // ── Binary ladder over the bits of d (MSB first) ──
+    // Invariant after processing a prefix with value m:
+    //   U = U_m mod n, V = V_m mod n, Qk = Q^m mod n.
+    Hydra U{1u}, V{1u};                          // U_1, V_1 (P = 1)
+    Hydra Qk = norm(Hydra{Q});
+    const Hydra Qn = Qk;                         // Q mod n, reused
+    const Hydra Dn = norm(Hydra{D});             // D mod n, reused
+
+    std::vector<uint64_t> d_limbs(d.limb_view().ptr,
+                                  d.limb_view().ptr + d.limb_view().count);
+    const uint32_t d_bits =
+        64u * (static_cast<uint32_t>(d_limbs.size()) - 1)
+        + (64u - static_cast<uint32_t>(__builtin_clzll(d_limbs.back())));
+
+    for (int32_t i = static_cast<int32_t>(d_bits) - 2; i >= 0; --i) {
+        // Double: m → 2m
+        Hydra U2 = (U * V) % n;
+        Hydra V2 = norm((V * V) % n - (Qk << 1));
+        Qk = (Qk * Qk) % n;
+        U = std::move(U2);
+        V = std::move(V2);
+
+        if ((d_limbs[i / 64] >> (i % 64)) & 1u) {
+            // Increment: m → m + 1
+            //   U' = (P·U + V)/2,  V' = (D·U + P·V)/2,  with P = 1
+            Hydra Un = half(norm(U + V));
+            Hydra Vn = half(norm((Dn * U) % n + V));
+            Qk = (Qk * Qn) % n;
+            U = std::move(Un);
+            V = std::move(Vn);
+        }
+    }
+
+    // ── Strong condition ──
+    // U_d ≡ 0, or V_{d·2^r} ≡ 0 for some 0 <= r < s.
+    if (U.is_zero() || V.is_zero()) return true;
+    for (uint32_t r = 1; r < s; ++r) {
+        V = norm((V * V) % n - (Qk << 1));
+        if (V.is_zero()) return true;
+        Qk = (Qk * Qk) % n;
+    }
+    return false;
+}
+
+} // namespace detail
+
+[[nodiscard]] inline bool is_probable_prime(const Hydra& n,
+                                            int extra_mr_rounds = 0) {
+    if (n.is_negative()) return false;
+    if (n < Hydra{2u}) return false;
+
+    // Even: only 2 is prime.
+    auto lv = n.limb_view();
+    if ((lv.ptr[0] & 1u) == 0) return n == Hydra{2u};
+
+    // Word-sized value for the n == p guards below.
+    const uint64_t n_word = (lv.count == 1) ? lv.ptr[0] : 0;
+
+    // ── Stage 1: trial division (exact for n < 66049) ──
+    for (uint16_t p : detail::SMALL_ODD_PRIMES) {
+        if (n_word == p) return true;
+        if (n.mod_u64(p) == 0) return false;
+    }
+    if (n_word != 0 && n_word < 66049) return true;   // < 257², no factor found
+
+    // ── Stage 2: strong Miller–Rabin, base 2 ──
+    const Hydra n_minus_1 = n - Hydra{1u};
+    const uint32_t s = detail::trailing_zero_bits(n_minus_1);
+    const Hydra d = n_minus_1 >> s;
+    if (!detail::mr_strong_round(n, n_minus_1, d, s, Hydra{2u}))
+        return false;
+
+    // ── Stage 3: strong Lucas (Selfridge parameters) ──
+    if (!detail::strong_lucas_prp(n))
+        return false;
+
+    // ── Optional extra Miller–Rabin rounds, fixed odd-prime bases ──
+    constexpr size_t N_SMALL = sizeof(detail::SMALL_ODD_PRIMES)
+                             / sizeof(detail::SMALL_ODD_PRIMES[0]);
+    for (int r = 0; r < extra_mr_rounds; ++r) {
+        const uint64_t base = detail::SMALL_ODD_PRIMES[r % N_SMALL];
+        if (n_word != 0 && base >= n_word) break;   // tiny n: bases exhausted
+        if (!detail::mr_strong_round(n, n_minus_1, d, s, Hydra{base}))
+            return false;
+    }
+    return true;
+}
+
+// Smallest prime strictly greater than n.
+[[nodiscard]] inline Hydra next_prime(const Hydra& n) {
+    if (n < Hydra{2u}) return Hydra{2u};
+    Hydra c = n + Hydra{1u};
+    if ((c & Hydra{1u}).is_zero()) c = c + Hydra{1u};
+    while (!is_probable_prime(c)) c = c + Hydra{2u};
+    return c;
+}
+
+// ─────────────────────────────────────────────────────────
 // Convenience literals
 // ─────────────────────────────────────────────────────────
 
