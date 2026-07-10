@@ -49,8 +49,9 @@
 ## Performance identity (Apple M5 Pro, 2026-07)
 - pow_mod: ~7.3 µs @256b (parity with GMP), 1.80 ms @2048b (1.65× GMP),
   14.5 ms @4096b (1.94× GMP); 3–4.5× faster than Boost cpp_int everywhere.
-- WebAssembly: whole suite passes unchanged; beats mini-gmp 4.2–6.3×, Boost
-  2.6–3.5× in-browser (GMP has no wasm asm). Small ops ≈1.1–1.3× native u64.
+- WebAssembly: whole suite passes unchanged; beats mini-gmp 5.0–7.4×, Boost
+  2.6–3.9× in-browser (GMP has no wasm asm; LLVM-only pipeline, see below).
+  Small ops ≈1.1–1.3× native u64.
 - npm package `pkg/` (hydra-bignum): bigint→bigint powMod/modInverse/primality
   API; beats native JS BigInt 2.6×@256b…1.3×@2048b, loses 0.8×@4096b (V8 is
   subquadratic). Build: `scripts/wasm_pkg.sh --test`. Publish = human step.
@@ -76,5 +77,6 @@
 - Browser timing: performance.now clamps to 100µs–1ms → batch ≥15ms per sample.
 - emcc's post-link `wasm-opt -O2` PESSIMIZES the kernels (+39%@256b…+60%@4096b
   with multiple exports). Ship LLVM-O2 only: `-g` build + passes-free
-  `wasm-opt --strip-dwarf` (see wasm_pkg.sh). Shootout/demo tables predate this
-  and are understated — re-bench before citing.
+  `wasm-opt --strip-dwarf` (see wasm_pkg.sh, wasm_bench.sh). Shootout re-benched
+  2026-07-10 under the fixed pipeline; the demo/ build + its recorded results +
+  README screenshots still use the old default pipeline (conservative).

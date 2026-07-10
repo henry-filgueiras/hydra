@@ -114,37 +114,37 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
-### WebAssembly shootout (2026-07-10)
+### WebAssembly shootout (2026-07-10, LLVM-only pipeline)
 
-_`scripts/wasm_bench.sh` — emscripten 6.0.2 `-O2` (no wasm-EH), node 26,
-min-of-2 × 50-sample medians, all three backends in one binary._
+_`scripts/wasm_bench.sh` — emscripten 6.0.2, LLVM `-O2` with binaryen
+limited to a passes-free DWARF strip (emcc's default post-link
+`wasm-opt -O2` pessimizes Hydra's kernels up to +60 % — see the
+binaryen dragon in DIRECTORS_NOTES, where the older, slower table is
+archived).  No wasm-EH, node 26, min-of-2 × 50-sample medians, all
+three backends in one binary, identical pipeline for all three._
 
 | Width | Hydra (wasm) | Boost cpp_int | mini-gmp  | vs Boost | vs mini-gmp |
 |------:|-------------:|--------------:|----------:|---------:|------------:|
-|  256  |     22.3 µs  |      78.5 µs  |   94.4 µs |   3.5×   |    4.2×     |
-|  512  |    136.7 µs  |     443.0 µs  |  686.5 µs |   3.2×   |    5.0×     |
-| 1024  |    972.4 µs  |      2.71 ms  |   5.13 ms |   2.8×   |    5.3×     |
-| 1536  |     3.14 ms  |      8.15 ms  |  17.52 ms |   2.6×   |    5.6×     |
-| 1984  |     6.68 ms  |     17.63 ms  |  37.39 ms |   2.6×   |    5.6×     |
-| 2048  |     7.42 ms  |     19.32 ms  |  41.59 ms |   2.6×   |    5.6×     |
-| 4096  |    51.66 ms  |    138.86 ms  | 325.93 ms |   2.7×   |    6.3×     |
+|  256  |     18.4 µs  |      72.5 µs  |   93.0 µs |   3.9×   |    5.0×     |
+|  512  |    102.1 µs  |     394.5 µs  |  669.9 µs |   3.9×   |    6.6×     |
+| 1024  |    722.0 µs  |      2.46 ms  |   5.09 ms |   3.4×   |    7.0×     |
+| 1536  |     2.36 ms  |      7.29 ms  |  17.15 ms |   3.1×   |    7.3×     |
+| 1984  |     5.06 ms  |     15.54 ms  |  36.89 ms |   3.1×   |    7.3×     |
+| 2048  |     5.61 ms  |     17.31 ms  |  41.31 ms |   3.1×   |    7.4×     |
+| 4096  |    48.19 ms  |    126.06 ms  | 323.49 ms |   2.6×   |    6.7×     |
 
 _mini-gmp is GMP's bundled portable fallback — what GMP-dependent code
 becomes on wasm32, where GMP's asm doesn't exist.  Hydra's advantage
-**widens** with width (4.2× → 6.3× vs mini-gmp).  The wasm-vs-native
-tax on Hydra itself is ~3-4× (7.42 ms vs 1.88 ms at 2048-bit),
-dominated by software lowering of the 64×64→128 multiply.
-`-fwasm-exceptions` costs Hydra a further ~15 % and is left off for
-benches (nothing throws in the timed path); the test suite needs it._
-
-_**Caveat discovered 2026-07-10 (binaryen):** the numbers above went
-through emcc's default post-link `wasm-opt -O2`, which pessimizes
-Hydra's kernels — the LLVM-only pipeline used by `scripts/wasm_pkg.sh`
-measures 17.5 µs / 5.76 ms / 48.1 ms at 256/2048/4096-bit on the same
-machine (−22 % / −22 % / −7 % vs this table).  The comparators would
-need re-benching under the same pipeline before the table is updated —
-see "Dragon — binaryen wasm-opt pessimizes the Montgomery kernels" in
-DIRECTORS_NOTES._
+**widens** with width (5.0× → 7.4× vs mini-gmp through 2048-bit).
+The pipeline fix helped Hydra far more than the comparators (−26 % vs
+−11 % Boost / −0.7 % mini-gmp at 2048-bit): binaryen's rewrites hurt
+Hydra's fused-accumulator kernels specifically.  The wasm-vs-native
+tax on Hydra is ~2.5-3.1× (5.61 ms vs 1.80 ms at 2048-bit), dominated
+by software lowering of the 64×64→128 multiply.  `-fwasm-exceptions`
+costs Hydra a further ~15 % and is left off for benches (nothing
+throws in the timed path); the test suite needs it.  The live demo
+(`demo/`) still builds with the old default pipeline — its on-screen
+numbers are conservative until it's migrated._
 
 ---
 

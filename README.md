@@ -139,22 +139,25 @@ Native GMP's speed comes from per-architecture assembly, which doesn't
 exist for wasm32 — compile GMP-dependent code to WebAssembly and you
 get **mini-gmp**, its portable fallback.  Hydra's performance story is
 pure portable C++, so it carries to wasm nearly intact.  Head-to-head
-under node (emscripten `-O2`, `pow_mod`, median latency,
-`scripts/wasm_bench.sh`):
+under node (`pow_mod`, median latency, `scripts/wasm_bench.sh` —
+LLVM `-O2`, identical pipeline for all three backends; emcc's default
+post-link `wasm-opt` pass is skipped, it costs Hydra up to 60 %):
 
 | Width | **Hydra (wasm)** | Boost cpp_int (wasm) | mini-gmp (wasm) | vs Boost | vs mini-gmp |
 |------:|-----------------:|---------------------:|----------------:|---------:|------------:|
-|  256  |    **22.3 µs**   |        78.5 µs       |     94.4 µs     |   3.5×   |    4.2×     |
-| 1024  |    **972 µs**    |        2.71 ms       |     5.13 ms     |   2.8×   |    5.3×     |
-| 2048  |    **7.42 ms**   |        19.3 ms       |     41.6 ms     |   2.6×   |    5.6×     |
-| 4096  |    **51.7 ms**   |        139 ms        |      326 ms     |   2.7×   |    6.3×     |
+|  256  |    **18.4 µs**   |        72.5 µs       |     93.0 µs     |   3.9×   |    5.0×     |
+| 1024  |    **722 µs**    |        2.46 ms       |     5.09 ms     |   3.4×   |    7.0×     |
+| 2048  |    **5.61 ms**   |        17.3 ms       |     41.3 ms     |   3.1×   |    7.4×     |
+| 4096  |    **48.2 ms**   |        126 ms        |      323 ms     |   2.6×   |    6.7×     |
 
 The full 989-test suite passes under wasm with zero source changes
 (`scripts/wasm_bootstrap.sh --full`; CI runs it on every push).
 Try it yourself: `scripts/wasm_demo.sh --serve` builds a
 self-contained page (`demo/`) that runs this exact shootout live in
 your browser — three backends, cross-checked for agreement before
-timing, ~150 KB total:
+timing, ~150 KB total.  (The demo still builds with emcc's default
+pipeline, so its on-screen Hydra numbers — and this screenshot — are
+conservative relative to the table above until it's migrated):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/demo_reference_dark.png">

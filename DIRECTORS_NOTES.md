@@ -5184,4 +5184,40 @@ npm 4096-bit 0.8× loss for batch workloads).
 
 ---
 
+### Wasm Shootout Re-Benched Under the LLVM-Only Pipeline
+
+_2026-07-10 — Claude Fable 5.  Resolves follow-up (a) of "Dragon —
+binaryen wasm-opt pessimizes the Montgomery kernels"._
+
+`scripts/wasm_bench.sh` now builds with `-O2 -g` + passes-free
+`wasm-opt --strip-dwarf --strip-producers` (identical treatment for
+all three backends), matching wasm_pkg.sh.  Result: Hydra gains far
+more than the comparators — the binaryen damage was concentrated in
+Hydra's fused-accumulator kernels, not generic C:
+
+| Width | Hydra old→new | Boost old→new | mini-gmp old→new |
+|------:|--------------:|--------------:|-----------------:|
+|  256  | 22.3→18.4 µs (−17 %) | 78.5→72.5 µs (−8 %) | 94.4→93.0 µs (−1 %) |
+| 2048  | 7.42→5.61 ms (−24 %) | 19.3→17.3 ms (−10 %) | 41.6→41.3 ms (−1 %) |
+| 4096  | 51.7→48.2 ms (−7 %)  | 139→126 ms (−9 %)   | 326→323 ms (−1 %)  |
+
+Headline ratios move up: **vs mini-gmp 4.2–6.3× → 5.0–7.4×; vs Boost
+2.6–3.5× → 2.6–3.9×** (peak at 2048-bit: 7.4×/3.1×).  Wasm-vs-native
+tax narrows to 2.5×@256b / 3.1×@2048b.  perf_snapshot.md, README, and
+llms.txt updated; the pre-fix table is preserved in the original
+2026-07-10 wasm-shootout dragon entry above.
+
+**Still open from the dragon:** the live demo (`demo/` +
+`scripts/wasm_demo.sh` + the CI Pages deploy) builds with the default
+pipeline — its on-screen numbers, its recorded-results fallback, and
+the README screenshots are now conservative.  Migrating it needs a
+`Module.wasmBinary` embed (SINGLE_FILE can't be post-link-stripped)
+or a two-file demo, then re-recording `#reference` results and
+re-shooting the light/dark screenshots.  README and llms.txt carry
+explicit "demo numbers are conservative" notes until then.  Also
+still open: pass-level bisection of *which* binaryen pass does the
+damage (upstream-report material).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

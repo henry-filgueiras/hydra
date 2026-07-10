@@ -56,13 +56,28 @@ say "compiling three-way shootout (Hydra + mini-gmp + Boost cpp_int)…"
 # and wasm EH costs Hydra ~35% at 2048-bit (8.55 ms vs 6.3 ms measured
 # 2026-07-10).  All three backends get the same EH-free treatment.
 # hydra_test, by contrast, NEEDS -fwasm-exceptions (see wasm_bootstrap).
-emcc -std=c++20 -O2 -DNDEBUG -I. \
+#
+# -g + passes-free strip, NOT plain -O2: emcc's default post-link
+# `wasm-opt -O2` pessimizes hot bignum kernels (measured up to +60% on
+# Hydra pow_mod, 2026-07-10 — see "Dragon — binaryen wasm-opt
+# pessimizes the Montgomery kernels").  -g limits binaryen to minimal
+# passes, keeping LLVM's -O2 output; the DWARF is stripped after.
+# All three backends get the identical pipeline.
+WASM_OPT="$(command -v wasm-opt || true)"
+[[ -n "$WASM_OPT" ]] || WASM_OPT="$(em-config BINARYEN_ROOT 2>/dev/null)/bin/wasm-opt"
+[[ -x "$WASM_OPT" ]] || fail "wasm-opt not found (PATH or em-config BINARYEN_ROOT)"
+
+emcc -std=c++20 -O2 -g -DNDEBUG -I. \
     -DHYDRA_POWMOD_GMP -DHYDRA_POWMOD_BOOST \
     -I"$MINIGMP_DIR" -I"$BOOST_INC" \
     bench/bench_pow_mod.cpp hydra.cpp "$MINIGMP_DIR/mini-gmp.o" \
     -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=8388608 \
-    -o "$WASM_DIR/bench_pow_mod_shootout.js"
+    -o "$WASM_DIR/bench_pow_mod_shootout.js" \
+    2> >(grep -v 'limited binaryen' >&2 || true)
+
+"$WASM_OPT" --all-features --strip-dwarf --strip-producers \
+    "$WASM_DIR/bench_pow_mod_shootout.wasm" -o "$WASM_DIR/bench_pow_mod_shootout.wasm"
 
 # ── Run ──────────────────────────────────────────────────────
 say "running under node ${RUNS_ARGS[*]} (mini-gmp at 4096-bit is slow — be patient)…"

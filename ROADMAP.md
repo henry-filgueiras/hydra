@@ -53,10 +53,12 @@ isPerfectSquare), 151-check node suite, CI job, ~96 KB dist.  Headline
 256/512/1024/2048-bit; honest 0.8× at 4096** (V8 multiplies
 subquadratically — Toom-Cook is Track B fodder).  Big side discovery:
 emcc's post-link `wasm-opt -O2` pessimizes Hydra kernels up to 60 % —
-the package ships an LLVM-only pipeline; **follow-up: re-bench the
-shootout + demo under the same pipeline** (perf_snapshot tables are
-currently understated).  Publishing to npm is deliberately left to a
-human (account, name claim, provenance)._
+the package ships an LLVM-only pipeline; the shootout was re-benched
+under it same-day (**vs mini-gmp 4.2–6.3× → 5.0–7.4×**, tables
+updated); remaining follow-up: migrate the live demo to the fixed
+pipeline + re-record its reference results and README screenshots.
+Publishing to npm is deliberately left to a human (account, name
+claim, provenance)._
 JS `BigInt` has no modular-exponentiation primitive; `(a ** e) % m` is
 non-modular and hand-rolled square-and-multiply over BigInt is slow and
 allocation-heavy.  Hydra is already the fastest bignum measured in wasm
