@@ -1,0 +1,72 @@
+# Hydra — llms.txt (AI-agent digest, ~1.5K tokens)
+
+> Header-only C++20 arbitrary-precision integer library. One class, `hydra::Hydra`,
+> with a tiered runtime representation: Small (≤64-bit, register-speed, no heap),
+> Medium (65–192-bit, inline payload), Large (heap limbs). Sign-magnitude signed
+> arithmetic. Variable-time by design — public-input workloads only (verification,
+> VDFs, primality), never secret keys. MIT. Repo: github.com/henry-filgueiras/hydra
+
+## Read this first, not the big docs
+- `DIRECTORS_NOTES.md` (~80K tokens) = full design history: Current Canon (present
+  truth) + Resolved Dragons (append-only experiment log incl. null results). Grep
+  its `### ` headers; read only the section you need.
+- `perf_snapshot.md` = current benchmark tables. `CLAUDE.md` = repo working rules
+  (update notes + commit per exchange, never push).
+- All implementation is in `hydra.hpp` (~4600 lines). `hydra.cpp` is a stub TU.
+
+## Public API (namespace hydra)
+- Construction: `Hydra{int/uint any width}` (implicit), `Hydra{"‑123…"}` (decimal
+  string), `Hydra::from_limbs(const uint64_t*, uint32_t)` (LSB-first magnitude).
+- Operators: `+ - * / % << >> & | ^ ~ == <=> +=` etc. Signed semantics; division
+  truncates toward zero; `&|^` throw std::domain_error on negative operands; `~x`
+  = −(x+1). Bit-shift counts are unsigned ints.
+- Methods: `.divmod(b)` → `{quotient, remainder}`, `.div_u64(u)`, `.mod_u64(u)`
+  (zero-heap), `.to_string()`, `.is_zero()`, `.is_negative()`, `.limb_view()` →
+  `{const uint64_t* ptr, uint32_t count}` (LSB-first magnitude; count 0 = zero).
+- Free functions: `abs, gcd, extended_gcd` (→ `{gcd,x,y}` Bézout), `pow_mod(base,
+  exp, mod)` (Montgomery for odd mod ≤4096 bits, else naive; throws on mod≤0 or
+  exp<0), `isqrt` (floor, throws on negative), `is_perfect_square`,
+  `is_probable_prime(n, extra_mr_rounds=0)` (Baillie–PSW: trial<256 → MR base 2 →
+  strong Lucas/Selfridge; exact <2^64, no known counterexample), `next_prime`.
+- Literal: `123_h`.
+
+## Internals map (detail::, hydra.hpp)
+- Kernels: `add/sub/mul_limbs`, `mul_3x3/4x4/8x8`, `mul_karatsuba` (≥32 limbs via
+  `mul_general`), `divmod_knuth_limbs` (Knuth D), `shl/shr_limbs`,
+  `divmod_u64_limbs`.
+- Montgomery (pow_mod engine): dispatch is FIOS (dual-row CIOS,
+  `montgomery_mul_fios`) at every k=1..64; squaring uses
+  `montgomery_sqr_fios_halved` (cross-term halving, ~1.5k² MACs) for k≤32
+  (`HALVED_SQR_MAX_K`), sqr-as-mul above. Sliding window is adaptive: W=6 for
+  exponents ≥512 bits, else W=4 (`HYDRA_POWMOD_WINDOW` forces fixed W for
+  sweeps). Retired-but-callable references (tests/AB only, NOT dispatched):
+  `montgomery_mul{,_fused,_sos,_karatsuba}`.
+- Key invariants: results always normalized to smallest tier; zero is Small,
+  non-negative, limb count 0; kernels are magnitude-only, sign applied by
+  operators; `work` buffers k+2 limbs for FIOS.
+
+## Performance identity (Apple M5 Pro, 2026-07)
+- pow_mod: ~7.3 µs @256b (parity with GMP), 1.80 ms @2048b (1.65× GMP),
+  14.5 ms @4096b (1.94× GMP); 3–4.5× faster than Boost cpp_int everywhere.
+- WebAssembly: whole suite passes unchanged; beats mini-gmp 4.2–6.3×, Boost
+  2.6–3.5× in-browser (GMP has no wasm asm). Small ops ≈1.1–1.3× native u64.
+
+## Build / test / bench
+- Tests: `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --target
+  hydra_test -j && ./build/hydra_test` (Debug = ASan+UBSan; 989 tests). Release
+  mirror in `build-rel`. CI: `.github/workflows/ci.yml` (native matrix + wasm).
+- Benchmarks: `./build-rel/bench_pow_mod --runs 6 --md` (min-of-medians +
+  cross-run CV — ALWAYS use --runs, never single-run deltas; noise ±10% at small
+  widths). Probes in `bench/probe_*.cpp` (kernel + "pow_mod cadence" layers).
+- wasm: `scripts/wasm_bootstrap.sh` (toolchain), `wasm_bench.sh` (shootout),
+  `wasm_demo.sh [--serve]` (in-browser demo, `demo/`). mini-gmp is fetched, never
+  vendored (LGPL). Bench builds are wasm-EH-free (-fwasm-exceptions costs ~15%);
+  hydra_test needs -fwasm-exceptions.
+
+## Hard-won rules (cost real time to learn — don't relearn)
+- Re-sweep every dispatch threshold whose other side changed (paid out twice).
+- Kernel-probe wins can invert e2e; the k+2-limb fused accumulator locality is
+  the decisive Montgomery invariant; 2k-limb intermediates lose under cadence.
+- asm/PGO/__restrict at these kernels: all measured null on M5 Pro — don't retry
+  without a structural change (see Resolved Dragons).
+- Browser timing: performance.now clamps to 100µs–1ms → batch ≥15ms per sample.

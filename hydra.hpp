@@ -4105,11 +4105,33 @@ struct EGCDResult {
     std::memset(result_mont_buf, 0, k * sizeof(uint64_t));
 
     // ── Sliding window precomputation ──
-    // Window size W=4: precompute base^1, base^3, base^5, ..., base^15
-    // in Montgomery form.  table[i] = base^(2i+1) for i in [0..7].
-    constexpr uint32_t WINDOW = 4;
-    constexpr uint32_t TABLE_SIZE = 1u << (WINDOW - 1);  // 8
-    uint64_t table[TABLE_SIZE][MAX_K];
+    // Window size W: precompute base^1, base^3, …, base^(2^W − 1)
+    // in Montgomery form.  table[i] = base^(2i+1).
+    //
+    // W is adaptive on the exponent bit length (measured 2026-07-10,
+    // min of 3×2 interleaved --runs medians per W):
+    //   W=6 beats W=4 at every width ≥ 512-bit (−1.7 % @512 rising
+    //   to −5.3 % @1984); at 256-bit W=6 costs +2.4 % (the 32-entry
+    //   table build doesn't amortize over a 256-bit exponent) and
+    //   W=5 is a wash.  Threshold: exponents ≥ 512 bits use W=6,
+    //   below that W=4.  HYDRA_POWMOD_WINDOW forces a fixed W for
+    //   A/B sweeps (build with -DHYDRA_POWMOD_WINDOW=5 etc.).
+    const uint32_t exp_bits_for_window = [&] {
+        auto lv = exp.limb_view();
+        if (lv.count == 0) return 0u;
+        return 64u * (lv.count - 1)
+             + (64u - static_cast<uint32_t>(
+                          __builtin_clzll(lv.ptr[lv.count - 1])));
+    }();
+#ifdef HYDRA_POWMOD_WINDOW
+    const uint32_t WINDOW = HYDRA_POWMOD_WINDOW;
+    (void)exp_bits_for_window;
+#else
+    const uint32_t WINDOW = (exp_bits_for_window >= 512) ? 6u : 4u;
+#endif
+    const uint32_t TABLE_SIZE = 1u << (WINDOW - 1);
+    constexpr uint32_t TABLE_SIZE_MAX = 32;   // W ≤ 6
+    uint64_t table[TABLE_SIZE_MAX][MAX_K];
 
     // ── Montgomery mul/sqr dispatch helpers ──
     // Single-tier dispatch: FIOS (dual-row CIOS) at every k = 1..64.

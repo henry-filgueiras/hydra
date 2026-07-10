@@ -317,6 +317,7 @@ Completed:
 * [x] benchmarking vs `boost::multiprecision::cpp_int`
 
 * [x] WebAssembly: full test suite + pow_mod shootout vs mini-gmp/Boost (`scripts/wasm_bootstrap.sh`, `scripts/wasm_bench.sh`)
+* [x] `llms.txt` — compact machine-readable project digest (API, internals map, perf identity) for AI agents and quick onboarding
 
 Active roadmap:
 

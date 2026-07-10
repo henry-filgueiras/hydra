@@ -1,5 +1,13 @@
 # Working guidelines for this repo
 
+## Orientation — read `llms.txt` FIRST
+`llms.txt` at the repo root is a ~1.5K-token digest: API surface, internals
+map, current perf numbers, build/test/bench commands, and the hard-won
+measurement rules.  Read it before opening `hydra.hpp` (~4600 lines) or
+`DIRECTORS_NOTES.md` (~80K tokens — grep its `### ` headers and read only
+the section you need).  Keep `llms.txt` current: when an exchange changes
+the API, dispatch, or headline numbers, update it in the same commit.
+
 ## Per-exchange checklist
 An "exchange" is one user request, start to finish. Before declaring it done:
 

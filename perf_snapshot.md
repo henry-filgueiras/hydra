@@ -26,18 +26,20 @@ rebuilt this pass; their code is unchanged)._
 
 | Width | Hydra (now)  | Hydra (prior)| Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
 |------:|-------------:|-------------:|-----------:|----------:|----------:|------------:|----------------:|
-|   256 |    7.08 µs   |    7.29 µs   |      −3 %  |  7.21 µs  |  5.29 µs  |   **0.98×** |           1.34× |
-|   512 |   32.71 µs   |   36.42 µs   |     −10 %  | 27.58 µs  | 19.00 µs  |       1.19× |           1.72× |
-|  1024 |  221.90 µs   |  234.56 µs   |      −5 %  | 152.63 µs | 109.75 µs |       1.45× |           2.02× |
-|  1536 |  755.96 µs   |  781.12 µs   |      −3 %  | 461.67 µs | 336.75 µs |       1.64× |           2.24× |
-|  1984 |    1.74 ms   |    1.78 ms   |      −2 %  |   1.03 ms |   1.65 ms |       1.69× |           1.05× |
-|  2048 |    1.88 ms   |    2.59 ms   |   **−27 %**|   1.09 ms |  782.9 µs |       1.72× |           2.40× |
-|  4096 |   15.35 ms   |   20.13 ms   |   **−24 %**|   7.47 ms |   5.82 ms |       2.05× |           2.64× |
+|   256 |    7.42 µs   |    7.29 µs   |      +2 %  |  7.21 µs  |  5.29 µs  |       1.03× |           1.40× |
+|   512 |   32.20 µs   |   36.42 µs   |     −12 %  | 27.58 µs  | 19.00 µs  |       1.17× |           1.69× |
+|  1024 |  218.40 µs   |  234.56 µs   |      −7 %  | 152.63 µs | 109.75 µs |       1.43× |           1.99× |
+|  1536 |  729.20 µs   |  781.12 µs   |      −7 %  | 461.67 µs | 336.75 µs |       1.58× |           2.17× |
+|  1984 |    1.64 ms   |    1.78 ms   |      −8 %  |   1.03 ms |   1.65 ms |       1.59× |           0.99× |
+|  2048 |    1.80 ms   |    2.59 ms   |   **−31 %**|   1.09 ms |  782.9 µs |       1.65× |           2.30× |
+|  4096 |   14.48 ms   |   20.13 ms |   **−28 %**|   7.47 ms |   5.82 ms |   **1.94×** |           2.49× |
 
-_256-bit now **beats GMP** (0.98×).  2048/4096-bit moved from
-Karatsuba+REDC to FIOS; the 1984→2048-bit cliff (+45 % for a 3 % width
-step) is gone (1.74 → 1.88 ms).  256…2048-bit additionally carry the
-halved-squaring win.  Cross-run CV at 2048/4096: 1.2 % / 0.3 %._
+_Cumulative 2026-07-10 arc: threshold retirement + halved squaring +
+adaptive window.  4096-bit is now **under 2× GMP**; 1984-bit is at
+parity with OpenSSL (0.99×); 256-bit sits at parity with GMP
+(0.98×–1.03× across runs — the adaptive-window plumbing costs ~1 %
+there, traded for −4 to −6 % at ≥1536-bit).  The 1984→2048-bit
+Karatsuba cliff is gone.  Cross-run CV at 2048/4096: ~1 % / 0.3 %._
 
 ---
 

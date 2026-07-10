@@ -4859,4 +4859,69 @@ the two scripts cover the repo's own needs.
 
 ---
 
+### Adaptive Sliding Window (W=4 → W=6 at ≥512-bit exponents) + llms.txt
+
+_Implemented 2026-07-10 — Claude Fable 5_
+_Status: **shipped** — third stale-constant dragon of the same species
+(FUSED_THRESHOLD, KARATSUBA_MONT_THRESHOLD, now WINDOW).  −3.7 % at
+2048-bit, −5.6 % at 4096-bit end-to-end; 4096-bit drops **under 2×
+GMP** (1.94×) and 1984-bit reaches parity with OpenSSL (0.99×)._
+
+#### Measurement
+
+`WINDOW = 4` in `pow_mod_montgomery` had never been re-measured since
+it was written.  Made it macro-overridable (`HYDRA_POWMOD_WINDOW`),
+built three fixed-W binaries, interleaved 3×(--runs 2) each:
+
+| bits | W=4      | W=5      | W=6      | Δ6 vs 4 |
+|-----:|---------:|---------:|---------:|--------:|
+|  256 |   7.2 µs |   7.2 µs |   7.4 µs |  +2.4 % |
+|  512 |  32.5 µs |  32.0 µs |  31.9 µs |  −1.7 % |
+| 1024 | 220.9 µs | 216.3 µs | 214.0 µs |  −3.1 % |
+| 1536 | 752.5 µs | 735.4 µs | 718.9 µs |  −4.5 % |
+| 1984 |  1.71 ms |  1.65 ms |  1.62 ms |  −5.3 % |
+| 2048 |  1.87 ms |  1.82 ms |  1.79 ms |  −4.3 % |
+| 4096 | 15.20 ms | 14.76 ms | 14.50 ms |  −4.6 % |
+
+Monotone in W at every width ≥512; only 256-bit pays (the 32-entry
+table build doesn't amortize over a 256-bit exponent).
+
+#### Landed: adaptive W by exponent bit length
+
+`W = exp_bits >= 512 ? 6 : 4`; table array sized for W=6
+(`TABLE_SIZE_MAX = 32`, +14 KB stack, allocation-only).
+`HYDRA_POWMOD_WINDOW` forces a fixed W for future sweeps.
+
+Adaptive vs old fixed-4, interleaved e2e (min of 3×2 + focused
+recheck): −0.9 % @512, −1.2 % @1024, −2.9 % @1536, −4.7 % @1984,
+−3.7 % @2048, −5.6 % @4096 — and **+1.2 % @256** (~90 ns absolute),
+confirmed real in a focused 4×2 interleave: the runtime `WINDOW`
+stops the table-build and window-scan loop bounds constant-folding.
+Accepted as-is; if anyone wants the 90 ns back, a C++20 templated
+lambda specializing the scan loop on W∈{4,6} would restore
+constexpr-ness at some structural churn.  989 tests pass (the ≥512
+pow_mod-vs-naive tests now exercise the W=6 path).
+
+#### llms.txt — low-token agent digest (director's tangent)
+
+New root file `llms.txt` (~1.5K tokens): what Hydra is, the full
+public API with one-line semantics, internals/dispatch map, current
+perf identity, build/test/bench commands, and the hard-won
+measurement rules — so an agent (or human) gets oriented without
+reading `hydra.hpp` (~4600 lines) or this file (~80K tokens).
+`CLAUDE.md` now points at it first and requires keeping it current
+in the same commit as API/dispatch/number changes.  Rationale: this
+repo's own history shows each session re-reading large docs to
+rediscover facts that fit in a page.
+
+#### Next-sprint ranking (unchanged otherwise)
+
+1. **Cross-row software pipelining for halved squaring at k > 32** —
+   the remaining named perf lever (~5 % at 4096-bit if it works).
+2. Packaging polish (FetchContent snippet, release tag) — Phase 3.
+3. The 256-bit window plumbing micro-recovery (templated lambda) —
+   only if someone is chasing the last percent at small widths.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
