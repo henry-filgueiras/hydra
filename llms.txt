@@ -11,7 +11,8 @@
   truth) + Resolved Dragons (append-only experiment log incl. null results). Grep
   its `### ` headers; read only the section you need.
 - `perf_snapshot.md` = current benchmark tables. `CLAUDE.md` = repo working rules
-  (update notes + commit per exchange, never push).
+  (update notes + commit per exchange, never push). `ROADMAP.md` = moonshot
+  tracks (A=adoption, B=perf, C=trust/meta) with dependency graph + statuses.
 - All implementation is in `hydra.hpp` (~4600 lines). `hydra.cpp` is a stub TU.
 
 ## Public API (namespace hydra)

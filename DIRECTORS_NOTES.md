@@ -1596,6 +1596,14 @@ dedicated design pass and its own benchmark discipline — revisit only
 with a concrete consumer), Python/Node bindings (wasm story first;
 bindings follow demand), sub-quadratic division (no workload asks yet).
 
+_2026-07-10 update: superseded-in-part by **`ROADMAP.md`** at the repo
+root — moonshot tracks (A=adoption, B=deep engineering, C=trust/meta)
+with a dependency graph and per-item statuses.  Item 3 of this list
+became executable as roadmap item A2 (VDF demo); item 5 feeds C1
+(OSS-Fuzz).  The "Node bindings deferred" line above is revised:
+roadmap A1 ships a JS/TS wasm package — the wasm story landed, so
+bindings-follow-demand now points at the browser, not native Node._
+
 ---
 
 ### Benchmark & Tooling Infrastructure
@@ -4985,6 +4993,29 @@ true` should create the site on first deploy; if the token lacks
 permission, one manual step remains (Settings → Pages → Source:
 "GitHub Actions").  Deploy is gated `needs: [native, wasm]` and
 push-to-main only, with a `pages-deploy` concurrency group.
+
+---
+
+### Moonshot Roadmap Catalogued (ROADMAP.md)
+
+_2026-07-10 — Claude Fable 5_
+
+At the director's request, the brainstorm beyond the Phase 3 backlog
+was formalized into **`ROADMAP.md`**: three tracks with a Mermaid
+dependency graph and per-item statuses.  Track A (adoption): A1 npm
+package / JS-BigInt interop ("JavaScript's missing powmod"), A2
+in-browser Wesolowski VDF verification demo (blocked on A1), A3
+Compiler Explorer + amalgamated release.  Track B (deep engineering):
+B1 batched `pow_mod` — SIMD across *independent* exponentiations,
+i.e. the structural change that the single-op asm null results demand
+before any NEON retry; B2 subquadratic base conversion.  Track C
+(trust/meta): C1 OSS-Fuzz enrollment (feeds off Phase 3 item 5), C2
+publishing Resolved Dragons as a perf-engineering casebook, C3
+tooling-harness extraction gated on a second consumer (manifest
+first).  Sequencing decision: A1 → A3 → B1 → A2.  The Phase 3
+"Node bindings deferred" stance was revised in place (annotated, old
+text preserved) — A1 is the bindings work, aimed at the browser.
+Statuses live in ROADMAP.md, not here.
 
 ---
 
