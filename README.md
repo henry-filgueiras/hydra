@@ -53,6 +53,18 @@ ciphertext: 2790
 recovered:  65
 ```
 
+**Getting Hydra** — it's one header.  Copy `hydra.hpp` into your
+project, or via CMake:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(hydra
+  GIT_REPOSITORY https://github.com/henry-filgueiras/hydra.git
+  GIT_TAG        main)
+FetchContent_MakeAvailable(hydra)          # exports just hydra_core —
+target_link_libraries(app PRIVATE hydra_core)  # no test/bench deps pulled
+```
+
 Arbitrary-precision arithmetic just works:
 
 ```cpp

@@ -162,6 +162,22 @@ else()
 endif()
 
 # ─────────────────────────────────────────────────────────
+# Consumers stop here.
+#
+# Everything below (tests, Google Benchmark via FetchContent, the
+# comparison benchmarks) is for developing Hydra itself.  Projects
+# pulling Hydra in via FetchContent / add_subdirectory get just the
+# header-only `hydra_core` interface target and none of the
+# dependency downloads.  Override with
+# -DHYDRA_BUILD_TESTS_AND_BENCH=ON if you want them anyway.
+# ─────────────────────────────────────────────────────────
+option(HYDRA_BUILD_TESTS_AND_BENCH
+       "Build Hydra's own tests and benchmarks" ${PROJECT_IS_TOP_LEVEL})
+if(NOT HYDRA_BUILD_TESTS_AND_BENCH)
+    return()
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Tests
 # ─────────────────────────────────────────────────────────
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hydra_test.cpp")
