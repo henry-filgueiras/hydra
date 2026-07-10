@@ -193,6 +193,75 @@ double hydra_bench_cell(int backend, int bits, int samples) {
     return -1.0;
 }
 
+// ── Playground exports ───────────────────────────────────────
+// String-based API for the interactive panel: decimal strings in,
+// comma-separated decimal strings out (no JSON escaping across the
+// boundary — the page does all presentation).  Returned pointers
+// stay valid until the next call (static buffer).
+
+static std::string g_out;
+
+// Toy RSA keypair: two (bits/2)-bit primes via next_prime from a
+// seeded random start, e = 65537, d = e^-1 mod φ via extended_gcd.
+// EDUCATIONAL ONLY — Hydra is variable-time; the page says so too.
+// Returns "p,q,n,d,keygen_ms" (decimal).
+EMSCRIPTEN_KEEPALIVE
+const char* hydra_rsa_keygen(int bits, double seed) {
+    const double t0 = emscripten_get_now();
+    const uint32_t half = static_cast<uint32_t>(bits) / 2;
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    auto random_start = [&](uint64_t salt) {
+        std::mt19937_64 r(rng() ^ salt);
+        auto limbs = make_limb_array(half, r());
+        return Hydra::from_limbs(limbs.data(),
+                                 static_cast<uint32_t>(limbs.size()));
+    };
+
+    const Hydra e{65537u};
+    Hydra p = hydra::next_prime(random_start(0x9E3779B97F4A7C15ull));
+    Hydra q, phi, d;
+    for (uint64_t salt = 1;; ++salt) {
+        q = hydra::next_prime(random_start(salt));
+        if (q == p) continue;
+        phi = (p - Hydra{1u}) * (q - Hydra{1u});
+        auto eg = hydra::extended_gcd(e, phi);
+        if (!(eg.gcd == Hydra{1u})) continue;   // e | φ — re-roll q (rare)
+        d = eg.x % phi;
+        if (d.is_negative()) d = d + phi;
+        break;
+    }
+    const double ms = emscripten_get_now() - t0;
+
+    g_out = p.to_string() + "," + q.to_string() + ","
+          + (p * q).to_string() + "," + d.to_string() + ","
+          + std::to_string(ms);
+    return g_out.c_str();
+}
+
+// Smallest prime > start (decimal string).  Returns "prime,ms".
+EMSCRIPTEN_KEEPALIVE
+const char* hydra_next_prime_str(const char* start_dec) {
+    const Hydra start{start_dec};
+    const double t0 = emscripten_get_now();
+    Hydra p = hydra::next_prime(start);
+    const double ms = emscripten_get_now() - t0;
+    g_out = p.to_string() + "," + std::to_string(ms);
+    return g_out.c_str();
+}
+
+// (base^exp) mod m on decimal strings.  Returns "result,ms".
+EMSCRIPTEN_KEEPALIVE
+const char* hydra_powmod_str(const char* base_dec, const char* exp_dec,
+                             const char* mod_dec) {
+    const Hydra b{base_dec}, e{exp_dec}, m{mod_dec};
+    const double t0 = emscripten_get_now();
+    Hydra r = hydra::pow_mod(b, e, m);
+    const double ms = emscripten_get_now() - t0;
+    g_out = r.to_string() + "," + std::to_string(ms);
+    return g_out.c_str();
+}
+
 // Cross-check all compiled backends agree at the given width.
 // Returns 1 on agreement, 0 on mismatch.
 EMSCRIPTEN_KEEPALIVE

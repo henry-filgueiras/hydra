@@ -4924,4 +4924,45 @@ rediscover facts that fit in a page.
 
 ---
 
+### Browser Playground — Live Primes & Toy RSA in the Demo
+
+_Implemented 2026-07-10 — Claude Fable 5 (same day; director asked for
+"things that would light up the browser scenario")_
+_Status: **shipped** — the wasm demo page gains an interactive panel:
+one-click prime generation (random n-bit start → `next_prime`) and a
+textbook-RSA round-trip (type a message → keygen → encrypt → decrypt),
+all timed, all running in the visitor's browser._
+
+#### What it demonstrates
+
+The whole 2026-07-10 façade in one visceral flow: `next_prime`/BPSW
+generates two (bits/2)-bit primes, `extended_gcd` computes
+d = e⁻¹ mod φ, `pow_mod` does the encrypt/decrypt.  Measured under
+node: 1024-bit keypair ≈ 13 ms, 512-bit ≈ 2 ms — prime generation is
+so fast in wasm it reads as instant in the UI.  A prominent
+**educational-toy disclaimer** (variable-time, never for real keys)
+sits in the panel copy, consistent with the README's stance.
+
+#### Design decisions
+
+- **C++ exports stay minimal and string-based** (`hydra_rsa_keygen`,
+  `hydra_next_prime_str`, `hydra_powmod_str` — decimal CSV out, static
+  buffer).  JS/BigInt does all text↔number encoding and presentation,
+  so no JSON escaping crosses the wasm boundary and the generic
+  powmod-on-strings export is reusable for future panels.
+- Message capacity guard: m < 2^(bits−16); random prime starts come
+  from `crypto.getRandomValues` on the JS side, keygen seeds the C++
+  RNG from Date.now (toy-grade by design, matching the disclaimer).
+- e | φ re-roll loop on q (rare), p ≠ q guard, d normalized to [0, φ).
+
+#### Validation
+
+Node smoke: `p·q == n` checked with BigInt, RSA round-trip verified
+numerically at 512/1024-bit, `next_prime(2^255)` returns a prime above
+the start with sane timing.  Page JS `node --check`ed; headless Chrome
+boots the page to "Ready" with the panel present.  Artifact redeployed
+(same URL).  The library itself is untouched — demo-only exports.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

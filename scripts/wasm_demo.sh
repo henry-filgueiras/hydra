@@ -58,7 +58,7 @@ emcc -std=c++20 -O2 -DNDEBUG -I. \
     -sENVIRONMENT=web,node \
     -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=8388608 \
-    -sEXPORTED_FUNCTIONS=_hydra_bench_cell,_hydra_validate \
+    -sEXPORTED_FUNCTIONS=_hydra_bench_cell,_hydra_validate,_hydra_rsa_keygen,_hydra_next_prime_str,_hydra_powmod_str \
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
     -o "$DEMO_OUT/bench_web.js"
 

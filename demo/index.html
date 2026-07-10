@@ -130,6 +130,16 @@
 
   .foot { color: var(--ink-muted); font-size: 12.5px; margin-top: 18px; max-width: 74ch; }
   .foot code { font-size: 11.5px; }
+
+  .mono-out {
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+  }
+  .mono-out .k { color: var(--ink-muted); }
+  .mono-out .ok { color: var(--good); font-weight: 600; }
+  .mono-out .num { color: var(--ink-1); }
+  .mono-out div { margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -175,6 +185,43 @@
         <tbody></tbody>
       </table>
     </details>
+  </div>
+
+  <div class="panel">
+    <h2 style="font-size:16px; margin-bottom:4px">Playground — primes &amp; toy RSA, live</h2>
+    <p class="sub" style="margin-bottom:14px">
+      The same engine doing real work: generate primes and round-trip a
+      message through textbook RSA, right here.  <strong>Educational
+      toy</strong> — Hydra is variable-time; never use this for real keys.
+    </p>
+
+    <div class="controls" style="margin-bottom:10px">
+      <button class="run" id="findPrime" disabled>Find a prime</button>
+      <label class="ctl">bits
+        <select id="primeBits">
+          <option value="256">256</option>
+          <option value="512" selected>512</option>
+          <option value="1024">1024</option>
+        </select>
+      </label>
+    </div>
+    <div id="primeOut" class="mono-out"></div>
+
+    <div class="controls" style="margin:16px 0 10px">
+      <button class="run" id="rsaGo" disabled>Generate keypair &amp; round-trip</button>
+      <label class="ctl">key
+        <select id="rsaBits">
+          <option value="512">512-bit</option>
+          <option value="1024" selected>1024-bit</option>
+          <option value="2048">2048-bit</option>
+        </select>
+      </label>
+      <input id="rsaMsg" type="text" value="hello, hydra 🐉" maxlength="40"
+             style="font:inherit; flex:1; min-width:180px; padding:6px 9px;
+                    color:var(--ink-1); background:var(--surface-1);
+                    border:1px solid var(--baseline); border-radius:7px">
+    </div>
+    <div id="rsaOut" class="mono-out"></div>
   </div>
 
   <p class="foot">
@@ -333,6 +380,95 @@
     runBtn.disabled = false;
   }
 
+  // ── Playground ──────────────────────────────────────────────
+  const trunc = s => s.length <= 34
+    ? s : s.slice(0, 16) + '…' + s.slice(-14) + ' <span class="k">(' + s.length + ' digits)</span>';
+  const fmtms = x => x < 1 ? (x * 1000).toFixed(0) + ' µs' : x.toFixed(1) + ' ms';
+
+  // text ↔ number via BigInt (big-endian bytes); wasm does the math.
+  const textToDec = t => {
+    const bytes = new TextEncoder().encode(t);
+    let v = 0n;
+    for (const b of bytes) v = (v << 8n) | BigInt(b);
+    return v.toString();
+  };
+  const decToText = d => {
+    let v = BigInt(d);
+    const bytes = [];
+    while (v > 0n) { bytes.unshift(Number(v & 0xFFn)); v >>= 8n; }
+    return new TextDecoder().decode(new Uint8Array(bytes));
+  };
+  const randomStartDec = bits => {
+    const words = new Uint32Array(bits / 32);
+    crypto.getRandomValues(words);
+    let v = 0n;
+    for (const w of words) v = (v << 32n) | BigInt(w);
+    v |= 1n << BigInt(bits - 1);     // exactly `bits` wide
+    return v.toString();
+  };
+
+  function initPlayground() {
+    const findBtn = document.getElementById('findPrime');
+    const rsaBtn  = document.getElementById('rsaGo');
+    const pOut    = document.getElementById('primeOut');
+    const rOut    = document.getElementById('rsaOut');
+    findBtn.disabled = rsaBtn.disabled = false;
+
+    findBtn.addEventListener('click', async () => {
+      const bits = +document.getElementById('primeBits').value;
+      findBtn.disabled = true;
+      pOut.innerHTML = '<div class="k">searching from a random ' + bits +
+                       '-bit start…</div>';
+      await new Promise(r => setTimeout(r, 30));
+      const [prime, ms] = mod.nextPrime(randomStartDec(bits)).split(',');
+      pOut.innerHTML =
+        '<div><span class="k">prime  </span><span class="num">' + trunc(prime) +
+        '</span></div>' +
+        '<div><span class="k">found in </span>' + fmtms(+ms) +
+        ' <span class="k">(Baillie–PSW, exact &lt; 2⁶⁴, no known counterexample above)</span></div>';
+      findBtn.disabled = false;
+    });
+
+    rsaBtn.addEventListener('click', async () => {
+      const bits = +document.getElementById('rsaBits').value;
+      const text = document.getElementById('rsaMsg').value || 'hello, hydra';
+      const mDec = textToDec(text);
+      if (BigInt(mDec) >= (1n << BigInt(bits - 16))) {
+        rOut.innerHTML = '<div class="k">message too long for a ' + bits +
+                         '-bit key — shorten it or pick a bigger key.</div>';
+        return;
+      }
+      rsaBtn.disabled = true;
+      rOut.innerHTML = '<div class="k">generating two ' + (bits / 2) +
+                       '-bit primes…</div>';
+      await new Promise(r => setTimeout(r, 30));
+
+      const [p, q, n, d, kms] = mod.keygen(bits, Date.now() % 2 ** 32).split(',');
+      rOut.innerHTML += '<div><span class="k">n = p·q  </span><span class="num">' +
+                        trunc(n) + '</span></div>' +
+                        '<div><span class="k">keygen   </span>' + fmtms(+kms) + '</div>' +
+                        '<div class="k">encrypting…</div>';
+      await new Promise(r => setTimeout(r, 30));
+
+      const [c, ems] = mod.powmod(mDec, '65537', n).split(',');
+      const [m2, dms] = mod.powmod(c, d, n).split(',');
+      const back = decToText(m2);
+      rOut.innerHTML =
+        '<div><span class="k">message  </span><span class="num">“' + text +
+        '”</span> <span class="k">→ ' + mDec.length + '-digit integer</span></div>' +
+        '<div><span class="k">n = p·q  </span><span class="num">' + trunc(n) + '</span></div>' +
+        '<div><span class="k">cipher   </span><span class="num">' + trunc(c) +
+        '</span> <span class="k">(m^65537 mod n, ' + fmtms(+ems) + ')</span></div>' +
+        '<div><span class="k">decrypted</span> <span class="num">“' + back +
+        '”</span> <span class="k">(c^d mod n, ' + fmtms(+dms) + ')</span> ' +
+        (back === text ? '<span class="ok">round-trip ✓</span>'
+                       : '<span class="k">MISMATCH ✗</span>') + '</div>' +
+        '<div><span class="k">keygen ' + fmtms(+kms) +
+        ' — two ' + (bits / 2) + '-bit primes + d = e⁻¹ mod φ (extended_gcd)</span></div>';
+      rsaBtn.disabled = false;
+    });
+  }
+
   // ── Boot ────────────────────────────────────────────────────
   runBtn.disabled = true;
   function enableFallback(msg) {
@@ -348,7 +484,11 @@
       mod = {
         cell:     m.cwrap('hydra_bench_cell', 'number', ['number', 'number', 'number']),
         validate: m.cwrap('hydra_validate', 'number', ['number']),
+        keygen:   m.cwrap('hydra_rsa_keygen', 'string', ['number', 'number']),
+        nextPrime: m.cwrap('hydra_next_prime_str', 'string', ['string']),
+        powmod:   m.cwrap('hydra_powmod_str', 'string', ['string', 'string', 'string']),
       };
+      initPlayground();
       status.textContent = 'Ready — wasm module loaded.';
       runBtn.disabled = false;
       runBtn.addEventListener('click', run);
