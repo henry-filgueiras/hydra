@@ -1496,19 +1496,19 @@ library someone reaches for.  Ordered by expected leverage.  None are
 started; whoever picks one up should demote/annotate its entry._
 
 1. **WebAssembly target + benchmark story.**  _2026-07-10 status:
-   toolchain bootstrap landed and validated — `scripts/wasm_bootstrap.sh`
-   installs emscripten + wasmtime via Homebrew (idempotent, `--check`
-   for dry-run), verifies `unsigned __int128` lowering with a smoke
+   **done except CI.**  `scripts/wasm_bootstrap.sh` installs
+   emscripten + wasmtime via Homebrew (idempotent, `--check` for
+   dry-run), verifies `unsigned __int128` lowering with a smoke
    test, and with `--full` compiles `hydra_test` to wasm
    (`-fwasm-exceptions` required: emcc aborts on `throw` by default)
    and runs it under node: **989/989 pass under wasm, zero source
-   changes** (emscripten 6.0.2, node 26).  First wasm pow_mod
-   numbers (emcc -O2, node, --runs 2): 19.8 µs / 827 µs / 6.29 ms /
-   51.97 ms at 256/1024/2048/4096-bit — a ~3× tax vs native M5 Pro,
-   from lowering the 64×64→128 multiply.  Remaining work: CMake
-   target or CI job wrapping the script, and the bench-vs-
-   mini-gmp-in-wasm comparison that anchors the "fastest bignum you
-   can ship in a browser" claim._  Hydra's biggest
+   changes** (emscripten 6.0.2, node 26).  `scripts/wasm_bench.sh`
+   then runs the three-way shootout — Hydra beats mini-gmp by
+   **4.2×–6.3×** and Boost cpp_int by **2.6×–3.5×** in wasm, gap
+   widening with width; full table in perf_snapshot.md and the
+   2026-07-10 wasm dragon entry.  The README now carries the
+   measured "fastest bignum you can ship in a browser" section.
+   Remaining: a CI job wrapping the two scripts._  Hydra's biggest
    competitive positioning insight: compiled to wasm, GMP loses its
    hand-written asm and falls back to portable C (or projects use
    mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf
@@ -4744,6 +4744,87 @@ and Release).
    Not perf, but the highest-leverage work for making the perf
    story matter.
 4. **Asm remains closed.**
+
+---
+
+### WebAssembly Shootout — Hydra vs mini-gmp vs Boost, In-Browser Claim Anchored
+
+_Implemented 2026-07-10 — Claude Fable 5 (Phase 3 roadmap item 1,
+unblocked the same day by `scripts/wasm_bootstrap.sh`)_
+_Status: **shipped** — Hydra beats mini-gmp by 4.2×–6.3× and Boost
+cpp_int by 2.6×–3.5× at every pow_mod width, all three compiled to
+wasm32 and run under node.  The "fastest bignum you can ship in a
+browser" positioning is now a measured result, not a hypothesis._
+
+#### Why this comparison is the honest one
+
+Native GMP's dominance comes from per-architecture hand-written
+assembly.  wasm32 has none, so GMP-dependent code compiled to
+WebAssembly gets **mini-gmp** — the portable two-file mpz_* fallback
+bundled with GMP — or generic-C GMP in the same ballpark.  Boost
+cpp_int and Hydra are both header-only C++ and compile unchanged.
+Same compiler (emscripten 6.0.2 `-O2`), same runtime (node 26), same
+binary, backends interleaved per run, `--runs 2` min-of-medians.
+
+#### Method
+
+`scripts/wasm_bench.sh` (new, reproducible): downloads gmp-6.3.0.tar.xz
+from ftp.gnu.org (sha256-pinned), extracts only mini-gmp, shims
+`<gmp.h>` → `mini-gmp.h` so `bench_pow_mod.cpp`'s existing GMP backend
+compiles against it verbatim (its API surface — mpz_init/set_str/
+powm/get_str/clear — is entirely inside mini-gmp's subset), compiles
+mini-gmp.c as a separate C object (no `-std=c++20` clash), links the
+three-way bench, and runs it under node.  mini-gmp (LGPL) is fetched
+at bench time into gitignored `build-wasm/` — never vendored into
+this MIT repo, never linked into the library.
+
+#### Results (min-of-2 × 50-sample medians)
+
+| Width | Hydra (wasm) | Boost cpp_int | mini-gmp  | vs Boost | vs mini-gmp |
+|------:|-------------:|--------------:|----------:|---------:|------------:|
+|  256  |     22.3 µs  |      78.5 µs  |   94.4 µs |   3.5×   |    4.2×     |
+|  512  |    136.7 µs  |     443.0 µs  |  686.5 µs |   3.2×   |    5.0×     |
+| 1024  |    972.4 µs  |      2.71 ms  |   5.13 ms |   2.8×   |    5.3×     |
+| 1536  |     3.14 ms  |      8.15 ms  |  17.52 ms |   2.6×   |    5.6×     |
+| 1984  |     6.68 ms  |     17.63 ms  |  37.39 ms |   2.6×   |    5.6×     |
+| 2048  |     7.42 ms  |     19.32 ms  |  41.59 ms |   2.6×   |    5.6×     |
+| 4096  |    51.66 ms  |    138.86 ms  | 325.93 ms |   2.7×   |    6.3×     |
+
+The advantage **widens** with width: mini-gmp's simple binary
+exponentiation + schoolbook reduction scales worse than Hydra's
+sliding-window Montgomery/FIOS/halved-sqr stack, and none of Hydra's
+2026-07-10 native wins depended on anything wasm lacks.
+
+#### The wasm-EH tax (methodology finding worth banking)
+
+The first shootout build reused `-fwasm-exceptions` from the test
+harness flags and measured Hydra at 8.55 ms @ 2048-bit; rebuilding
+EH-free dropped it to 7.42 ms (**~15 % faster**) while Boost and
+mini-gmp barely moved.  Wasm EH inserts landing-pad structure that
+inhibits optimization precisely in heavily-inlined header C++ — the
+shape Hydra is made of.  Benches now compile EH-free (nothing throws
+in the timed path; emcc's default throw→abort is acceptable there);
+`hydra_test` under wasm keeps `-fwasm-exceptions` because the suite
+exercises `std::domain_error` paths.  Any future wasm-facing build
+guidance should tell users: compile Hydra EH-free if you don't need
+exceptions across the wasm boundary.
+
+Wasm-vs-native tax on Hydra itself: ~3.4–4.4× (e.g. 7.42 ms vs
+1.88 ms at 2048-bit) — dominated by software lowering of the
+64×64→128 multiply that M-series does in two instructions.
+
+#### Collateral repair
+
+brew's emscripten install upgraded `llhttp`, breaking the dylib link
+in `libgit2` and thereby the user's `eza` (`ls` alias).  Fixed with
+`brew reinstall libgit2`; verified `eza` runs.  Noted so future brew
+installs from agent sessions check for this class of breakage.
+
+#### What remains on roadmap item 1
+
+A CI job wrapping `wasm_bootstrap.sh --full` + `wasm_bench.sh`.
+Optionally a `-DHYDRA_WASM=ON` CMake profile if consumers want it —
+the two scripts cover the repo's own needs.
 
 ---
 

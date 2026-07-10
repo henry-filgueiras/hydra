@@ -115,6 +115,25 @@ Achieved via Montgomery reduction, Karatsuba multiplication dispatch, and fast-p
 
 </details>
 
+### 🌐 WebAssembly — fastest bignum you can ship in a browser
+
+Native GMP's speed comes from per-architecture assembly, which doesn't
+exist for wasm32 — compile GMP-dependent code to WebAssembly and you
+get **mini-gmp**, its portable fallback.  Hydra's performance story is
+pure portable C++, so it carries to wasm nearly intact.  Head-to-head
+under node (emscripten `-O2`, `pow_mod`, median latency,
+`scripts/wasm_bench.sh`):
+
+| Width | **Hydra (wasm)** | Boost cpp_int (wasm) | mini-gmp (wasm) | vs Boost | vs mini-gmp |
+|------:|-----------------:|---------------------:|----------------:|---------:|------------:|
+|  256  |    **22.3 µs**   |        78.5 µs       |     94.4 µs     |   3.5×   |    4.2×     |
+| 1024  |    **972 µs**    |        2.71 ms       |     5.13 ms     |   2.8×   |    5.3×     |
+| 2048  |    **7.42 ms**   |        19.3 ms       |     41.6 ms     |   2.6×   |    5.6×     |
+| 4096  |    **51.7 ms**   |        139 ms        |      326 ms     |   2.7×   |    6.3×     |
+
+The full 989-test suite passes under wasm with zero source changes
+(`scripts/wasm_bootstrap.sh --full`).
+
 ---
 
 ## Visual Hydra Performance Story
@@ -284,9 +303,11 @@ Completed:
 * [x] primality: `is_probable_prime` (Baillie–PSW), `next_prime`, `isqrt`
 * [x] benchmarking vs `boost::multiprecision::cpp_int`
 
+* [x] WebAssembly: full test suite + pow_mod shootout vs mini-gmp/Boost (`scripts/wasm_bootstrap.sh`, `scripts/wasm_bench.sh`)
+
 Active roadmap:
 
-* [ ] WebAssembly build target + benchmark vs mini-gmp
+* [ ] wasm CI job (bootstrap + test + shootout on a runner)
 * [ ] Toom-Cook multiplication for ≥128-limb operands
 * [ ] arena-backed Karatsuba scratch (may lower threshold to 16 limbs)
 * [ ] `std::hash<Hydra>` specialisation

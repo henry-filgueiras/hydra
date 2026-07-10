@@ -112,6 +112,31 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
+### WebAssembly shootout (2026-07-10)
+
+_`scripts/wasm_bench.sh` — emscripten 6.0.2 `-O2` (no wasm-EH), node 26,
+min-of-2 × 50-sample medians, all three backends in one binary._
+
+| Width | Hydra (wasm) | Boost cpp_int | mini-gmp  | vs Boost | vs mini-gmp |
+|------:|-------------:|--------------:|----------:|---------:|------------:|
+|  256  |     22.3 µs  |      78.5 µs  |   94.4 µs |   3.5×   |    4.2×     |
+|  512  |    136.7 µs  |     443.0 µs  |  686.5 µs |   3.2×   |    5.0×     |
+| 1024  |    972.4 µs  |      2.71 ms  |   5.13 ms |   2.8×   |    5.3×     |
+| 1536  |     3.14 ms  |      8.15 ms  |  17.52 ms |   2.6×   |    5.6×     |
+| 1984  |     6.68 ms  |     17.63 ms  |  37.39 ms |   2.6×   |    5.6×     |
+| 2048  |     7.42 ms  |     19.32 ms  |  41.59 ms |   2.6×   |    5.6×     |
+| 4096  |    51.66 ms  |    138.86 ms  | 325.93 ms |   2.7×   |    6.3×     |
+
+_mini-gmp is GMP's bundled portable fallback — what GMP-dependent code
+becomes on wasm32, where GMP's asm doesn't exist.  Hydra's advantage
+**widens** with width (4.2× → 6.3× vs mini-gmp).  The wasm-vs-native
+tax on Hydra itself is ~3-4× (7.42 ms vs 1.88 ms at 2048-bit),
+dominated by software lowering of the 64×64→128 multiply.
+`-fwasm-exceptions` costs Hydra a further ~15 % and is left off for
+benches (nothing throws in the timed path); the test suite needs it._
+
+---
+
 ### Hot-path hotspots after the threshold retirement + halved squaring
 
 1. **Halved squaring stops at k = 32** — `montgomery_sqr_fios_halved`
