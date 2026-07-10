@@ -132,7 +132,11 @@ under node (emscripten `-O2`, `pow_mod`, median latency,
 | 4096  |    **51.7 ms**   |        139 ms        |      326 ms     |   2.7×   |    6.3×     |
 
 The full 989-test suite passes under wasm with zero source changes
-(`scripts/wasm_bootstrap.sh --full`).
+(`scripts/wasm_bootstrap.sh --full`).  Try it yourself:
+`scripts/wasm_demo.sh --serve` builds a self-contained page
+(`demo/`) that runs this exact shootout live in your browser —
+three backends, cross-checked for agreement before timing, ~150 KB
+total.
 
 ---
 

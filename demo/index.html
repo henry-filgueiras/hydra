@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hydra — live bignum benchmark in your browser</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb;      /* chart surface */
+    --plane:     #f9f9f7;      /* page plane */
+    --ink-1:     #0b0b0b;      /* primary ink */
+    --ink-2:     #52514e;      /* secondary ink */
+    --ink-muted: #898781;      /* axis / labels */
+    --hairline:  #e1e0d9;      /* gridline */
+    --baseline:  #c3c2b7;      /* axis baseline */
+    --ring:      rgba(11,11,11,0.10);
+    --good:      #006300;      /* success text (delta-good, light) */
+    --series-1:  #2a78d6;      /* Hydra    — blue,   slot 1 */
+    --series-2:  #1baf7a;      /* Boost    — aqua,   slot 2 */
+    --series-3:  #eda100;      /* mini-gmp — yellow, slot 3 */
+    --track:     #f0efec;      /* empty bar track */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --plane:     #0d0d0d;
+      --ink-1:     #ffffff;
+      --ink-2:     #c3c2b7;
+      --ink-muted: #898781;
+      --hairline:  #2c2c2a;
+      --baseline:  #383835;
+      --ring:      rgba(255,255,255,0.10);
+      --good:      #0ca30c;
+      --series-1:  #3987e5;
+      --series-2:  #199e70;
+      --series-3:  #c98500;
+      --track:     #242422;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--plane);
+    color: var(--ink-1);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 22px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 6px 0 20px; max-width: 64ch; }
+  .sub code { font-size: 13px; }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button.run {
+    font: inherit; font-weight: 600;
+    color: #fff; background: var(--series-1);
+    border: none; border-radius: 7px;
+    padding: 8px 18px; cursor: pointer;
+  }
+  button.run:disabled { opacity: 0.55; cursor: default; }
+  select {
+    font: inherit; color: var(--ink-1);
+    background: var(--surface-1);
+    border: 1px solid var(--baseline); border-radius: 7px;
+    padding: 6px 8px;
+  }
+  label.ctl { color: var(--ink-2); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  #status { color: var(--ink-2); font-size: 13px; min-height: 1.4em; margin-top: 10px; }
+  #status .ok { color: var(--good); font-weight: 600; }
+
+  .legend { display: flex; gap: 18px; margin: 2px 0 14px; flex-wrap: wrap; }
+  .legend span { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+  .group { margin-bottom: 18px; }
+  .group h3 {
+    font-size: 12px; font-weight: 600; color: var(--ink-muted);
+    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px;
+  }
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; /* 2px surface gap between bars */ }
+  .name { width: 74px; flex: none; font-size: 13px; color: var(--ink-2); text-align: right; }
+  .trackbox {
+    flex: 1; position: relative; height: 22px;
+    background: transparent;
+    border-left: 2px solid var(--baseline);   /* the shared baseline */
+  }
+  .bar {
+    position: absolute; left: 0; top: 1px; bottom: 1px;
+    width: 0%;
+    border-radius: 0 4px 4px 0;               /* rounded on the data end only */
+    transition: width 300ms ease;
+    min-width: 2px;
+  }
+  .bar.empty { background: var(--track); width: 14%; }
+  .val {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    font-size: 12.5px; color: var(--ink-1);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap; padding-left: 8px;
+  }
+  .val .mult { color: var(--ink-2); }
+  .val .fastest { color: var(--good); font-weight: 600; }
+
+  #tip {
+    position: fixed; display: none; z-index: 10;
+    background: var(--surface-1); color: var(--ink-1);
+    border: 1px solid var(--ring); border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    padding: 8px 11px; font-size: 12.5px; pointer-events: none;
+    max-width: 260px;
+  }
+  #tip b { display: block; margin-bottom: 2px; }
+  #tip .muted { color: var(--ink-2); }
+
+  details { margin-top: 4px; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  table { border-collapse: collapse; margin-top: 10px; width: 100%; font-size: 13.5px; }
+  th, td { text-align: right; padding: 5px 10px; font-variant-numeric: tabular-nums; }
+  th { color: var(--ink-muted); font-weight: 600; border-bottom: 1px solid var(--hairline); }
+  td:first-child, th:first-child { text-align: left; }
+  tr + tr td { border-top: 1px solid var(--hairline); }
+
+  .foot { color: var(--ink-muted); font-size: 12.5px; margin-top: 18px; max-width: 74ch; }
+  .foot code { font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Hydra — live bignum benchmark, in <em>your</em> browser</h1>
+  <p class="sub">
+    Modular exponentiation (<code>pow_mod</code>, n-bit base/exp/modulus)
+    running as WebAssembly on this device, right now.  Three backends in
+    one ~150&nbsp;KB module: <strong>Hydra</strong>, Boost&nbsp;cpp_int, and
+    mini-gmp — GMP's portable fallback, i.e. what GMP-dependent code
+    becomes on wasm32, where GMP's assembly doesn't exist.
+  </p>
+
+  <div class="panel">
+    <div class="controls">
+      <button class="run" id="run">Run benchmark</button>
+      <label class="ctl">samples/cell
+        <select id="samples">
+          <option value="6">6 — quick (~15 s)</option>
+          <option value="15" selected>15 — standard (~40 s)</option>
+          <option value="31">31 — thorough (~90 s)</option>
+        </select>
+      </label>
+      <label class="ctl"><input type="checkbox" id="w4096" checked> include 4096-bit (slowest cells)</label>
+      <label class="ctl" id="fallbackCtl" style="display:none">
+        <button class="run" id="showRef" style="background:var(--ink-2)">Show recorded results</button>
+      </label>
+    </div>
+    <div id="status">Loading wasm module…</div>
+  </div>
+
+  <div class="panel">
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--series-1)"></i>Hydra</span>
+      <span><i class="swatch" style="background:var(--series-2)"></i>Boost cpp_int</span>
+      <span><i class="swatch" style="background:var(--series-3)"></i>mini-gmp</span>
+    </div>
+    <div id="chart"></div>
+    <details>
+      <summary>Table view</summary>
+      <table id="tbl">
+        <thead><tr><th>Width</th><th>Hydra</th><th>Boost cpp_int</th><th>mini-gmp</th><th>Boost / Hydra</th><th>mini-gmp / Hydra</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </details>
+  </div>
+
+  <p class="foot">
+    Results depend on your device, browser, and background load — medians
+    of the chosen sample count per cell, warmup excluded, operand
+    conversion outside the timed region.  Correctness is cross-checked
+    before timing (all three backends must produce identical results).
+    Reproduce natively or rebuild this page from the
+    <code>hydra</code> repo: <code>scripts/wasm_bench.sh</code>,
+    <code>scripts/wasm_demo.sh</code>.  Hydra is variable-time and for
+    public inputs — verification workloads, not secret keys.
+  </p>
+</div>
+
+<div id="tip"></div>
+
+<script src="bench_web.js"></script>
+<script>
+(function () {
+  'use strict';
+  const WIDTHS   = [256, 512, 1024, 2048, 4096];
+  const BACKENDS = [
+    { id: 0, name: 'Hydra',         css: 'var(--series-1)' },
+    { id: 1, name: 'Boost cpp_int', css: 'var(--series-2)' },
+    { id: 2, name: 'mini-gmp',      css: 'var(--series-3)' },
+  ];
+  // Recorded reference run — Apple M5 Pro, node 26, emcc -O2,
+  // scripts/wasm_bench.sh --runs 2, 2026-07-10.  Milliseconds.
+  const REFERENCE = {
+    256:  [0.0223, 0.0785, 0.0944],
+    512:  [0.1367, 0.4430, 0.6865],
+    1024: [0.9724, 2.7100, 5.1300],
+    2048: [7.4200, 19.320, 41.590],
+    4096: [51.660, 138.86, 325.93],
+  };
+
+  const chart  = document.getElementById('chart');
+  const status = document.getElementById('status');
+  const tbody  = document.querySelector('#tbl tbody');
+  const tip    = document.getElementById('tip');
+  const runBtn = document.getElementById('run');
+
+  const results = {};           // results[bits] = [ms, ms, ms]
+  let mod = null;               // wasm module instance
+
+  const fmt = ms =>
+    ms == null ? '—'
+    : ms < 1 ? (ms * 1000).toFixed(1) + ' µs'
+    : ms < 100 ? ms.toFixed(2) + ' ms'
+    : ms.toFixed(1) + ' ms';
+
+  // ── Build the empty chart skeleton ─────────────────────────
+  const cells = {};             // cells[bits] = per-backend {bar, val, row}
+  for (const bits of WIDTHS) {
+    const g = document.createElement('div');
+    g.className = 'group';
+    g.innerHTML = '<h3>' + bits + '-bit</h3>';
+    cells[bits] = [];
+    BACKENDS.forEach((bk, i) => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML =
+        '<div class="name">' + (i === 0 ? 'Hydra' : (i === 1 ? 'Boost' : 'mini-gmp')) + '</div>' +
+        '<div class="trackbox"><div class="bar empty"></div><div class="val">—</div></div>';
+      g.appendChild(row);
+      const bar = row.querySelector('.bar');
+      const val = row.querySelector('.val');
+      cells[bits].push({ bar, val, row });
+
+      row.addEventListener('mousemove', e => {
+        const r = results[bits];
+        if (!r || r[i] == null) { tip.style.display = 'none'; return; }
+        const vs = (i === 0 || !(r[0] > 0)) ? '' :
+          '<span class="muted">' + (r[i] / r[0]).toFixed(1) + '× slower than Hydra</span>';
+        tip.innerHTML = '<b>' + bk.name + ' @ ' + bits + '-bit</b>' +
+          'median ' + fmt(r[i]) + '<br>' + vs;
+        tip.style.display = 'block';
+        tip.style.left = Math.min(e.clientX + 14, innerWidth - 280) + 'px';
+        tip.style.top  = (e.clientY + 14) + 'px';
+      });
+      row.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+    });
+    chart.appendChild(g);
+  }
+
+  function paint(bits) {
+    const r = results[bits];
+    const max = Math.max(...r.filter(v => v != null));
+    r.forEach((ms, i) => {
+      const c = cells[bits][i];
+      if (ms == null) return;
+      const pct = Math.max(2, (ms / max) * 78);   // leave room for labels
+      c.bar.className = 'bar';
+      c.bar.style.background = BACKENDS[i].css;
+      c.bar.style.width = pct + '%';
+      c.val.style.left = pct + '%';
+      const mult = i === 0
+        ? (r[1] != null || r[2] != null ? ' <span class="fastest">fastest</span>' : '')
+        : (r[0] > 0 ? ' <span class="mult">' + (ms / r[0]).toFixed(1) + '×</span>' : '');
+      c.val.innerHTML = fmt(ms) + mult;
+    });
+  }
+
+  function paintTable() {
+    tbody.innerHTML = '';
+    for (const bits of WIDTHS) {
+      const r = results[bits];
+      if (!r) continue;
+      const tr = document.createElement('tr');
+      const ratio = i => (r[0] > 0 && r[i] != null) ? (r[i] / r[0]).toFixed(1) + '×' : '—';
+      tr.innerHTML = '<td>' + bits + '-bit</td><td>' + fmt(r[0]) + '</td><td>' + fmt(r[1]) +
+        '</td><td>' + fmt(r[2]) + '</td><td>' + ratio(1) + '</td><td>' + ratio(2) + '</td>';
+      tbody.appendChild(tr);
+    }
+  }
+
+  function showReference(note) {
+    for (const bits of WIDTHS) { results[bits] = REFERENCE[bits].slice(); paint(bits); }
+    paintTable();
+    status.innerHTML = note;
+  }
+
+  // ── Live run ────────────────────────────────────────────────
+  async function run() {
+    const samples = +document.getElementById('samples').value;
+    const widths = WIDTHS.filter(b => b !== 4096 || document.getElementById('w4096').checked);
+    runBtn.disabled = true;
+
+    status.textContent = 'Cross-checking backends (256/1024-bit)…';
+    await new Promise(r => setTimeout(r, 30));
+    if (mod.validate(256) !== 1 || mod.validate(1024) !== 1) {
+      status.textContent = 'Cross-check FAILED — not benchmarking.';
+      runBtn.disabled = false;
+      return;
+    }
+
+    const plan = [];
+    for (const bits of widths)
+      for (const bk of BACKENDS) plan.push({ bits, bk });
+
+    for (const bits of widths) results[bits] = [null, null, null];
+
+    for (let i = 0; i < plan.length; ++i) {
+      const { bits, bk } = plan[i];
+      status.textContent = 'Running ' + bk.name + ' @ ' + bits + '-bit  (' +
+        (i + 1) + '/' + plan.length + ')…';
+      await new Promise(r => setTimeout(r, 30));   // let the UI paint
+      results[bits][bk.id] = mod.cell(bk.id, bits, samples);
+      paint(bits);
+      paintTable();
+    }
+    status.innerHTML = '<span class="ok">Done ✓</span> — cross-checked, medians of ' +
+      samples + ' samples/cell on this device.';
+    runBtn.disabled = false;
+  }
+
+  // ── Boot ────────────────────────────────────────────────────
+  runBtn.disabled = true;
+  function enableFallback(msg) {
+    status.textContent = msg;
+    document.getElementById('fallbackCtl').style.display = '';
+    document.getElementById('showRef').addEventListener('click', () =>
+      showReference('Recorded reference run — Apple M5 Pro, node 26, 2026-07-10 ' +
+                    '(live run unavailable in this environment).'));
+  }
+  try {
+    if (typeof HydraBench !== 'function') throw new Error('module missing');
+    HydraBench().then(m => {
+      mod = {
+        cell:     m.cwrap('hydra_bench_cell', 'number', ['number', 'number', 'number']),
+        validate: m.cwrap('hydra_validate', 'number', ['number']),
+      };
+      status.textContent = 'Ready — wasm module loaded.';
+      runBtn.disabled = false;
+      runBtn.addEventListener('click', run);
+      // #autorun: headless/CI hook — quick samples, no 4096-bit.
+      if (location.hash === '#autorun') {
+        document.getElementById('samples').value = '6';
+        document.getElementById('w4096').checked = false;
+        run();
+      }
+    }).catch(e => enableFallback('wasm failed to initialize (' + e.message + ').'));
+  } catch (e) {
+    enableFallback('wasm unavailable in this environment (' + e.message + ').');
+  }
+})();
+</script>
+</body>
+</html>

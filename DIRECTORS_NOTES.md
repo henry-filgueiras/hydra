@@ -1508,7 +1508,20 @@ started; whoever picks one up should demote/annotate its entry._
    widening with width; full table in perf_snapshot.md and the
    2026-07-10 wasm dragon entry.  The README now carries the
    measured "fastest bignum you can ship in a browser" section.
-   Remaining: a CI job wrapping the two scripts._  Hydra's biggest
+   **In-browser live demo also landed** (`demo/` +
+   `scripts/wasm_demo.sh`): a self-contained ~150 KB page
+   (SINGLE_FILE module, three backends, cross-checked for agreement
+   before timing) with a dataviz-compliant grouped-bar UI,
+   per-cell progressive updates, a recorded-results fallback for
+   wasm-less environments, and an `#autorun` hook for headless/CI
+   smoke.  Key implementation finding: browsers clamp
+   `performance.now()` to 100 µs–1 ms without cross-origin
+   isolation, so each sample times a calibrated batch (≥15 ms
+   window, Google-Benchmark-style) instead of a single op; a
+   frozen-clock escape hatch caps calibration at 64 reps.
+   Validated: node smoke (timings match wasm_bench) and headless
+   Chrome running the full UI flow to "Done ✓".
+   Remaining: a CI job wrapping the three scripts._  Hydra's biggest
    competitive positioning insight: compiled to wasm, GMP loses its
    hand-written asm and falls back to portable C (or projects use
    mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf
