@@ -2352,6 +2352,102 @@ static void test_pow_mod_throws_negative_mod() {
     CHECK(threw, "pow_mod throws on negative mod");
 }
 
+// --- pow_mod_batch (fused 2-lane ladder, tier 1: shared exp+mod) ---
+static Hydra batch_rnd_hydra(std::mt19937_64& rng, uint32_t k,
+                             bool top_set, bool force_odd = false) {
+    std::vector<uint64_t> v(k);
+    for (auto& w : v) w = rng();
+    if (top_set) v[k - 1] |= (1ull << 63);
+    if (force_odd) v[0] |= 1u;
+    return Hydra::from_limbs(v.data(), k);
+}
+static void test_pow_mod_batch_agreement() {
+    // Every element must equal single-op pow_mod EXACTLY, across the
+    // Montgomery band.  Batch of 5 → two fused pairs + one remainder
+    // through the single-op path.
+    std::mt19937_64 rng(0xBA7C42);
+    for (uint32_t k : {1u, 2u, 3u, 4u, 8u, 16u, 32u, 33u, 64u}) {
+        const Hydra mod = batch_rnd_hydra(rng, k, true, true);
+        const Hydra exp = batch_rnd_hydra(rng, k, true);
+        std::vector<Hydra> bases;
+        for (int i = 0; i < 5; ++i)
+            bases.push_back(batch_rnd_hydra(rng, k, false));
+        bases[1] = -bases[1];                       // negative base lane
+        auto got = pow_mod_batch(bases, exp, mod);
+        CHECK(got.size() == bases.size(), "batch result size matches");
+        for (size_t i = 0; i < bases.size(); ++i)
+            CHECK(got[i] == pow_mod(bases[i], exp, mod),
+                  "pow_mod_batch element == pow_mod");
+    }
+}
+static void test_pow_mod_batch_low_popcount_exp() {
+    // Long zero runs exercise the deferred squaring-run flush.
+    std::mt19937_64 rng2(0xF1005);
+    for (uint32_t k : {8u, 32u}) {
+        const Hydra mod = batch_rnd_hydra(rng2, k, true, true);
+        std::vector<uint64_t> e(k, 0);
+        e[k - 1] = 1ull << 63;
+        e[0] = 1u;
+        const Hydra exp = Hydra::from_limbs(e.data(), k);
+        std::vector<Hydra> bases = {batch_rnd_hydra(rng2, k, false),
+                                    batch_rnd_hydra(rng2, k, false)};
+        auto got = pow_mod_batch(bases, exp, mod);
+        for (size_t i = 0; i < bases.size(); ++i)
+            CHECK(got[i] == pow_mod(bases[i], exp, mod),
+                  "batch matches pow_mod on sparse exponent");
+    }
+}
+static void test_pow_mod_batch_fallback_paths() {
+    std::mt19937_64 rng(0xEBE7);
+    // Even modulus → per-element naive fallback, still exact.
+    {
+        Hydra mod = batch_rnd_hydra(rng, 4, true);
+        if (mod.limb_view().ptr[0] & 1u) mod += Hydra{1u};
+        const Hydra exp{12345u};
+        std::vector<Hydra> bases = {batch_rnd_hydra(rng, 4, false),
+                                    batch_rnd_hydra(rng, 4, false)};
+        auto got = pow_mod_batch(bases, exp, mod);
+        for (size_t i = 0; i < bases.size(); ++i)
+            CHECK(got[i] == pow_mod(bases[i], exp, mod),
+                  "batch matches pow_mod on even modulus");
+    }
+    // exp == 0 → all ones (mod > 1), via the per-element path.
+    {
+        std::vector<Hydra> bases = {Hydra{5u}, Hydra{7u}, Hydra{0u}};
+        auto got = pow_mod_batch(bases, Hydra{0u}, Hydra{97u});
+        for (auto& r : got)
+            CHECK(r == Hydra{1u}, "batch exp=0 -> 1 mod m");
+    }
+    // mod == 1 → all zeros.
+    {
+        std::vector<Hydra> bases = {Hydra{5u}, Hydra{7u}};
+        auto got = pow_mod_batch(bases, Hydra{3u}, Hydra{1u});
+        for (auto& r : got)
+            CHECK(r == Hydra{0u}, "batch mod=1 -> 0");
+    }
+    // Empty and single-element batches.
+    {
+        std::vector<Hydra> empty;
+        CHECK(pow_mod_batch(empty, Hydra{3u}, Hydra{97u}).empty(),
+              "empty batch -> empty result");
+        std::vector<Hydra> one = {Hydra{2u}};
+        auto got = pow_mod_batch(one, Hydra{10u}, Hydra{1000u});
+        CHECK(got.size() == 1 && got[0] == Hydra{24u},
+              "single-element batch == pow_mod");
+    }
+}
+static void test_pow_mod_batch_throws() {
+    std::vector<Hydra> bases = {Hydra{2u}};
+    bool threw = false;
+    try { (void)pow_mod_batch(bases, Hydra{3u}, Hydra{0u}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "pow_mod_batch throws on mod == 0");
+    threw = false;
+    try { (void)pow_mod_batch(bases, Hydra{-3}, Hydra{7u}); }
+    catch (const std::domain_error&) { threw = true; }
+    CHECK(threw, "pow_mod_batch throws on negative exponent");
+}
+
 // --- Toy RSA showcase ---
 static void test_rsa_toy() {
     Hydra n{3233u};
@@ -4444,6 +4540,12 @@ int main() {
     test_pow_mod_throws_zero_mod();
     test_pow_mod_throws_negative_exp();
     test_pow_mod_throws_negative_mod();
+
+    // Number theory: pow_mod_batch (fused 2-lane ladder)
+    test_pow_mod_batch_agreement();
+    test_pow_mod_batch_low_popcount_exp();
+    test_pow_mod_batch_fallback_paths();
+    test_pow_mod_batch_throws();
 
     // Showcase: toy RSA
     test_rsa_toy();

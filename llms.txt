@@ -26,7 +26,10 @@
   `{const uint64_t* ptr, uint32_t count}` (LSB-first magnitude; count 0 = zero).
 - Free functions: `abs, gcd, extended_gcd` (→ `{gcd,x,y}` Bézout), `pow_mod(base,
   exp, mod)` (Montgomery for odd mod ≤4096 bits, else naive; throws on mod≤0 or
-  exp<0), `isqrt` (floor, throws on negative), `is_perfect_square`,
+  exp<0), `pow_mod_batch(span<const Hydra> bases, exp, mod)` → vector (shared
+  exp+mod verification shape; fused 2-lane ladder, 1.33×@2048b/1.38×@4096b
+  native throughput, per-element pow_mod semantics + fallbacks), `isqrt` (floor,
+  throws on negative), `is_perfect_square`,
   `is_probable_prime(n, extra_mr_rounds=0)` (Baillie–PSW: trial<256 → MR base 2 →
   strong Lucas/Selfridge; exact <2^64, no known counterexample), `next_prime`.
 - Literal: `123_h`.
@@ -74,8 +77,10 @@
   the decisive Montgomery invariant; 2k-limb intermediates lose under cadence.
 - asm/PGO/__restrict at these kernels: all measured null on M5 Pro — don't retry
   without a structural change (see Resolved Dragons). The structural change that
-  DOES work: fused 2-lane FIOS (probe_mont_interleave) = 1.5× throughput at
-  2048/4096-bit native (wasm null; call-level null; 4 lanes ≈ 2). B1 roadmap.
+  DOES work: fused 2-lane FIOS = 1.5× kernel throughput → pow_mod_batch LANDED
+  at 1.33×@2048b e2e (wasm null; call-level null; 4 lanes ≈ 2; under fusion
+  sqr-as-mul beats fused halved-sqr; squarings must flush in pointer-invariant
+  RUNS — per-call dispatch costs ~20%/mul, see montgomery_sqr_run_xL).
 - Browser timing: performance.now clamps to 100µs–1ms → batch ≥15ms per sample.
 - emcc's post-link `wasm-opt -O2` PESSIMIZES the kernels (+39%@256b…+60%@4096b
   with multiple exports). Ship LLVM-O2 only: `-g` build + passes-free

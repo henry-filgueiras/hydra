@@ -24,6 +24,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <compare>
 #include <cstddef>
@@ -32,6 +33,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <span>
 #include <stdexcept>
 #include <ostream>
 #include <string>
@@ -2359,6 +2361,165 @@ inline void montgomery_sqr_fios_halved(
     }
 }
 
+// ─── Fused L-lane FIOS (batch pow_mod engine) ───
+//
+// L *independent* Montgomery multiplications interleaved inside one
+// row loop: per j, the 2L MAC chains are adjacent instructions, so
+// lane B's multiplies fill lane A's carry-latency bubbles — the
+// structural ILP the single-op kernel cannot expose (its serial
+// carry chain is why the asm/PGO attempts measured null; see
+// Resolved Dragons).  Per-lane outputs are BIT-IDENTICAL to
+// montgomery_mul_fios (verified across k by probe_mont_interleave
+// and the pow_mod_batch agreement tests).
+//
+// Measured 2026-07-10 (M5 Pro, chained-dependency cadence): fused×2
+// is 1.24–1.54× single-op throughput, peaking at k=32/64; ×4 ≈ ×2
+// (register ceiling) — production dispatch uses L=2 only.  Squaring
+// dispatches through THIS kernel (a==b): under fusion, sqr-as-mul
+// beats a fused halved-squaring at every k — the halved kernel's
+// shrunken product chain starves the dual-issue slots fusion feeds.
+// wasm: null (1.02–1.08×) — the i128 software lowering exhausts the
+// register budget; pow_mod_batch still works there, it just doesn't
+// win (the pairing threshold is not worth a wasm-specific gate).
+//
+// Preconditions per lane: identical to montgomery_mul_fios (k ≥ 1,
+// out ≥ k, work ≥ k+2 limbs; work may be dirty; a may alias out).
+template <int L>
+inline void montgomery_mul_fios_xL(
+    const uint64_t* const* a, const uint64_t* const* b,
+    uint32_t k,
+    const uint64_t* const* mod,
+    const uint64_t* n0inv,
+    uint64_t* const* out,
+    uint64_t* const* work) noexcept
+{
+    const uint32_t tlen = k + 2;
+    for (int l = 0; l < L; ++l) std::memset(work[l], 0, tlen * sizeof(uint64_t));
+
+    for (uint32_t i = 0; i < k; ++i) {
+        std::array<uint64_t, L> ai, m, ca, cb;
+
+        // Bootstrap (j = 0), all lanes — same structure as the
+        // single-lane kernel; see montgomery_mul_fios for the chain
+        // A/B commentary.
+        for (int l = 0; l < L; ++l) {
+            ai[l] = a[l][i];
+            const unsigned __int128 t0 =
+                static_cast<unsigned __int128>(ai[l]) * b[l][0] + work[l][0];
+            const uint64_t T0 = static_cast<uint64_t>(t0);
+            ca[l]             = static_cast<uint64_t>(t0 >> 64);
+            m[l]              = T0 * n0inv[l];
+            const unsigned __int128 t1 =
+                static_cast<unsigned __int128>(m[l]) * mod[l][0] + T0;
+            cb[l]             = static_cast<uint64_t>(t1 >> 64);
+        }
+
+        // Inner loop: per j, the 2L chains are adjacent instructions.
+        for (uint32_t j = 1; j < k; ++j) {
+            for (int l = 0; l < L; ++l) {
+                const unsigned __int128 tA =
+                    static_cast<unsigned __int128>(ai[l]) * b[l][j]
+                    + work[l][j]
+                    + ca[l];
+                const uint64_t Tj = static_cast<uint64_t>(tA);
+                ca[l]             = static_cast<uint64_t>(tA >> 64);
+
+                const unsigned __int128 tB =
+                    static_cast<unsigned __int128>(m[l]) * mod[l][j]
+                    + Tj
+                    + cb[l];
+                work[l][j - 1]    = static_cast<uint64_t>(tB);
+                cb[l]             = static_cast<uint64_t>(tB >> 64);
+            }
+        }
+
+        // End-of-row fold, all lanes.
+        for (int l = 0; l < L; ++l) {
+            const unsigned __int128 tkA =
+                static_cast<unsigned __int128>(work[l][k]) + ca[l];
+            const uint64_t Wp_k  = static_cast<uint64_t>(tkA);
+            const uint64_t ca_hi = static_cast<uint64_t>(tkA >> 64);
+
+            const unsigned __int128 tkB =
+                static_cast<unsigned __int128>(Wp_k) + cb[l];
+            work[l][k - 1]       = static_cast<uint64_t>(tkB);
+            const uint64_t cb_hi = static_cast<uint64_t>(tkB >> 64);
+
+            const unsigned __int128 top =
+                static_cast<unsigned __int128>(work[l][k + 1]) + ca_hi + cb_hi;
+            work[l][k]     = static_cast<uint64_t>(top);
+            work[l][k + 1] = static_cast<uint64_t>(top >> 64);
+        }
+    }
+
+    // Conditional final subtraction, per lane (identical to FIOS).
+    for (int l = 0; l < L; ++l) {
+        const uint64_t* T = work[l];
+        bool need_sub = false;
+        if (T[k] != 0) {
+            need_sub = true;
+        } else {
+            for (uint32_t i = k; i-- > 0;) {
+                if (T[i] > mod[l][i]) { need_sub = true; break; }
+                if (T[i] < mod[l][i]) { need_sub = false; break; }
+            }
+            if (!need_sub) {
+                bool all_equal = true;
+                for (uint32_t i = 0; i < k; ++i) {
+                    if (T[i] != mod[l][i]) { all_equal = false; break; }
+                }
+                if (all_equal) need_sub = true;
+            }
+        }
+        if (need_sub) {
+            uint64_t borrow = 0;
+            for (uint32_t i = 0; i < k; ++i) {
+                uint64_t wi = T[i];
+                uint64_t mi = mod[l][i];
+                uint64_t d1 = wi - mi;
+                uint64_t b1 = (d1 > wi) ? 1u : 0u;
+                uint64_t d2 = d1 - borrow;
+                uint64_t b2 = (d2 > d1) ? 1u : 0u;
+                out[l][i] = d2;
+                borrow = b1 + b2;
+            }
+        } else {
+            std::memcpy(out[l], T, k * sizeof(uint64_t));
+        }
+    }
+}
+
+// Run n consecutive fused squarings per lane (x → x^(2^n), Montgomery
+// form), ping-ponging between cur and nxt internally and swapping the
+// caller's pointers on odd counts.  Manually unrolled by 2 so both
+// pointer configurations are loop-invariant: dispatching each
+// squaring as its own call with freshly built pointer arrays measured
+// ~20% slower per mul than this shape (2026-07-10, probe_pow_mod_
+// batch) — enough to erase a third of the fusion win e2e.
+template <int L>
+inline void montgomery_sqr_run_xL(
+    uint64_t** cur, uint64_t** nxt,
+    uint32_t n, uint32_t k,
+    const uint64_t* const* mod, const uint64_t* n0inv,
+    uint64_t* const* work) noexcept
+{
+    const uint64_t* a0[L]; uint64_t* o0[L];   // cur -> nxt
+    const uint64_t* a1[L]; uint64_t* o1[L];   // nxt -> cur
+    for (int l = 0; l < L; ++l) {
+        a0[l] = cur[l]; o0[l] = nxt[l];
+        a1[l] = nxt[l]; o1[l] = cur[l];
+    }
+    uint32_t r = 0;
+    for (; r + 2 <= n; r += 2) {
+        montgomery_mul_fios_xL<L>(a0, a0, k, mod, n0inv, o0, work);
+        montgomery_mul_fios_xL<L>(a1, a1, k, mod, n0inv, o1, work);
+    }
+    if (r < n) {
+        montgomery_mul_fios_xL<L>(a0, a0, k, mod, n0inv, o0, work);
+        for (int l = 0; l < L; ++l) std::swap(cur[l], nxt[l]);
+    }
+}
+
 // ─── Karatsuba-backed Montgomery multiply (separate product + REDC) ───
 //
 // For large k (≥ KARATSUBA_THRESHOLD_LIMBS), the O(k²) schoolbook product
@@ -4329,6 +4490,214 @@ struct EGCDResult {
         return pow_mod_montgomery(base, std::move(exp), mod);
     }
     return pow_mod_naive(std::move(base), std::move(exp), mod);
+}
+
+// ─────────────────────────────────────────────────────────
+// Batched modular exponentiation (tier 1: shared exp + mod)
+// ─────────────────────────────────────────────────────────
+//
+// Two independent bases through one fused 2-lane Montgomery ladder.
+// A faithful pair-wise pow_mod_montgomery with three differences:
+//   1. The MontgomeryContext (n0inv + R² via Knuth D) is built once
+//      for the pair instead of once per call.
+//   2. Every kernel call is the fused 2-lane FIOS mul — including
+//      squarings (sqr-as-fused-mul beats a fused halved squaring at
+//      every k; see the kernel's header comment).
+//   3. Squarings flush in runs (montgomery_sqr_run_xL) with ping-pong
+//      buffers instead of per-call dispatch + memcpy-back.
+// The shared window walk is legal because the schedule depends only
+// on the exponent, which the lanes share by construction.
+//
+// Measured 2026-07-10 (M5 Pro, rotating operands, min of 5):
+// 1.35× per-op throughput at 2048-bit, 1.40× at 4096-bit, 1.20–1.35×
+// elsewhere, vs two production pow_mod calls.
+//
+// Preconditions (enforced by pow_mod_batch): mod odd, mod > 1,
+// k ≤ 64, exp ≥ 1.
+[[nodiscard]] inline std::array<Hydra, 2> pow_mod_montgomery_x2(
+    const Hydra& b0, const Hydra& b1,
+    const Hydra& exp, const Hydra& mod)
+{
+    auto mod_lv = mod.limb_view();
+    const uint32_t k = mod_lv.count;
+
+    MontgomeryContext ctx = MontgomeryContext::build(mod_lv.ptr, k);
+    ctx.compute_r_sq();
+
+    constexpr uint32_t MAX_K = 64;
+    constexpr uint32_t TABLE_SIZE_MAX = 32;   // W ≤ 6
+
+    // Reduce both bases into [0, mod) and pad to k limbs.
+    uint64_t base_padded[2][MAX_K];
+    const Hydra* bases[2] = {&b0, &b1};
+    for (int l = 0; l < 2; ++l) {
+        Hydra r = *bases[l] % mod;
+        if (r.is_negative()) r = r + mod;
+        auto lv = r.limb_view();
+        std::memset(base_padded[l], 0, k * sizeof(uint64_t));
+        std::memcpy(base_padded[l], lv.ptr, lv.count * sizeof(uint64_t));
+    }
+
+    // Adaptive window, identical to single-op pow_mod_montgomery.
+    auto exp_lv = exp.limb_view();
+    const uint32_t exp_bits =
+        64u * (exp_lv.count - 1)
+        + (64u - static_cast<uint32_t>(
+                     __builtin_clzll(exp_lv.ptr[exp_lv.count - 1])));
+#ifdef HYDRA_POWMOD_WINDOW
+    const uint32_t WINDOW = HYDRA_POWMOD_WINDOW;
+    (void)exp_bits;
+#else
+    const uint32_t WINDOW = (exp_bits >= 512) ? 6u : 4u;
+#endif
+    const uint32_t TABLE_SIZE = 1u << (WINDOW - 1);
+
+    uint64_t work[2][MAX_K + 2];
+    uint64_t table[2][TABLE_SIZE_MAX][MAX_K];
+    uint64_t res_a[2][MAX_K], res_b[2][MAX_K];   // ping-pong
+    uint64_t base_sq[2][MAX_K];
+
+    uint64_t* wptr[2] = {work[0], work[1]};
+    uint64_t n0[2]    = {ctx.n0inv, ctx.n0inv};
+    const uint64_t* mptr[2] = {ctx.mod_limbs.data(), ctx.mod_limbs.data()};
+
+    auto mul2 = [&](const uint64_t* a0, const uint64_t* a1,
+                    const uint64_t* c0, const uint64_t* c1,
+                    uint64_t* o0, uint64_t* o1) {
+        const uint64_t* a[2] = {a0, a1};
+        const uint64_t* c[2] = {c0, c1};
+        uint64_t* o[2] = {o0, o1};
+        detail::montgomery_mul_fios_xL<2>(a, c, k, mptr, n0, o, wptr);
+    };
+
+    // table[l][0] = base_l in Montgomery form; then odd powers.
+    mul2(base_padded[0], base_padded[1],
+         ctx.r_sq.data(), ctx.r_sq.data(),
+         table[0][0], table[1][0]);
+    mul2(table[0][0], table[1][0], table[0][0], table[1][0],
+         base_sq[0], base_sq[1]);
+    for (uint32_t i = 1; i < TABLE_SIZE; ++i) {
+        mul2(table[0][i - 1], table[1][i - 1], base_sq[0], base_sq[1],
+             table[0][i], table[1][i]);
+    }
+
+    // result_l = 1 in Montgomery form (R mod n).
+    {
+        uint64_t one_padded[MAX_K];
+        std::memset(one_padded, 0, k * sizeof(uint64_t));
+        one_padded[0] = 1;
+        mul2(one_padded, one_padded, ctx.r_sq.data(), ctx.r_sq.data(),
+             res_a[0], res_a[1]);
+    }
+
+    uint64_t* cur[2] = {res_a[0], res_a[1]};
+    uint64_t* nxt[2] = {res_b[0], res_b[1]};
+
+    uint32_t pending_sqrs = 0;
+    auto flush_sqrs = [&]() {
+        if (pending_sqrs) {
+            detail::montgomery_sqr_run_xL<2>(
+                cur, nxt, pending_sqrs, k, mptr, n0, wptr);
+            pending_sqrs = 0;
+        }
+    };
+
+    // MSB-to-LSB sliding window, shared bit walk.
+    const uint32_t top_limb_idx = exp_lv.count - 1;
+    const int top_bit = 63 - __builtin_clzll(exp_lv.ptr[top_limb_idx]);
+    int bit_pos = static_cast<int>(top_limb_idx) * 64 + top_bit;
+
+    while (bit_pos >= 0) {
+        const uint32_t limb_idx = static_cast<uint32_t>(bit_pos) / 64;
+        const uint32_t bit_idx  = static_cast<uint32_t>(bit_pos) % 64;
+        const uint64_t cur_bit  = (exp_lv.ptr[limb_idx] >> bit_idx) & 1u;
+
+        if (cur_bit == 0) {
+            ++pending_sqrs;
+            --bit_pos;
+        } else {
+            int window_len = static_cast<int>(WINDOW);
+            if (bit_pos < static_cast<int>(WINDOW) - 1) window_len = bit_pos + 1;
+
+            uint32_t wval = 0;
+            for (int i = 0; i < window_len; ++i) {
+                const int bp = bit_pos - i;
+                const uint32_t li = static_cast<uint32_t>(bp) / 64;
+                const uint32_t bi = static_cast<uint32_t>(bp) % 64;
+                wval = (wval << 1) | ((exp_lv.ptr[li] >> bi) & 1u);
+            }
+            int trailing_zeros = 0;
+            while (window_len > 1 && (wval & 1u) == 0) {
+                wval >>= 1; window_len--; trailing_zeros++;
+            }
+
+            pending_sqrs += static_cast<uint32_t>(window_len);
+            flush_sqrs();
+            const uint32_t ti = (wval - 1) / 2;
+            mul2(cur[0], cur[1], table[0][ti], table[1][ti], nxt[0], nxt[1]);
+            std::swap(cur[0], nxt[0]);
+            std::swap(cur[1], nxt[1]);
+            pending_sqrs += static_cast<uint32_t>(trailing_zeros);
+
+            bit_pos -= (window_len + trailing_zeros);
+        }
+    }
+    flush_sqrs();
+
+    // Back from Montgomery form, per lane (cold path).
+    std::array<Hydra, 2> out;
+    for (int l = 0; l < 2; ++l) {
+        uint64_t res[MAX_K];
+        uint64_t wb[2 * MAX_K + 1];
+        std::memset(res, 0, k * sizeof(uint64_t));
+        ctx.from_montgomery(cur[l], res, wb);
+        uint32_t used = k;
+        while (used > 0 && res[used - 1] == 0) --used;
+        out[l] = (used == 0) ? Hydra{0u} : Hydra::from_limbs(res, used);
+    }
+    return out;
+}
+
+// Batched pow_mod for verification-shaped workloads: many bases, ONE
+// exponent, ONE modulus (RSA signature batches, VDF checks, RSA
+// accumulators).  Element i of the result equals
+// pow_mod(bases[i], exp, mod) exactly — same values, same exceptions.
+//
+// When the modulus is Montgomery-eligible (odd, ≤ 64 limbs) and
+// exp ≥ 1, bases are processed in pairs through the fused 2-lane
+// ladder above (odd remainder → single-op path).  Anything else falls
+// back to per-element pow_mod.  Like everything in Hydra this is
+// variable-time — public inputs only.
+[[nodiscard]] inline std::vector<Hydra> pow_mod_batch(
+    std::span<const Hydra> bases, const Hydra& exp, const Hydra& mod)
+{
+    if (mod <= Hydra{0u})
+        throw std::domain_error("pow_mod_batch: modulus must be positive");
+    if (exp.is_negative())
+        throw std::domain_error("pow_mod_batch: exponent must be non-negative");
+
+    std::vector<Hydra> out;
+    out.reserve(bases.size());
+
+    constexpr uint32_t MONTGOMERY_MAX_LIMBS = 64;
+    auto mod_lv = mod.limb_view();
+    const bool pairable =
+        mod_lv.count > 0 && mod_lv.count <= MONTGOMERY_MAX_LIMBS
+        && (mod_lv.ptr[0] & 1u)
+        && mod != Hydra{1u}
+        && !exp.is_zero();
+
+    size_t i = 0;
+    if (pairable) {
+        for (; i + 2 <= bases.size(); i += 2) {
+            auto r = pow_mod_montgomery_x2(bases[i], bases[i + 1], exp, mod);
+            out.push_back(std::move(r[0]));
+            out.push_back(std::move(r[1]));
+        }
+    }
+    for (; i < bases.size(); ++i)
+        out.push_back(pow_mod(bases[i], exp, mod));
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────

@@ -148,6 +148,30 @@ numbers are conservative until it's migrated._
 
 ---
 
+### pow_mod_batch — fused 2-lane ladder (2026-07-10)
+
+_`bench/probe_pow_mod_batch.cpp` — native M5 Pro, rotating operands
+(8 pairs), min of 5 samples, per-exponentiation latency vs two
+production `pow_mod` calls.  Tier-1 shape: shared exponent + modulus
+(RSA verify / VDF / accumulator workloads)._
+
+| Width | pow_mod ns/op | pow_mod_batch ns/op | throughput gain |
+|------:|--------------:|--------------------:|----------------:|
+|  256  |        7 549  |               5 433 |      1.39×      |
+|  512  |       33 101  |              27 001 |      1.23×      |
+| 1024  |      218 310  |             182 248 |      1.20×      |
+| 2048  |    1 791 958  |           1 345 761 |    **1.33×**    |
+| 4096  |   14 468 723  |          10 494 828 |    **1.38×**    |
+
+_Kernel-layer fusion is 1.54×/1.50× at 2048/4096-bit
+(`probe_mont_interleave`); the e2e gap is the baseline's halved-
+squaring advantage plus residual L1 competition at k=64.  Batched
+Hydra at 2048-bit (1.35 ms) does not yet catch single-op GMP
+(~1.05 ms).  wasm: fusion is a null (1.02–1.08×) — the API works
+there but doesn't win.  Not constant-time; public inputs only._
+
+---
+
 ### hydra-bignum (npm) vs native JS BigInt (2026-07-10)
 
 _`pkg/bench/bench_vs_bigint.mjs --runs 6` — node 26, Apple M5 Pro.

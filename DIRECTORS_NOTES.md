@@ -5266,4 +5266,57 @@ overstate locality — two lanes' operands compete for L1).
 
 ---
 
+### pow_mod_batch Landed — Fused 2-Lane Ladder (B1 Tier 1)
+
+_2026-07-10 — Claude Fable 5.  Completes the B1 gate opened by the
+interleave probe (entry above).  1058/1058 tests pass in Debug-ASan,
+Release, and wasm._
+
+**Shipped:** `detail::montgomery_mul_fios_xL<L>` +
+`detail::montgomery_sqr_run_xL<L>` (kernels, bit-identical per lane
+to `montgomery_mul_fios`), `pow_mod_montgomery_x2` (2-lane ladder),
+and public `pow_mod_batch(std::span<const Hydra> bases, exp, mod)` →
+`vector<Hydra>` — element i exactly equals `pow_mod(bases[i], exp,
+mod)`, same exceptions.  Pairs go through the fused ladder when the
+modulus is Montgomery-eligible (odd, ≤64 limbs, >1) and exp ≥ 1; odd
+remainder and every fallback case route per-element through pow_mod.
+`bench/mont_interleave_kernels.hpp` now aliases the shipped kernels
+(probes are the A/B harness); the fused halved-squaring stays
+probe-only.
+
+**E2e results** (rotating operands, per-exponentiation, vs two
+production pow_mod calls): 1.39× @256b, 1.23× @512b, 1.20× @1024b,
+**1.33× @2048b, 1.38× @4096b**.  Table in perf_snapshot.md.
+
+**Two e2e discoveries beyond the kernel probe:**
+1. **Sqr-as-fused-mul beats fused halved-squaring at every k** (e.g.
+   548 vs 568 ns @k=32) — the halved kernel's shrunken product chain
+   starves the dual-issue slots fusion feeds.  The batch ladder uses
+   ONE kernel for everything; no fused halved-sqr in production.
+2. **The in-ladder pointer tax.**  First e2e attempt measured only
+   1.12× @2048b: dispatching each squaring as its own call with
+   freshly built pointer arrays ran the fused kernel ~20% over its
+   microbench cost (665 vs 548 ns/mul; NOT cadence — fixed-operand
+   e2e matched rotating).  Fix: defer squarings and flush them in
+   runs (`montgomery_sqr_run_xL`, manually unrolled ×2 so both
+   ping-pong pointer configurations are loop-invariant) — recovered
+   to 557 ns/mul in-ladder, i.e. the kernel-probe number.  Rule:
+   fused kernels must be fed pointer-invariant call runs.
+
+**Honest ceilings:** e2e trails the 1.54× kernel figure because the
+single-op baseline enjoys halved squaring (743 ns blended vs our
+557); k=64 shows a residual gap (1.38× vs 1.50× kernel) — likely the
+2×16 KB window tables competing in L1, unexplored.  Batched 2048-bit
+(1.35 ms/op) does not catch single-op GMP (~1.05 ms).  wasm: fusion
+null, API works but doesn't win there — the npm package intentionally
+gets no batch entry point.
+
+**Not done (future tiers):** tier 2 (shared mod, divergent exps —
+needs per-lane window bookkeeping), batch API in the JS package
+(pointless until a wasm win exists), the k=64 L1 investigation, and
+any constant-time claims (the lockstep structure is a *stepping
+stone*, per the design digression — the disclaimer stands).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

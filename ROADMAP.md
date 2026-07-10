@@ -96,7 +96,18 @@ to impact; no prerequisites.
 
 ## Track B — Deep engineering
 
-### B1 · Batched `pow_mod` — interleave independent exponentiations — **probe: FUNDED (native)**
+### B1 · Batched `pow_mod` — interleave independent exponentiations — **tier 1 LANDED 2026-07-10**
+
+_Shipped: `pow_mod_batch(bases, exp, mod)` — fused 2-lane Montgomery
+ladder, **1.33× @2048-bit / 1.38× @4096-bit** e2e throughput vs
+single-op, exact pow_mod semantics per element, 1058/1058 tests
+(native + wasm).  Key e2e findings: one kernel serves both mul and
+sqr (fused halved-sqr loses to sqr-as-fused-mul), and squarings must
+flush in pointer-invariant runs (~20%/mul tax otherwise).  Remaining
+ideas below stay open: tier 2 (shared mod, divergent exps), the k=64
+L1 gap (1.38× e2e vs 1.50× kernel), catching single-op GMP (needs
+~1.7× — tier 2 + halved-sqr-style MAC reduction inside the fused
+kernel is the plausible route).  Full record in DIRECTORS_NOTES._
 The hard-won rule says single-op asm/PGO are measured nulls; don't
 retry **without a structural change**.  Batching is the structural
 change: verification workloads (signature batches, accumulator checks,
