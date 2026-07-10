@@ -371,7 +371,9 @@
       status.textContent = 'Running ' + bk.name + ' @ ' + bits + '-bit  (' +
         (i + 1) + '/' + plan.length + ')…';
       await new Promise(r => setTimeout(r, 30));   // let the UI paint
-      results[bits][bk.id] = mod.cell(bk.id, bits, samples);
+      const ms = mod.cell(bk.id, bits, samples);
+      // < 0 = backend not compiled into this build — leave the row empty.
+      results[bits][bk.id] = ms >= 0 ? ms : null;
       paint(bits);
       paintTable();
     }

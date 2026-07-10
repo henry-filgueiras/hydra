@@ -21,6 +21,11 @@ on:
     branches: [main]
   pull_request:
 
+# Only one Pages deployment in flight at a time.
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
 jobs:
   native:
     name: native ${{ matrix.os }} / ${{ matrix.build }}
@@ -88,3 +93,72 @@ jobs:
               console.log('backends agree at 256/1024/2048-bit');
             });
           "
+
+  # ── Deploy the live demo to GitHub Pages (main pushes only) ──
+  # Full three-backend build (Hydra + mini-gmp + Boost).  Boost
+  # headers are copied into an ISOLATED include dir first: pointing
+  # emcc at /usr/include directly would let host glibc headers shadow
+  # the wasm sysroot.  First-ever deploy may need Pages enabled once
+  # (Settings → Pages → Source: "GitHub Actions") if the automatic
+  # enablement below lacks permission.
+  deploy-demo:
+    name: deploy demo → GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [native, wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Isolated Boost headers
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libboost-dev
+          mkdir -p boost-iso
+          cp -rL /usr/include/boost boost-iso/
+
+      - name: Build demo (three backends)
+        run: |
+          scripts/fetch_minigmp.sh
+          emcc -O2 -DNDEBUG -c build-wasm/minigmp/mini-gmp.c \
+            -o build-wasm/minigmp/mini-gmp.o
+          mkdir -p build-wasm/demo
+          emcc -std=c++20 -O2 -DNDEBUG -I. \
+            -DHYDRA_POWMOD_GMP -DHYDRA_POWMOD_BOOST \
+            -Ibuild-wasm/minigmp -Iboost-iso \
+            demo/bench_web.cpp hydra.cpp build-wasm/minigmp/mini-gmp.o \
+            -sSINGLE_FILE=1 -sMODULARIZE=1 -sEXPORT_NAME=HydraBench \
+            -sENVIRONMENT=web,node \
+            -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 \
+            -sEXPORTED_FUNCTIONS=_hydra_bench_cell,_hydra_validate,_hydra_rsa_keygen,_hydra_next_prime_str,_hydra_powmod_str \
+            -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+            -o build-wasm/demo/bench_web.js
+          cp demo/index.html build-wasm/demo/index.html
+          node -e "
+            require('./build-wasm/demo/bench_web.js')().then(m => {
+              const v = m.cwrap('hydra_validate', 'number', ['number']);
+              if (v(1024) !== 1) process.exit(1);
+              console.log('pages build validates');
+            });
+          "
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build-wasm/demo
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

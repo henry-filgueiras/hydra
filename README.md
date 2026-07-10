@@ -131,6 +131,10 @@ Achieved via Montgomery reduction, Karatsuba multiplication dispatch, and fast-p
 
 ### 🌐 WebAssembly — fastest bignum you can ship in a browser
 
+**[▶ Live demo](https://henry-filgueiras.github.io/hydra/)** — run the
+shootout on your own device, generate primes, round-trip a message
+through toy RSA.  Deployed automatically from `main` by CI.
+
 Native GMP's speed comes from per-architecture assembly, which doesn't
 exist for wasm32 — compile GMP-dependent code to WebAssembly and you
 get **mini-gmp**, its portable fallback.  Hydra's performance story is

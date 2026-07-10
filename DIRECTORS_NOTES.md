@@ -4963,6 +4963,29 @@ the start with sane timing.  Page JS `node --check`ed; headless Chrome
 boots the page to "Ready" with the panel present.  Artifact redeployed
 (same URL).  The library itself is untouched — demo-only exports.
 
+#### Follow-up (same day): GitHub Pages auto-deploy
+
+`deploy-demo` job appended to `.github/workflows/ci.yml`: on main
+pushes, after `native` + `wasm` pass, it builds the full three-backend
+demo and deploys `build-wasm/demo/` to GitHub Pages
+(https://henry-filgueiras.github.io/hydra/).  Two engineering points:
+
+1. **Isolated Boost include dir.**  The wasm CI jobs previously
+   excluded Boost because `-I/usr/include` lets host glibc headers
+   shadow emcc's sysroot.  The fix: `cp -rL /usr/include/boost
+   boost-iso/` and `-Iboost-iso` — only Boost is visible.  Proven
+   locally with emcc against a brew-boost copy before landing.
+2. **Graceful backend degradation.**  `bench_cell` returns −1 for a
+   backend not compiled into the module; the page previously would
+   have rendered "−1000 µs".  Now a negative cell leaves the row
+   empty — any single-backend build of the page stays presentable.
+
+Pages enablement: `actions/configure-pages@v5` with `enablement:
+true` should create the site on first deploy; if the token lacks
+permission, one manual step remains (Settings → Pages → Source:
+"GitHub Actions").  Deploy is gated `needs: [native, wasm]` and
+push-to-main only, with a `pages-deploy` concurrency group.
+
 ---
 
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
