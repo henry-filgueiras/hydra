@@ -102,14 +102,30 @@ VDF aggregation) present many independent modexps, and 2–4 interleaved
 Montgomery ladders break the serial dependency chain that made
 single-op NEON a null.
 
-- **API sketch:** `pow_mod_batch(std::span<const Hydra> bases, exp,
-  mod)` (shared exp/mod first — the verification shape).
-- **Measurement:** throughput (ops/s) vs N× single-op at crypto
-  widths, existing probe/A-B harness (`--runs`, min-of-medians).
-  Target: ≥1.5× throughput at 2048-bit, which would put batched Hydra
-  ahead of single-op GMP.
-- **Risk:** honest chance of a null result; log it as a Dragon either
-  way.
+- **API sketch (tiered):** tier 1 `pow_mod_batch(span<const Hydra>
+  bases, exp, mod)` — shared exponent+modulus, the RSA-verify/VDF
+  shape, perfect lockstep + one Montgomery context; tier 2 shared
+  modulus only (squarings stay lockstep, window multiplies predicated
+  per lane, pad to max exponent width); tier 3 general N×(b,e,m)
+  sugar that groups by (mod, width).  Structure-of-arrays padded
+  layout (N×k limbs per operand) — forward-compatible with a future
+  32/52-bit-limb vector backend.
+- **Measurement:** `probe_mont_interleave` first (1/2/4 interleaved
+  Montgomery muls × k = 4..64, MACs/cycle) — kills or funds the idea
+  before any API exists.  Then e2e throughput vs N× single-op,
+  existing harness (`--runs`, min-of-medians).  Target: ≥1.5×
+  throughput at 2048-bit (would put batched Hydra ahead of single-op
+  GMP).  Include a wasm lane: it could flip the 4096-bit npm story
+  vs native BigInt.
+- **Risk:** honest chance of a null result (2 lanes of FIOS state vs
+  31 GPRs — register spill can eat the ILP win); log it as a Dragon
+  either way.
+- **Full design notes:** see "Batched pow_mod — Design Digression"
+  in DIRECTORS_NOTES (2026-07-10): why ILP-across-lanes is the
+  structural change the single-op asm nulls demand, the no-vector-
+  64×64→128 trap on NEON/wasm-SIMD128, the JS microtask auto-
+  coalescing aggregator for the npm package, and the security
+  framing (defense in depth, never a constant-time claim).
 
 ### B2 · Subquadratic base conversion
 `to_string` is chunked base-10^18 but still linear in divisions;

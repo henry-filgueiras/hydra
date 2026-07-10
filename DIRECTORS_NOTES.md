@@ -5111,4 +5111,77 @@ Statuses live in ROADMAP.md, not here.
 
 ---
 
+### Batched pow_mod — Design Digression (B1 pre-work, no code)
+
+_2026-07-10 — Claude Fable 5, from a director thinking-aloud session.
+Captured so the reasoning isn't lost; nothing implemented or measured._
+
+**Why batching is the right non-asm lever.**  Single-op Montgomery is
+bounded by the serial carry chain in the FIOS inner loop — every MAC
+waits on the previous carry, so the ~1/cycle multiplier sits idle for
+most of its 3–5-cycle latency.  That dependency structure is why the
+asm/PGO attempts measured null: scheduling can't fix a data
+dependency.  Interleaving 2–4 *independent* ladders in one loop body
+lets the compiler fill lane A's carry bubbles with lane B's multiplies
+— portable C++, no intrinsics, and precisely the "structural change"
+the null-result rule demands.  Expectation: 1.3–1.7× throughput, NOT
+2× — two lanes of live FIOS state (the k+2-limb fused accumulator is
+the decisive invariant) will pressure aarch64's 31 GPRs; spill can eat
+the win.  Null result is a live possibility.
+
+**The SIMD trap (do not walk into it).**  Neither NEON nor wasm
+SIMD128 has a vector 64×64→128 multiply, so "SIMD across batch lanes"
+requires re-plumbing limbs to 32-bit (or 52-bit float-FMA, the
+AVX-512 IFMA / ipp-crypto literature).  That is a per-arch backend
+decision for *after* an ILP version proves the API earns its keep.
+The SoA padded batch layout (N×k limbs per operand) is deliberately
+the layout such a backend would want — the ABI is forward-compatible.
+
+**API tiering** (also sketched in ROADMAP B1): shared-exp+mod →
+perfect lockstep + one Montgomery context (n′, R², W=6 table
+amortized); shared-mod → squarings lockstep by construction, only the
+~bits/7 window multiplies diverge (predicate per lane, pad to max
+exponent width); general N×(b,e,m) → group internally, serial
+fallback for singletons.
+
+**Aggregator layer: not the library's job — except in JS, where it's
+free.**  A per-CPU hot-loop batch aggregator with coroutine
+completions (io_uring-shaped) presumes a client that doesn't exist
+and drags executors/lifetimes into a header-only math library.  The
+library ships a pure synchronous batch kernel.  BUT the npm package
+gets the aggregator from the event loop itself: a `powModBatched()`
+that pushes into a pending list and schedules one microtask flush
+coalesces all same-tick calls into one wasm batch call, resolving
+each promise individually — no threads, no config, one tick of added
+latency.  Ship the pattern there first; boundary-crossing
+amortization helps even before an ILP kernel exists under it.
+
+**Security framing (director's "batching blurs variable-time"
+intuition — half right).**  Real: a lockstep batch ladder padded to
+max width has a fixed squaring schedule, and cross-stream mixing
+means an observer's wall clock mostly measures batch composition —
+blinding-like *reduction* of remote-timing observability, and
+structurally ~70% of a constant-time ladder (a genuine stepping stone
+toward the deferred hardened profile).  Not real: an attacker who can
+co-schedule requests can difference the target back out; aggregate
+time still leaks sums; cache/port-contention channels are untouched.
+Rule: batching may be described as defense in depth; it must never be
+marketed as constant-time, and the "not for secret keys" disclaimer
+stays.
+
+**Adjacent:** for RSA specifically, algebraic batch-verification
+(small-exponent combination tests) beats even a perfect batched
+modexp — a consumer-layer trick to remember if a real verification
+user appears.
+
+**Measurement plan when B1 opens:** `probe_mont_interleave.cpp`
+(1/2/4 lanes × k = 4..64, MACs/cycle) funds or kills the idea in
+hours; then e2e `pow_mod_batch` vs N× single-op, `--runs`
+min-of-medians, target ≥1.5× @2048-bit; kernel wins can invert e2e —
+bench both layers; include a wasm lane (V8's scheduling of two
+interleaved software-i128 chains is unknown; a win could flip the
+npm 4096-bit 0.8× loss for batch workloads).
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._
