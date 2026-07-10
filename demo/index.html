@@ -419,16 +419,22 @@
     findBtn.addEventListener('click', async () => {
       const bits = +document.getElementById('primeBits').value;
       findBtn.disabled = true;
-      pOut.innerHTML = '<div class="k">searching from a random ' + bits +
-                       '-bit start…</div>';
-      await new Promise(r => setTimeout(r, 30));
-      const [prime, ms] = mod.nextPrime(randomStartDec(bits)).split(',');
-      pOut.innerHTML =
-        '<div><span class="k">prime  </span><span class="num">' + trunc(prime) +
-        '</span></div>' +
-        '<div><span class="k">found in </span>' + fmtms(+ms) +
-        ' <span class="k">(Baillie–PSW, exact &lt; 2⁶⁴, no known counterexample above)</span></div>';
-      findBtn.disabled = false;
+      try {
+        pOut.innerHTML = '<div class="k">searching from a random ' + bits +
+                         '-bit start…</div>';
+        await new Promise(r => setTimeout(r, 30));
+        const [prime, ms] = mod.nextPrime(randomStartDec(bits)).split(',');
+        pOut.innerHTML =
+          '<div><span class="k">prime  </span><span class="num">' + trunc(prime) +
+          '</span></div>' +
+          '<div><span class="k">found in </span>' + fmtms(+ms) +
+          ' <span class="k">(Baillie–PSW, exact &lt; 2⁶⁴, no known counterexample above)</span></div>';
+      } catch (e) {
+        pOut.innerHTML = '<div class="k">failed: ' + String(e).slice(0, 200) +
+                         '</div>';
+      } finally {
+        findBtn.disabled = false;
+      }
     });
 
     rsaBtn.addEventListener('click', async () => {
@@ -441,6 +447,7 @@
         return;
       }
       rsaBtn.disabled = true;
+      try {
       rOut.innerHTML = '<div class="k">generating two ' + (bits / 2) +
                        '-bit primes…</div>';
       await new Promise(r => setTimeout(r, 30));
@@ -467,7 +474,12 @@
                        : '<span class="k">MISMATCH ✗</span>') + '</div>' +
         '<div><span class="k">keygen ' + fmtms(+kms) +
         ' — two ' + (bits / 2) + '-bit primes + d = e⁻¹ mod φ (extended_gcd)</span></div>';
-      rsaBtn.disabled = false;
+      } catch (e) {
+        rOut.innerHTML = '<div class="k">failed: ' + String(e).slice(0, 200) +
+                         '</div>';
+      } finally {
+        rsaBtn.disabled = false;
+      }
     });
   }
 
