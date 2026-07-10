@@ -2006,6 +2006,13 @@ inline void montgomery_sqr_sos(
 //   out[]  has at least k limbs
 //   work[] has at least k+2 limbs
 //
+// Measured 2026-07-10: adding __restrict to all five pointer params
+// (legal — a/b are read-only so the sqr path's a==b is fine; work/out
+// never alias inputs on the dispatch path) was performance-neutral at
+// every k in 4..32: deltas −2.7%..+1.3% with sign flips, min-of-3
+// interleaved runs.  Clang-21 already schedules the chain loads past
+// the work[j-1] store.  Kept qualifier-free to avoid carrying UB risk
+// for zero measured benefit.  See DIRECTORS_NOTES.md 2026-07-10.
 inline void montgomery_mul_fios(
     const uint64_t* a, const uint64_t* b,
     uint32_t k,
@@ -2143,6 +2150,213 @@ inline void montgomery_sqr_fios(
     uint64_t* work) noexcept
 {
     montgomery_mul_fios(a, a, k, mod, n0inv, out, work);
+}
+
+// ─── Halved FIOS squaring (cross-term symmetry inside the fused pass) ───
+//
+// Montgomery squaring that exploits a[i]·a[j] == a[j]·a[i] while
+// preserving the fused k+2-limb accumulator (the invariant both the
+// SOS null result and the FIOS win identified as decisive).
+//
+// Regroup the square:
+//
+//   a² = Σ_i [ a[i]²·2^(128i)  +  2·Σ_{j>i} a[i]·a[j]·2^(64(i+j)) ]
+//
+// and assign group i to CIOS row i.  In the row-i local frame
+// (T[t] = global position i+t after i shifts), group i's terms land
+// at local j = i..k-1 — the diagonal a[i]² at j == i, doubled cross
+// terms at j > i.  Rows therefore add a *shrinking* product chain:
+//
+//   row i:  product MACs at j = i..k-1   (k-i of them)
+//           reduce  MACs at j = 0..k-1   (k, unchanged)
+//
+// Total: k(k+1)/2 + k² ≈ 1.5k² MACs vs 2k² for FIOS-sqr-as-mul.
+//
+// Correctness of the m_i sequence: position i receives cross terms
+// from pairs (g, j), g < j, g + j == i — all with g ≤ i/2 < i, i.e.
+// from groups already processed when row i computes
+// m_i = T[0]·n0inv.  The partial sums at every position match plain
+// FIOS exactly, so the m_i sequence — and therefore the final T and
+// out[] — are BIT-IDENTICAL to montgomery_mul_fios(a, a, …).  The
+// tests exploit this: any deviation at any k is a hard failure.
+//
+// The doubled product needs 65-bit carry handling: 2·(2^64−1)² +
+// T[j] + carry exceeds 2^128, so chain A's carry is tracked as
+// (ca, caH) with caH ≤ 2, and 2p is decomposed into three words
+// (d0, d1, d2) before entering the 128-bit adds.  Chain B (reduce)
+// is unchanged from FIOS: 64-bit carry, implicit shift via the
+// work[j-1] write.
+//
+// Row shape (three phases, each j in 1..k-1 covered exactly once):
+//   phase 1  j = 1..i-1   reduce chain only (no products this row)
+//   phase 2  j = i        diagonal a[i]² (undoubled) + reduce
+//   phase 3  j = i+1..k-1 doubled cross term + reduce (dual chain)
+// Row 0 folds the diagonal into the bootstrap (j = 0) instead.
+//
+// ILP note: phase 1 runs the reduce chain alone (serial carry), and
+// its share grows with i — averaged over rows, roughly half the
+// reduce MACs lose their dual-issue partner.  The measured win is
+// therefore expected below the 25 % MAC-count ceiling.
+//
+// Preconditions: identical to montgomery_mul_fios (k ≥ 1, out ≥ k,
+// work ≥ k+2 limbs; work may be dirty).
+//
+inline void montgomery_sqr_fios_halved(
+    const uint64_t* a,
+    uint32_t k,
+    const uint64_t* mod,
+    uint64_t n0inv,
+    uint64_t* out,
+    uint64_t* work) noexcept
+{
+    const uint32_t tlen = k + 2;
+    std::memset(work, 0, tlen * sizeof(uint64_t));
+
+    for (uint32_t i = 0; i < k; ++i) {
+        const uint64_t ai = a[i];
+
+        // ── Bootstrap (j = 0) ──
+        // Row 0: the diagonal a[0]² IS the j=0 product term.
+        // Rows i ≥ 1: no product lands at j=0 (group i starts at
+        // local j = i), so T0 is just the accumulator digit.
+        uint64_t T0;
+        uint64_t ca  = 0;   // chain-A carry, low 64 bits
+        uint64_t caH = 0;   // chain-A carry, high bits (≤ 2)
+        if (i == 0) {
+            const unsigned __int128 t0 =
+                static_cast<unsigned __int128>(ai) * ai + work[0];
+            T0 = static_cast<uint64_t>(t0);
+            ca = static_cast<uint64_t>(t0 >> 64);
+        } else {
+            T0 = work[0];
+        }
+
+        const uint64_t m = T0 * n0inv;
+
+        const unsigned __int128 t1 =
+            static_cast<unsigned __int128>(m) * mod[0] + T0;
+        uint64_t cb = static_cast<uint64_t>(t1 >> 64);
+
+        uint32_t j = 1;
+
+        // ── Phase 1 (j = 1..i-1): reduce chain only ──
+        // No product contributions in this range; the post-product
+        // digit is work[j] itself.
+        for (; j < i; ++j) {
+            const unsigned __int128 tB =
+                static_cast<unsigned __int128>(m) * mod[j]
+                + work[j]
+                + cb;
+            work[j - 1] = static_cast<uint64_t>(tB);
+            cb          = static_cast<uint64_t>(tB >> 64);
+        }
+
+        // ── Phase 2 (j = i, rows i ≥ 1): undoubled diagonal ──
+        // a[i]² + work[i] ≤ (2^64−1)² + 2^64−1 < 2^128 — no 65-bit
+        // carry needed here; ca/caH are zero on entry (phase 1
+        // carries only through cb).
+        if (i >= 1) {
+            const unsigned __int128 tA =
+                static_cast<unsigned __int128>(ai) * ai + work[i];
+            const uint64_t Tj = static_cast<uint64_t>(tA);
+            ca                = static_cast<uint64_t>(tA >> 64);
+
+            const unsigned __int128 tB =
+                static_cast<unsigned __int128>(m) * mod[i]
+                + Tj
+                + cb;
+            work[i - 1] = static_cast<uint64_t>(tB);
+            cb          = static_cast<uint64_t>(tB >> 64);
+            j = i + 1;
+        }
+
+        // ── Phase 3 (j = i+1..k-1): doubled cross terms, dual chain ──
+        for (; j < k; ++j) {
+            const unsigned __int128 p =
+                static_cast<unsigned __int128>(ai) * a[j];
+            const uint64_t p_lo = static_cast<uint64_t>(p);
+            const uint64_t p_hi = static_cast<uint64_t>(p >> 64);
+            // 2p = d2·2^128 + d1·2^64 + d0
+            const uint64_t d0 = p_lo << 1;
+            const uint64_t d1 = (p_hi << 1) | (p_lo >> 63);
+            const uint64_t d2 = p_hi >> 63;
+
+            // Low words: digit + small overflow c0 (≤ 2)
+            const unsigned __int128 s =
+                static_cast<unsigned __int128>(d0) + work[j] + ca;
+            const uint64_t Tj = static_cast<uint64_t>(s);
+            const uint64_t c0 = static_cast<uint64_t>(s >> 64);
+
+            // Carry into next position:
+            //   (2p + work[j] + ca_full) >> 64 = d1 + c0 + caH + d2·2^64
+            // d2 contributes only to the high word — add it there
+            // directly instead of through a 128-bit shift.
+            const unsigned __int128 cnext =
+                static_cast<unsigned __int128>(d1) + c0 + caH;
+            ca  = static_cast<uint64_t>(cnext);
+            caH = static_cast<uint64_t>(cnext >> 64) + d2;   // ≤ 2
+
+            const unsigned __int128 tB =
+                static_cast<unsigned __int128>(m) * mod[j]
+                + Tj
+                + cb;
+            work[j - 1] = static_cast<uint64_t>(tB);
+            cb          = static_cast<uint64_t>(tB >> 64);
+        }
+
+        // ── End-of-row fold ──
+        // Chain A's carry is (ca, caH): ca lands at local position k,
+        // caH at k+1.  cb lands at k.  Same shift semantics as FIOS.
+        const unsigned __int128 tkA =
+            static_cast<unsigned __int128>(work[k]) + ca;
+        const uint64_t Wp_k  = static_cast<uint64_t>(tkA);
+        const uint64_t sp1   = static_cast<uint64_t>(tkA >> 64);
+
+        const unsigned __int128 tkB =
+            static_cast<unsigned __int128>(Wp_k) + cb;
+        work[k - 1]          = static_cast<uint64_t>(tkB);
+        const uint64_t sp2   = static_cast<uint64_t>(tkB >> 64);
+
+        const unsigned __int128 top =
+            static_cast<unsigned __int128>(work[k + 1]) + caH + sp1 + sp2;
+        work[k]     = static_cast<uint64_t>(top);
+        work[k + 1] = static_cast<uint64_t>(top >> 64);
+    }
+
+    // ── Conditional final subtraction (identical to FIOS) ──
+    const uint64_t* T = work;
+    bool need_sub = false;
+    if (T[k] != 0) {
+        need_sub = true;
+    } else {
+        for (uint32_t i = k; i-- > 0;) {
+            if (T[i] > mod[i]) { need_sub = true; break; }
+            if (T[i] < mod[i]) { need_sub = false; break; }
+        }
+        if (!need_sub) {
+            bool all_equal = true;
+            for (uint32_t i = 0; i < k; ++i) {
+                if (T[i] != mod[i]) { all_equal = false; break; }
+            }
+            if (all_equal) need_sub = true;
+        }
+    }
+
+    if (need_sub) {
+        uint64_t borrow = 0;
+        for (uint32_t i = 0; i < k; ++i) {
+            uint64_t wi = T[i];
+            uint64_t mi = mod[i];
+            uint64_t d1 = wi - mi;
+            uint64_t b1 = (d1 > wi) ? 1u : 0u;
+            uint64_t d2 = d1 - borrow;
+            uint64_t b2 = (d2 > d1) ? 1u : 0u;
+            out[i] = d2;
+            borrow = b1 + b2;
+        }
+    } else {
+        std::memcpy(out, T, k * sizeof(uint64_t));
+    }
 }
 
 // ─── Karatsuba-backed Montgomery multiply (separate product + REDC) ───
@@ -3919,8 +4133,23 @@ struct EGCDResult {
             detail::montgomery_mul(a, b, k, ctx.mod_limbs.data(),
                                     ctx.n0inv, out, work_buf);
     };
+    // Squaring routes to the halved-cross-term FIOS variant for
+    // k <= HALVED_SQR_MAX_K (2026-07-10): ~1.5k² MACs vs 2k² for
+    // sqr-as-mul, bit-identical output by construction (same m_i
+    // sequence).  End-to-end wins at every benched width up to
+    // 2048-bit (−2% to −11%), but at k=64 the shrinking product
+    // chain leaves the reduce chain unpaired for most of the row
+    // (serial-carry-bound) and 4096-bit REGRESSED +2.3% (min-of-12,
+    // both interleave orders) — so the threshold stops at the last
+    // e2e-verified win.  k=33..63 is e2e-unbenched; it stays on the
+    // conservative sqr-as-mul path.  See DIRECTORS_NOTES.md
+    // 2026-07-10 (halved squaring entry) before moving this.
+    constexpr uint32_t HALVED_SQR_MAX_K = 32;
     auto mont_sqr = [&](const uint64_t* a, uint64_t* out) {
-        if (use_fused)
+        if (use_fused && k <= HALVED_SQR_MAX_K)
+            detail::montgomery_sqr_fios_halved(a, k, ctx.mod_limbs.data(),
+                                                ctx.n0inv, out, work_buf);
+        else if (use_fused)
             detail::montgomery_sqr_fios(a, k, ctx.mod_limbs.data(),
                                          ctx.n0inv, out, work_buf);
         else

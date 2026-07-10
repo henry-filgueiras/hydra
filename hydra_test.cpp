@@ -3468,6 +3468,51 @@ static void test_fios_mont_large_k_band() {
     }
 }
 
+// Halved FIOS squaring — bit-identity against sqr-as-mul.
+// Both kernels compute the identical m_i sequence (see the design
+// comment on montgomery_sqr_fios_halved), so outputs must match
+// EXACTLY at every k, for every input — including carry-adversarial
+// (mod-1)² and dirty work buffers.  Any deviation is a hard failure,
+// which makes this the strongest oracle in the Montgomery suite.
+static void test_halved_sqr_bit_identity() {
+    for (uint32_t k = 1; k <= 64; ++k) {
+        std::mt19937_64 rng(0x5A11DEEDull + k);
+        for (int trial = 0; trial < 4; ++trial) {
+            std::vector<uint64_t> mod(k), a(k);
+            for (auto& l : mod) l = rng();
+            mod[0] |= 1u;
+            mod[k - 1] |= (1ull << 63);
+            if (trial == 0) {
+                a = mod;
+                a[0] -= 1;                       // a = mod - 1
+            } else {
+                for (auto& l : a) l = rng();
+                a[k - 1] &= (1ull << 63) - 1;    // a < mod
+            }
+            uint64_t n0inv = hydra::detail::montgomery_n0inv(mod[0]);
+
+            std::vector<uint64_t> out_ref(k), out_new(k);
+            std::vector<uint64_t> work(k + 2, 0xBADC0FFEE0DDF00Dull);
+            hydra::detail::montgomery_sqr_fios(
+                a.data(), k, mod.data(), n0inv,
+                out_ref.data(), work.data());
+            std::fill(work.begin(), work.end(), 0xBADC0FFEE0DDF00Dull);
+            hydra::detail::montgomery_sqr_fios_halved(
+                a.data(), k, mod.data(), n0inv,
+                out_new.data(), work.data());
+
+            if (out_ref != out_new) {
+                std::string label = "halved sqr bit-identity at k=" +
+                                    std::to_string(k) + " trial=" +
+                                    std::to_string(trial);
+                CHECK(false, label.c_str());
+            }
+        }
+    }
+    CHECK(true, "halved sqr bit-identity k=1..64 (random, (mod-1)^2, "
+                "dirty work buffer)");
+}
+
 static void test_fios_mont_mul_carry_adversarial() {
     // (mod-1)² operands — drives the two-chain carry pipeline to
     // its structural maximum.  Exactly the shape that breaks shift-
@@ -4222,6 +4267,7 @@ int main() {
     // Dual-row CIOS / FIOS Montgomery tests
     test_fios_mont_mul_vs_fused_sweep();
     test_fios_mont_large_k_band();
+    test_halved_sqr_bit_identity();
     test_fios_mont_mul_carry_adversarial();
     test_fios_mont_mul_dirty_work_buffer();
     test_fios_mont_sqr_cross();

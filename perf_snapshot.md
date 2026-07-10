@@ -2,16 +2,15 @@
 
 Generated: `2026-07-10`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
-> Current state after the **KARATSUBA_MONT_THRESHOLD retirement**
-> (2026-07-10): FIOS (dual-row CIOS) now owns the entire Montgomery
-> band k = 1..64.  The Karatsuba+REDC tier that previously served
-> k ≥ 32 was benchmark-retired — FIOS beats it at every k in 31..64
-> with no crossover (−22.6 % at k=32, −28.0 % at k=64 kernel-level),
-> worth **−26 % at 2048-bit and −24 % at 4096-bit** end-to-end.  The
-> threshold had been derived against fused CIOS (pre-FIOS) and was
-> never re-measured after FIOS landed.  `montgomery_mul_karatsuba`,
-> canonical fused CIOS, separate schoolbook+REDC, and SOS all stay
-> in-tree as correctness references, not reachable via dispatch.
+> Current state after the 2026-07-10 arc: **KARATSUBA_MONT_THRESHOLD
+> retirement** (FIOS owns the entire k = 1..64 Montgomery band; −26 %
+> at 2048-bit, −24 % at 4096-bit) followed by the **halved FIOS
+> squaring** landing (`montgomery_sqr_fios_halved`, ~1.5k² MACs vs
+> 2k², dispatched for k ≤ 32; a further −2 % to −10 % at 256…2048-bit;
+> 4096-bit stays on sqr-as-mul — the halved kernel regressed there).
+> A `__restrict` probe on the FIOS pointers was a null result.
+> Retired-but-callable references in `detail::`: Karatsuba Montgomery,
+> canonical fused CIOS, separate schoolbook+REDC, SOS.
 > `bench_pow_mod` gained `--runs N` (min-of-medians + cross-run CV),
 > institutionalizing the manual 6-run A/B protocol.
 > See `DIRECTORS_NOTES.md` for hypothesis / design / rationale history.
@@ -20,24 +19,25 @@ Generated: `2026-07-10`  Machine: Apple M5 Pro (arm64, macOS)  Build: `Release`
 
 ### pow_mod — Modular Exponentiation
 
-_`bench_pow_mod --runs 6` (min-of-6-medians, 50 samples/run); GMP and
-OpenSSL columns carried from the 2026-04-18 report (those backends
-were not rebuilt this pass; their code is unchanged)._
+_`bench_pow_mod --runs N` (min-of-medians, 50 samples/run); "prior" =
+2026-04-18 report (pre-retirement, pre-halved-sqr).  GMP and OpenSSL
+columns carried from the 2026-04-18 report (those backends were not
+rebuilt this pass; their code is unchanged)._
 
 | Width | Hydra (now)  | Hydra (prior)| Δ vs prior | GMP       | OpenSSL   | Hydra / GMP | Hydra / OpenSSL |
 |------:|-------------:|-------------:|-----------:|----------:|----------:|------------:|----------------:|
-|   256 |    7.42 µs   |    7.29 µs   |     ~0 %   |  7.21 µs  |  5.29 µs  |       1.03× |           1.40× |
-|   512 |   36.33 µs   |   36.42 µs   |     ~0 %   | 27.58 µs  | 19.00 µs  |       1.32× |           1.91× |
-|  1024 |  229.21 µs   |  234.56 µs   |      −2 %  | 152.63 µs | 109.75 µs |       1.50× |           2.09× |
-|  1536 |  766.77 µs   |  781.12 µs   |      −2 %  | 461.67 µs | 336.75 µs |       1.66× |           2.28× |
-|  1984 |    1.78 ms   |    1.78 ms   |       0 %  |   1.03 ms |   1.65 ms |       1.73× |           1.08× |
-|  2048 |    1.94 ms   |    2.59 ms   |   **−25 %**|   1.09 ms |  782.9 µs |       1.78× |           2.48× |
+|   256 |    7.08 µs   |    7.29 µs   |      −3 %  |  7.21 µs  |  5.29 µs  |   **0.98×** |           1.34× |
+|   512 |   32.71 µs   |   36.42 µs   |     −10 %  | 27.58 µs  | 19.00 µs  |       1.19× |           1.72× |
+|  1024 |  221.90 µs   |  234.56 µs   |      −5 %  | 152.63 µs | 109.75 µs |       1.45× |           2.02× |
+|  1536 |  755.96 µs   |  781.12 µs   |      −3 %  | 461.67 µs | 336.75 µs |       1.64× |           2.24× |
+|  1984 |    1.74 ms   |    1.78 ms   |      −2 %  |   1.03 ms |   1.65 ms |       1.69× |           1.05× |
+|  2048 |    1.88 ms   |    2.59 ms   |   **−27 %**|   1.09 ms |  782.9 µs |       1.72× |           2.40× |
 |  4096 |   15.35 ms   |   20.13 ms   |   **−24 %**|   7.47 ms |   5.82 ms |       2.05× |           2.64× |
 
-_2048/4096-bit moved from Karatsuba+REDC to FIOS.  The 1984→2048-bit
-cliff (1.78 → 2.59 ms, +45 % for a 3 % width step) is gone — the curve
-is now smooth across the old backend boundary (1.78 → 1.94 ms).
-Cross-run CV at these widths: 1.6 % / 0.4 %._
+_256-bit now **beats GMP** (0.98×).  2048/4096-bit moved from
+Karatsuba+REDC to FIOS; the 1984→2048-bit cliff (+45 % for a 3 % width
+step) is gone (1.74 → 1.88 ms).  256…2048-bit additionally carry the
+halved-squaring win.  Cross-run CV at 2048/4096: 1.2 % / 0.3 %._
 
 ---
 
@@ -112,19 +112,21 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ---
 
-### Hot-path hotspots after the threshold retirement
+### Hot-path hotspots after the threshold retirement + halved squaring
 
-1. **FIOS squaring has no cross-term halving** — pow_mod is ~5:1
-   sqr:mul and `montgomery_sqr_fios` forwards to the full mul.  A
-   dual-chain squaring that exploits `a[i]·a[j] == a[j]·a[i]` is the
-   largest single line item left, at every width (the whole k = 1..64
-   band now runs FIOS).  Non-trivial correctness story; see the
-   2026-07-10 dragon's next-sprint ranking.
-2. **GMP/OpenSSL gap at 2048/4096-bit** — narrowed to 1.78×/2.05×
-   (GMP) and 2.48×/2.64× (OpenSSL) after the retirement, from
-   2.38×/2.69× and 3.31×/3.46×.  What remains is squaring
-   specialization (they have it, Hydra doesn't) plus hand-tuned asm
-   (exploration closed after two null results — portable levers only).
+1. **Halved squaring stops at k = 32** — `montgomery_sqr_fios_halved`
+   wins −2 % to −10 % e2e at 256…2048-bit but regressed +2.3 % at
+   4096-bit: the shrinking product chain leaves the reduce chain
+   serial-carry-bound for most of each row at large k.  Recovering
+   the k > 32 band needs cross-row software pipelining (pair row i's
+   reduce-only phase with row i−1's product tail) — bounded idea,
+   unproven.  The k = 33..63 band is e2e-unbenched either way.
+2. **GMP/OpenSSL gap at 2048/4096-bit** — narrowed to 1.72×/2.05×
+   (GMP) and 2.40×/2.64× (OpenSSL), from 2.38×/2.69× and 3.31×/3.46×
+   pre-retirement.  256-bit now beats GMP outright.  What remains at
+   the top widths is squaring specialization at k = 64 (see item 1)
+   plus hand-tuned asm (exploration closed after two null results —
+   portable levers only).
 3. **Schoolbook leaf at k=16** — the dual-row leaf kernel at n=16
    shows only a −3 % delta vs. the old scalar (whereas k=32 / k=64
    are −40 %).  Compiler auto-vectorization of the baseline narrows

@@ -1356,9 +1356,15 @@ Montgomery Multiply" (2026-04-16), demoted verbatim to Resolved
 Dragons._
 
 `pow_mod_montgomery` uses a **single Montgomery multiply backend**:
-`montgomery_mul_fios` / `montgomery_sqr_fios` (dual-row CIOS) at every
-k from 1 to `MONTGOMERY_MAX_LIMBS = 64`.  There is no Karatsuba tier
-on the dispatch anymore.
+`montgomery_mul_fios` (dual-row CIOS) at every k from 1 to
+`MONTGOMERY_MAX_LIMBS = 64`.  There is no Karatsuba tier on the
+dispatch anymore.  Squaring splits once (2026-07-10, same day):
+`montgomery_sqr_fios_halved` (cross-term halving inside the fused
+pass, ~1.5k² MACs) for k ≤ `HALVED_SQR_MAX_K = 32`, plain
+`montgomery_sqr_fios` (sqr-as-mul) above — the halved kernel's
+shrinking product chain leaves the reduce chain serial-bound at
+large k and regressed 4096-bit.  See the halved-squaring dragon
+entry (2026-07-10).
 
 The `KARATSUBA_MONT_THRESHOLD = 32` tier was retired after
 `bench/probe_mont_k32_band.cpp` (2026-07-10) showed FIOS beating
@@ -1411,6 +1417,78 @@ _Catalogued 2026-04-15 — Claude Sonnet 4.6; updated 2026-04-16_
 - **Karatsuba / Toom-Cook.** `mul_8x8` is the current specialised-kernel
   ceiling; Karatsuba prototype exists (2026-04-16) but is not yet on the
   dispatch path.  Toom-Cook remains future work for ≥128-limb operands.
+
+---
+
+### Phase 3 Roadmap — Adoption & Ecosystem ("Shininess Backlog")
+
+_Catalogued 2026-07-10 — Claude Fable 5, at the director's request.
+These are adoption levers, not perf levers: things that make Hydra the
+library someone reaches for.  Ordered by expected leverage.  None are
+started; whoever picks one up should demote/annotate its entry._
+
+1. **WebAssembly target + benchmark story.**  Hydra's biggest
+   competitive positioning insight: compiled to wasm, GMP loses its
+   hand-written asm and falls back to portable C (or projects use
+   mini-gmp, which is unoptimized schoolbook).  Hydra's entire perf
+   story is portable `unsigned __int128` C++ — it carries to wasm
+   nearly intact (wasm has 64×64→128 via `i64.mul`+`__wasm_i128`
+   lowering through clang).  Concrete work:
+   - Emscripten/wasi-sdk build target in CMake (`-DHYDRA_WASM=ON`)
+     plus a CI job that runs `hydra_test` under wasmtime/node.
+   - `bench_pow_mod` compiled to wasm, benched vs mini-gmp compiled
+     to wasm, published as a table: "fastest bignum you can ship in
+     a browser" is plausibly *winnable outright*, unlike the native
+     GMP comparison.
+   - Zero source changes expected (no asm on dispatch, no
+     platform-specific intrinsics in the hot path) — the work is
+     build/CI/bench harness, not kernels.  Check `__int128` lowering
+     quality under wasm first; if it's poor, a 32-bit-limb build
+     profile is the fallback (bigger change, measure first).
+
+2. **`is_probable_prime` public API.**  Miller–Rabin is repeated
+   pow_mod at exactly the widths the engine is tuned for — this is
+   simultaneously a showcase feature and genuinely useful (test-data
+   generation, DH/RSA parameter validation, hash-to-prime).  Do
+   **BPSW** (2 + strong Lucas), the industry standard (no known
+   pseudoprimes, deterministic < 2^64), with optional extra
+   Miller–Rabin rounds for paranoia.  Needs: small-prime trial
+   division (cheap with `mod_u64`), one Lucas sequence implementation.
+   A `next_prime` follow-up is nearly free once this exists.
+   Fits naturally next to `pow_mod` in the number-theory façade.
+
+3. **README repositioning around the honest niches.**  The current
+   README leads with the GMP/OpenSSL gap closing.  The killer
+   use-cases to name explicitly: VDF/RSA-accumulator verification
+   (public inputs, pure repeated squaring — Hydra's exact hot loop),
+   language runtimes needing Python-style ints (the tiered small-int
+   design IS the interpreter fast path), and wasm/embedded targets
+   where GMP isn't shippable.  Pair with an explicit **constant-time
+   disclaimer**: Hydra is variable-time by design; secret-key crypto
+   is out of scope until a hardened profile exists.  Saying this
+   loudly is a trust feature, not a weakness.
+
+4. **Single-header amalgamation + packaging.**  Already header-only;
+   the remaining friction is acquisition: a released `hydra.hpp` with
+   version stamp, a CMake `FetchContent`/`find_package` snippet in
+   the README, maybe vcpkg/conan recipes.  Low effort, directly
+   removes the first-five-minutes barrier.
+
+5. **Fuzzing harness.**  libFuzzer targets for parse/format
+   round-trip, divmod invariant (`q*b + r == a`), and Montgomery
+   vs naive pow_mod agreement.  The bit-identity oracles used by the
+   kernel tests make crash-free differential fuzzing cheap to set
+   up, and "fuzzed" is table stakes for crypto-adjacent adoption.
+
+6. **`std::hash<Hydra>` + `std::format` support.**  Small ergonomic
+   wins already on the Phase 2 list; bundling them with a "use Hydra
+   as a map key / print it like an int" doc section turns them into
+   adoption features.
+
+Explicitly deferred: constant-time hardened profile (large, needs a
+dedicated design pass and its own benchmark discipline — revisit only
+with a concrete consumer), Python/Node bindings (wasm story first;
+bindings follow demand), sub-quadratic division (no workload asks yet).
 
 ---
 
@@ -4452,6 +4530,145 @@ the cost is now 100 % FIOS, so:
    the new all-FIOS dispatch is a single uniform kernel — if any
    future asm attempt is ever justified, a whole-FIOS-row kernel is
    the only seam left.
+
+---
+
+### Halved FIOS Squaring (k ≤ 32) + `__restrict` Null Result
+
+_Implemented 2026-07-10 — Claude Fable 5 (same day as the
+KARATSUBA_MONT_THRESHOLD retirement)_
+_Status: **shipped with a threshold** — `montgomery_sqr_fios_halved`
+dispatched for k ≤ HALVED_SQR_MAX_K = 32.  −2 % to −10 % end-to-end
+at 256…2048-bit; 4096-bit regressed under the halved kernel and
+stays on sqr-as-mul.  256-bit pow_mod now beats GMP (0.98×)._
+
+#### Warm-up: `__restrict` on the FIOS pointers — NULL RESULT
+
+Hypothesis: the row-level asm sprint found Clang round-tripping
+chain values through memory because it can't prove the kernel's
+pointers don't alias; `__restrict` is the portable way to assert
+that.  (Legality note: a/b are read-only in the kernel, so the
+squaring path's `a == b` is fine under restrict semantics — the
+qualifier only constrains modified objects.)
+
+Measured (min-of-3 interleaved runs, k = 4..32): deltas −2.7 % to
++1.3 % with sign flips.  Clang-21 already schedules the chain loads
+past the `work[j-1]` store.  Reverted per the branch-hints
+precedent (no perf-neutral churn); a comment at the definition
+records the measurement.
+
+#### Halved squaring: design
+
+Regroup the square as
+
+```
+a² = Σ_i [ a[i]²·2^(128i) + 2·Σ_{j>i} a[i]·a[j]·2^(64(i+j)) ]
+```
+
+and assign group i to CIOS row i.  In row i's local frame the group
+lands at j = i..k-1: diagonal (undoubled) at j = i, doubled cross
+terms above.  Rows therefore run a *shrinking* product chain
+(k−i MACs) against the unchanged full reduce chain (k MACs):
+~1.5k² total MACs vs 2k² for sqr-as-mul.
+
+Correctness hinges on the m_i sequence being unchanged: position i
+receives cross terms only from pairs (g, i−g) with g ≤ i/2 < i, all
+processed before row i computes m_i = T[0]·n0inv.  The partial sums
+at every position match plain FIOS exactly, so the output is
+**bit-identical** to `montgomery_mul_fios(a, a, …)` — the strongest
+oracle in the Montgomery suite (`test_halved_sqr_bit_identity`,
+k = 1..64 × {(mod−1)², random×3}, dirty work buffer, 512
+cross-checks in the probe's layer 0).
+
+Two implementation subtleties:
+
+1. **65-bit product carry.**  2·(2^64−1)² + T[j] + carry exceeds
+   2^128, so chain A's carry is (ca, caH ≤ 2) and 2p is decomposed
+   into three words (d0, d1, d2) before the 128-bit adds.  d2 is
+   added directly to the carry's high word — no 128-bit shift.
+2. **Three row phases.**  j = 1..i−1 reduce-only (no products this
+   row), j = i diagonal + reduce, j = i+1..k−1 doubled + reduce.
+   Row 0 folds its diagonal into the j = 0 bootstrap.
+
+#### Measurement
+
+`bench/probe_sqr_halved.cpp`, layers: bit-identity gate → isolated
+kernel → pow_mod cadence.  Kernel-level (min of 2 × median-of-5):
+wins at k = 6..32 (−1.8 % to −14.5 %), noise-dominated at k ≤ 4,
+**mixed at k = 40..64** (+0.7 %, +2.6 %, −4.9 %, +3.2 %).  Cadence:
+wins everywhere except a wash at k=24.
+
+End-to-end (min of 12 × 50-sample medians, both interleave orders,
+vs the post-retirement HEAD):
+
+| Width | baseline  | halved sqr | Δ        |
+|------:|----------:|-----------:|---------:|
+|  256  |   7.2 µs  |    7.0 µs  |   −3.5 % |
+|  512  |  36.3 µs  |   32.4 µs  |  **−10.7 %** |
+| 1024  | 229.0 µs  |  221.1 µs  |   −3.5 % |
+| 1536  | 773.4 µs  |  757.2 µs  |   −2.1 % |
+| 1984  |  1.76 ms  |   1.70 ms  |   −3.4 % |
+| 2048  |  1.92 ms  |   1.87 ms  |   −2.6 % |
+| 4096  | 15.22 ms  |  15.57 ms  |  **+2.3 %** ← regression |
+
+The 4096 regression is real (persists across both interleave
+orders; CV at that width is ~0.3 %) and matches the isolated-kernel
+sign at k=64, *not* the cadence probe — a caution for future
+sprints: **the 2-buffer cadence probe under-models real pow_mod at
+large k** (the real loop rotates through an 8-entry window table;
+table+operand footprint at k=64 is ~5 KiB vs the probe's ~2 KiB).
+
+Root cause of the large-k failure: the reduce chain runs unpaired
+(serial carry-bound) for j < i, and that region's share of the row
+grows as i/k.  Averaged over rows, half the reduce MACs lose their
+dual-issue partner; at k=64 the serial-latency cost fully eats the
+25 % MAC saving.  At k ≤ 32 the working set is small enough that
+the MAC saving dominates.
+
+#### Decision: `HALVED_SQR_MAX_K = 32`
+
+Halved squaring for k ≤ 32 (every e2e-benched width up to 2048-bit
+won), `montgomery_sqr_fios` (sqr-as-mul) above.  The k = 33..63
+band has no e2e benchmark width and mixed kernel signals — it stays
+on the conservative path.  Not "no crossover" this time; the
+threshold sits at the last e2e-verified win.
+
+#### Results after this sprint (cumulative for 2026-07-10)
+
+`bench_pow_mod --runs 4` vs the 2026-04-18 report:
+
+|  bits | was (04-18) | now      | Δ cumulative | vs GMP |
+|------:|------------:|---------:|-------------:|-------:|
+|   256 |   7.29 µs   |  7.08 µs |         −3 % | **0.98×** |
+|   512 |  36.42 µs   | 32.71 µs |        −10 % | 1.19× |
+|  1024 | 234.56 µs   | 221.9 µs |         −5 % | 1.45× |
+|  1536 | 781.12 µs   | 756.0 µs |         −3 % | 1.64× |
+|  1984 |   1.78 ms   |  1.74 ms |         −2 % | 1.69× |
+|  2048 |   2.59 ms   |  1.88 ms |     **−27 %**| 1.72× |
+|  4096 |  20.13 ms   | 15.35 ms |     **−24 %**| 2.05× |
+
+256-bit pow_mod now beats GMP.  942 tests pass (Debug ASan+UBSan
+and Release).
+
+#### Updated recommendation for next sprint
+
+1. **Cross-row software pipelining for halved squaring at k > 32.**
+   Pair row i's reduce-only phase (j < i, currently serial) with
+   row i−1's product tail so both issue ports stay fed.  If it
+   works, the halved win extends to 4096-bit (~−5 % there) and
+   HALVED_SQR_MAX_K goes away.  Bounded scope, medium risk of the
+   same serialisation traps that killed outer-row pairing in the
+   SOS era.
+2. **Window-size sweep for the sliding window (W = 4 hard-coded).**
+   W = 5/6 at k ≥ 32 saves ~20 % of the muls for a 2–4× larger
+   table build; ~2–4 % ceiling at the top widths.  Another
+   never-re-swept constant.  A 15-minute experiment with the
+   existing --runs protocol.
+3. **Phase 3 adoption items** (see the new Canon roadmap):
+   wasm target + bench vs mini-gmp, `is_probable_prime` (BPSW).
+   Not perf, but the highest-leverage work for making the perf
+   story matter.
+4. **Asm remains closed.**
 
 ---
 
