@@ -85,7 +85,8 @@ visible squarings with live rate/ETA, naive chunked prover, verify
 timed on the same thread, one-bit tamper button, transcript view), a
 42-check node suite (oracle identities, chunk-size invariance, tamper
 rejection — wired into CI), and `scripts/wasm_vdf_demo.sh` which
-assembles it under the Pages deploy at `/vdf/`.  Measured headline
+assembles it under the Pages deploy at `/vdf/` (CI green + live page
+verified end-to-end in headless Chrome, 2026-07-11).  Measured headline
 (M5 Pro, headless Chrome, defaults 2048-bit N · T=2²⁰): **evaluate
 2.5 s · prove 5.4 s · verify 2.1 ms → 1,182× faster than the delay it
 certifies**; ~1.57M sq/s at 1024-bit.  The naive prover lands at the
