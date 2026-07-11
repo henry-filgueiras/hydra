@@ -24,10 +24,21 @@ say "packing…"
 TARBALL="$(cd pkg && npm pack --pack-destination "$TMP" --silent)"
 
 say "checking tarball manifest…"
-tar -tzf "$TMP/$TARBALL" | grep -q '^package/dist/hydra_core\.wasm$' \
-    || fail "dist/hydra_core.wasm missing from tarball"
-tar -tzf "$TMP/$TARBALL" | grep -q '^package/dist/hydra_core\.mjs$' \
-    || fail "dist/hydra_core.mjs missing from tarball"
+# Capture the listing once and grep the variable.  Piping tar straight
+# into `grep -q` is a trap under `set -o pipefail`: grep exits on the
+# first match, tar can catch SIGPIPE writing the rest of the listing
+# (exit 141), and the check fails even though the file IS in the
+# tarball.  Bit us on CI 2026-07-11 — deterministically on ubuntu
+# runners (GNU tar, mid-listing entry), never on macOS (bsdtar).
+MANIFEST="$(tar -tzf "$TMP/$TARBALL")"
+manifest_has() { grep -q "^package/$1\$" <<< "$MANIFEST"; }
+for f in dist/hydra_core.wasm dist/hydra_core.mjs index.mjs index.d.ts; do
+    manifest_has "${f//./\\.}" || {
+        printf 'tarball manifest (node %s, npm %s):\n%s\n' \
+            "$(node --version)" "$(npm --version)" "$MANIFEST" >&2
+        fail "$f missing from tarball"
+    }
+done
 
 say "installing into fresh project at $TMP …"
 cd "$TMP"

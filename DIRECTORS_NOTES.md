@@ -5730,4 +5730,52 @@ size).  Verifier work is ~2·|l| ≈ 512 modular mults regardless of T.
 
 ---
 
+### 2026-07-11 — Claude Fable 5 — Dragon — `tar | grep -q` under pipefail: the tarball was never broken
+
+**Symptom.**  CI's "npm package — packed tarball install test" step
+failed on every ubuntu run since the step existed (5/5), always with
+`dist/hydra_core.mjs missing from tarball` — while passing on macOS
+and while the VDF step behind it never got to run.  The wasm build,
+in-tree pkg tests, and the tarball itself were all fine.
+
+**Wrong turns first (they cost the time).**  The failure smelled like
+an npm-packlist regression: it "reproduced" in node:24 Linux
+containers, seemed correlated with npm 11.16, with readdir order, with
+emsdk's environment — each theory died when a control container
+refused to reproduce.  A detour read npm-packlist's `files`-array
+handling (individual-file entries take an lstat-dependent strict-
+include path; directory entries take a robust one) — real fragility,
+wrong bug.  The tell that finally cracked it: `hydra_core.wasm`
+(checked first) always passed and it is the **last line** of the tar
+listing; `hydra_core.mjs` sits mid-listing.
+
+**Actual mechanism.**  `scripts/npm_pack_test.sh` runs under
+`set -euo pipefail` and checked the manifest with
+`tar -tzf $TARBALL | grep -q pattern || fail`.  `grep -q` exits 0 at
+the first match; if GNU tar hasn't finished writing the listing, its
+next write gets SIGPIPE → pipeline status 141 under pipefail → the
+`|| fail` fires *even though the file is present*.  Mid-listing
+entries are at risk; last-line entries are safe (tar has already
+finished).  Whether tar loses the race depends on write buffering and
+scheduling: deterministic-feeling per environment (ubuntu runners:
+always; macOS bsdtar: never; local containers: flipped with Docker VM
+load — which is what made every repro attempt gaslight the previous
+one).  Proof: `stdbuf -oL tar -tzf … | grep -q <mid-line>` exits 141
+on demand; grepping the last line exits 0.
+
+**Fix.**  Capture `MANIFEST="$(tar -tzf …)"` once, grep the variable —
+no pipeline, no race; on failure the script now prints node/npm
+versions and the full manifest so a future CI failure is diagnosable
+from logs alone.  Swept the repo for other `… | grep -q` under
+pipefail: only `sign_hydra_test.sh` (no pipefail, `if` condition —
+benign).
+
+**Rule.**  Under `set -o pipefail`, never end a pipeline with an
+early-exiting consumer (`grep -q`, `head`, `sed q`) whose producer you
+don't want SIGPIPE-checked.  Capture once, then match.  Corollary for
+debugging: when a "missing item" is mid-list and the checked-first
+item is last-in-list, suspect the checker before the producer.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

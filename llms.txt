@@ -105,6 +105,9 @@
   sqr-as-mul beats fused halved-sqr; squarings must flush in pointer-invariant
   RUNS — per-call dispatch costs ~20%/mul, see montgomery_sqr_run_xL).
 - Browser timing: performance.now clamps to 100µs–1ms → batch ≥15ms per sample.
+- Under `set -o pipefail`, never end a pipeline with `grep -q`/`head`: the
+  early exit SIGPIPEs the producer (exit 141) and fails checks whose target is
+  present (npm_pack_test bit this on all-ubuntu CI). Capture output, then grep.
 - emcc's post-link `wasm-opt -O2` PESSIMIZES the kernels (+39%@256b…+60%@4096b
   with multiple exports). Ship LLVM-O2 only: `-g` build + passes-free
   `wasm-opt --strip-dwarf` (see wasm_pkg.sh, wasm_bench.sh). Shootout re-benched
