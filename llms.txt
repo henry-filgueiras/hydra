@@ -19,10 +19,13 @@
 - Construction: `Hydra{int/uint any width}` (implicit), `Hydra{"‑123…"}` (decimal
   string), `Hydra::from_limbs(const uint64_t*, uint32_t)` (LSB-first magnitude).
 - Operators: `+ - * / % << >> & | ^ ~ == <=> +=` etc. Signed semantics; division
-  truncates toward zero; `&|^` throw std::domain_error on negative operands; `~x`
-  = −(x+1). Bit-shift counts are unsigned ints.
+  truncates toward zero; shifts are sign-magnitude (`x<<n == x*2^n`, `x>>n ==
+  x/2^n` toward zero: `-3>>1 == -1`, NOT arithmetic shift); `&|^` throw
+  std::domain_error on negative operands; `~x` = −(x+1). Shift counts unsigned.
 - Methods: `.divmod(b)` → `{quotient, remainder}`, `.div_u64(u)`, `.mod_u64(u)`
-  (zero-heap), `.to_string()`, `.is_zero()`, `.is_negative()`, `.limb_view()` →
+  (zero-heap), `.to_string()`, `.is_zero()`, `.is_negative()`, `.negate()`,
+  `.fits_u64()` (true iff value ∈ [0, 2^64)), `.to_u64()` (throws
+  std::overflow_error unless fits_u64 — negatives never fit), `.limb_view()` →
   `{const uint64_t* ptr, uint32_t count}` (LSB-first magnitude; count 0 = zero).
 - Free functions: `abs, gcd, extended_gcd` (→ `{gcd,x,y}` Bézout), `pow_mod(base,
   exp, mod)` (Montgomery for odd mod ≤4096 bits, else naive; throws on mod≤0 or
@@ -47,7 +50,10 @@
   `montgomery_mul{,_fused,_sos,_karatsuba}`.
 - Key invariants: results always normalized to smallest tier; zero is Small,
   non-negative, limb count 0; kernels are magnitude-only, sign applied by
-  operators; `work` buffers k+2 limbs for FIOS.
+  operators; `work` buffers k+2 limbs for FIOS. Representation state
+  (meta/payload) is PRIVATE; repo tests/benches fabricate states via
+  `detail::TestAccess` (not stable API). sizeof(Hydra)=32, alignof=8
+  (static_asserted — "32-byte object", never alignas(32)).
 
 ## Performance identity (Apple M5 Pro, 2026-07)
 - pow_mod: ~7.3 µs @256b (parity with GMP), 1.80 ms @2048b (1.65× GMP),
@@ -61,8 +67,11 @@
 
 ## Build / test / bench
 - Tests: `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --target
-  hydra_test -j && ./build/hydra_test` (Debug = ASan+UBSan; 989 tests). Release
-  mirror in `build-rel`. CI: `.github/workflows/ci.yml` (native matrix + wasm).
+  hydra_test -j && ./build/hydra_test` (Debug = ASan+UBSan; 1250 checks). Release
+  mirror in `build-rel`. CI: `.github/workflows/ci.yml` — native matrix + header
+  self-sufficiency + wasm (emsdk PINNED 6.0.2) + npm packed-tarball install gate
+  (`scripts/npm_pack_test.sh` — in-tree pkg tests alone once masked a tarball
+  missing its .wasm).
 - Benchmarks: `./build-rel/bench_pow_mod --runs 6 --md` (min-of-medians +
   cross-run CV — ALWAYS use --runs, never single-run deltas; noise ±10% at small
   widths). Probes in `bench/probe_*.cpp` (kernel + "pow_mod cadence" layers).

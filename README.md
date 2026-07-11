@@ -92,24 +92,37 @@ next_prime(Hydra(1) << 256);               // 2^256 + 297, ~0.4 ms
   <img src="assets/hydra_powmod_bench.svg" alt="pow_mod benchmark: Hydra vs Boost, GMP, OpenSSL" width="720">
 </p>
 
-Median latency for `pow_mod(base, exp, mod)` across bit widths — single core, Apple Silicon, clang release build:
+Median latency for `pow_mod(base, exp, mod)` across bit widths — single core:
 
-| Width | Hydra | Boost `cpp_int` | GMP | OpenSSL |
-|------:|:-----:|:---------------:|:---:|:-------:|
-|  256  | **19.9 µs** | 47.9 µs | 7.2 µs | 5.3 µs |
-| 1024  | **607 µs** | 1.32 ms | 156 µs | 111 µs |
-| 2048  | **3.99 ms** | 8.60 ms | 1.13 ms | 798 µs |
+| Width | Hydra | GMP | OpenSSL | Hydra / GMP |
+|------:|:-----:|:---:|:-------:|:-----------:|
+|  256  | **7.4 µs**  | 7.2 µs  | 5.3 µs  | 1.03× |
+| 1024  | **218 µs**  | 153 µs  | 110 µs  | 1.43× |
+| 2048  | **1.80 ms** | 1.09 ms | 783 µs  | 1.65× |
+| 4096  | **14.5 ms** | 7.5 ms  | 5.8 ms  | 1.94× |
+
+_Provenance: Hydra column measured 2026-07-10 on Apple M5 Pro (arm64,
+macOS), Apple clang, Release `-O2`, via `build-rel/bench_pow_mod
+--runs 6` — min of per-run medians, 50 samples/run, random top-bit-set
+operands with odd moduli; cross-run CV ≈ 1 % at 2048-bit, 0.3 % at
+4096-bit.  The GMP and OpenSSL columns are **carried forward from the
+2026-04-18 run** of the same benchmark on the same machine (Homebrew
+builds; those backends were not rebuilt in the 2026-07-10 pass), so
+treat the cross-library ratios as approximate rather than same-run.
+Boost.Multiprecision `cpp_int`, from that same 2026-04-18 run, is
+3–4.5× slower than current Hydra across 256–4096-bit.  Full tables and
+history: [perf_snapshot.md](perf_snapshot.md)._
 
 Hydra currently delivers:
 
-- **2×–3× faster than Boost.Multiprecision** across 256–4096-bit widths
-- within **3×–5× of GMP** (hand-tuned C/asm, decades of optimization)
-- within **4×–6× of OpenSSL** (assembly-optimized big-number core)
+- **3–4.5× faster than Boost.Multiprecision `cpp_int`** across 256–4096-bit widths
+- **parity with GMP at 256-bit**, within **2× of GMP at 4096-bit** (hand-tuned C/asm, decades of optimization)
+- within **1.4×–2.5× of OpenSSL** (assembly-optimized big-number core)
 
-Achieved via Montgomery reduction, Karatsuba multiplication dispatch, and fast-path modular exponentiation — all in portable C++20 with zero assembly.
+Achieved via Montgomery reduction (FIOS with halved squaring), Karatsuba multiplication dispatch, and an adaptive sliding window — all in portable C++20 with zero assembly.
 
 <details>
-<summary>Full micro-benchmark table (add, mul, shift, div)</summary>
+<summary>Full micro-benchmark table (add, mul, shift, div) — older snapshot (2026-04), retained for the small/medium-tier picture; pow_mod numbers above are current</summary>
 
 | Operation             | Hydra      | Reference                      | Δ vs reference |
 | --------------------- | ---------- | ------------------------------ | -------------- |
@@ -356,11 +369,13 @@ Completed:
 * [x] benchmarking vs `boost::multiprecision::cpp_int`
 
 * [x] WebAssembly: full test suite + pow_mod shootout vs mini-gmp/Boost (`scripts/wasm_bootstrap.sh`, `scripts/wasm_bench.sh`)
+* [x] wasm CI job (full suite under node + npm-package build/test + packed-tarball install test + demo cross-check, every push)
+* [x] npm package `hydra-bignum` (`pkg/` — bigint→bigint powMod/modInverse/primality; publish itself is a human step)
+* [x] batched modular exponentiation: `pow_mod_batch` fused 2-lane ladder (1.33×@2048b / 1.38×@4096b e2e throughput)
 * [x] `llms.txt` — compact machine-readable project digest (API, internals map, perf identity) for AI agents and quick onboarding
 
 Active roadmap:
 
-* [ ] wasm CI job (bootstrap + test + shootout on a runner)
 * [ ] Toom-Cook multiplication for ≥128-limb operands
 * [ ] arena-backed Karatsuba scratch (may lower threshold to 16 limbs)
 * [ ] `std::hash<Hydra>` specialisation

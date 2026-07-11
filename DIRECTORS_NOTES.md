@@ -153,14 +153,22 @@ All three paths beat Boost, exceeding the ±5% target.
 
 ---
 
-### 32-Byte Aligned Default Footprint
+### 32-Byte Object Default Footprint
 
-_Design decision recorded 2026-04-15 — ChatGPT and Gemini_
+_Design decision recorded 2026-04-15 (ChatGPT and Gemini); wording
+corrected 2026-07-11 (Claude Fable 5) — the original "32-byte aligned"
+text is archived verbatim in Resolved Dragons._
 
-**Keep the 32-byte aligned layout as the canonical default.** Reasons:
+**Keep the 32-byte object layout as the canonical default.** Precisely:
+`sizeof(Hydra) == 32` (8-byte meta + 24-byte payload union) with
+**natural 8-byte alignment** — `alignof(Hydra) == alignof(uint64_t)`.
+The class was never `alignas(32)`, and stays that way deliberately:
+forcing 32-byte alignment would bloat arrays and allocator behaviour
+for no measured win.  Both facts are pinned by `static_assert`s next
+to the class in `hydra.hpp`; public docs must say "32-byte object",
+not "32-byte aligned".  Reasons to keep the 32-byte size:
 
 - Clean cache-line behaviour: 2 objects per 64-byte line
-- Future SIMD friendliness: natural fit for 256-bit register-oriented loads
 - Simpler field alignment and code generation
 - Fewer layout edge-cases
 - Easier reasoning about payload invariants
@@ -255,6 +263,18 @@ Both shift operators and `div_u64` call `normalize()` after construction,
 so the result always occupies the smallest valid tier.  `shr_limbs` trims
 trailing zeros internally; `shl_limbs` simply never writes leading zeros
 (the carry slot is only filled when carry != 0).
+
+#### Signed shift semantics (fixed 2026-07-11)
+
+Shifts are sign-magnitude, consistent with Hydra's truncating division:
+`x << n == x * 2^n` (sign preserved) and `x >> n == x / 2^n`
+(truncates toward zero: `-3 >> 1 == -1`, `-1 >> 100 == 0`).  This is
+**not** two's-complement arithmetic right shift, which floors toward
+−∞ (`-3 >> 1 == -2` there).  The magnitude work lives in private
+`shl_magnitude`/`shr_magnitude`; the operators apply the sign via
+`negate()`, so no negative zero can escape.  (Until 2026-07-11 the
+operators returned bare magnitudes — shifting a negative value
+silently produced a positive one; see Resolved Dragons.)
 
 #### `to_string()` refactor
 
@@ -5316,6 +5336,119 @@ needs per-lane window bookkeeping), batch API in the JS package
 (pointless until a wasm win exists), the k=64 L1 investigation, and
 any constant-time claims (the lockstep structure is a *stepping
 stone*, per the design digression — the disclaimer stands).
+
+---
+
+### 2026-07-11 — Claude Fable 5 — external-audit hardening pass (seal the artifact)
+
+An external source review (ChatGPT) flagged ~12 issues; each was
+verified against main before touching anything.  Verdicts and what
+changed:
+
+**Confirmed + fixed (correctness/distribution):**
+
+1. **npm tarball shipped without the wasm engine (P0).**
+   `pkg/package.json` `files` listed `dist/hydra_core.mjs` but not
+   `dist/hydra_core.wasm`; `wasm_pkg.sh` emits them as separate files
+   and the glue resolves the `.wasm` via `import.meta.url` — so every
+   source-tree test passed while `npm pack` produced a package that
+   could not initialize anywhere else.  Fixed; and because this
+   failure class is invisible to in-tree tests, CI now runs
+   `scripts/npm_pack_test.sh`: pack → install into a fresh temp
+   project → known-answer ops (Fermat on M127, modInverse, BPSW).
+2. **Signed shifts returned bare magnitudes.** `operator<</>>` built
+   results from `limb_view()` (magnitude) and never reapplied the
+   sign: `Hydra(-3) << 1 == +6`.  Chosen contract (matches Hydra's
+   truncating division): `x<<n == x*2^n`, `x>>n == x/2^n` toward zero
+   (`-3>>1 == -1`, NOT arithmetic-shift `-2`; `-1>>100 == 0`).
+   Magnitude kernels factored into private `shl/shr_magnitude`; sign
+   applied via `negate()` (zero stays non-negative).  New checks
+   incl. differential vs `*`/`divmod` by 2^n across all three tiers.
+3. **`fits_u64()`/`to_u64()` ignored the sign.** `fits_u64()` was
+   `is_small()` — true for `Hydra(-1)` — and `to_u64()` then returned
+   the magnitude.  Contract now: `fits_u64()` ⇔ value ∈ [0, 2^64);
+   `to_u64()` throws `std::overflow_error` otherwise.  (No other
+   signed conversion helpers existed to reconcile.)
+4. **Representation state was publicly mutable.** `struct Hydra`
+   exposed `meta`/`payload` and raw helpers; tests fabricated Large
+   values by direct assignment.  Now private with an
+   invariant-preserving public surface; the repo's own tests/benches
+   go through `hydra::detail::TestAccess` (adopt_large, make_medium,
+   poke_small, force_negative, normalize, meta_word for DCE sinks) —
+   documented as not a stable API.  **Perf proof:** old-vs-new header
+   on an -O2 TU produces byte-identical instruction streams (access
+   control changes nothing about layout or inlining); full suites
+   pass Debug(ASan/UBSan)/Release/wasm.
+5. **`<concepts>` was only reached transitively.** Added the direct
+   include.  Null-adjacent note: the header *did* compile standalone
+   on Apple libc++ (transitive via other includes), so this was
+   fragility, not breakage.  `header_check.cpp` + CTest target +
+   CI step now pin self-sufficiency.
+6. **CMake comment/default mismatch.** The `HYDRA_BENCH_BOOST` block
+   said "OFF by default so clean builds don't require Boost" while
+   the option was `ON` → default configure hit
+   `find_package(Boost REQUIRED)`; CI masked it by passing OFF.  Now
+   actually OFF; clean default configure verified Boost-free.
+7. **npm wrapper races + stack math.** `init()` cached the resolved
+   module, not the promise — concurrent first calls double-
+   instantiated; now promise-cached (cleared on failure, retryable).
+   Interop buffers had only a 4 MiB *per-operand* cap on the 8 MiB
+   wasm stack, but powMod pushes base+exp+mod+result in one frame
+   (worst case ≈16 MiB → silent overflow).  Added a 6 MiB
+   *per-operation* budget summed over all buffers; the C++ side
+   heap-allocates its working state and the binding's buffers are all
+   caller-provided, so callee frames are small — ≥2 MiB headroom.
+8. **wasm toolchain pinned.** CI used emsdk `latest`; given the
+   proven toolchain sensitivity (the wasm-opt pessimization dragon),
+   release/bench evidence must be reproducible.  Pinned to emsdk
+   6.0.2 in both wasm jobs.  Local evidence toolchain: emcc 6.0.2-git
+   (clang 23.0.0git), Binaryen wasm-opt 130, flags `-O2` LLVM-only +
+   passes-free `wasm-opt --strip-dwarf`, `-sALLOW_MEMORY_GROWTH=1
+   -sSTACK_SIZE=8388608` (+ `-fwasm-exceptions` for hydra_test only).
+
+**Documentation drift (fixed):** README pow_mod table was two
+generations stale (19.9 µs @256b vs current 7.4 µs) — replaced with
+2026-07-10 numbers plus full provenance (machine, toolchain, command,
+CV, operand shape) and an explicit "GMP/OpenSSL columns carried
+forward from 2026-04-18, not same-run" label; README roadmap still
+listed wasm CI as unfinished (it has run on every push for a while)
+and omitted the landed npm package + pow_mod_batch; Canon's "32-Byte
+Aligned" section claimed alignment the class never had —
+`alignof(Hydra)` is 8; `sizeof` is 32.  Canon rewritten (old text
+archived verbatim below), `static_assert`s added, and NO `alignas(32)`
+was added — overalignment would bloat storage for no measured win.
+
+**False positives / already-fine:** `perf_snapshot.md` already labels
+the GMP/OpenSSL carry-forward honestly; ROADMAP statuses (A1 landed,
+B1 tier 1 landed) were accurate; `to_u64()` already threw on
+Medium/Large (only the sign path was wrong).
+
+**New (pre-existing) bit-rot found, not fixed:**
+`bench/bench_mont_backends.cpp` no longer compiles — a
+`montgomery_mul_karatsuba` call passes 11 args where the current
+signature takes 12 (drift from the backend-retirement arc; the file
+is a standalone probe, not a CMake target, so nothing caught it).
+Left as-is: retired-reference probe, fix when next needed.
+
+**Test-count identity:** 989 → 1250 checks (native Debug+Release and
+wasm all green).  npm suite 151 → 155 checks + packed-tarball gate.
+
+**Archived verbatim from Current Canon (superseded 2026-07-11):**
+
+> ### 32-Byte Aligned Default Footprint
+>
+> _Design decision recorded 2026-04-15 — ChatGPT and Gemini_
+>
+> **Keep the 32-byte aligned layout as the canonical default.** Reasons:
+>
+> - Clean cache-line behaviour: 2 objects per 64-byte line
+> - Future SIMD friendliness: natural fit for 256-bit register-oriented loads
+> - Simpler field alignment and code generation
+> - Fewer layout edge-cases
+> - Easier reasoning about payload invariants
+> - Benchmark continuity and reproducibility
+>
+> This is the current benchmarked and publicly communicated artifact.
 
 ---
 

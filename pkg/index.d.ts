@@ -3,8 +3,11 @@
 
 /**
  * Instantiate the WebAssembly module.  Must be awaited once before any
- * other call.  Idempotent.  `moduleOptions` is passed through to the
- * Emscripten module factory (rarely needed).
+ * other call.  Idempotent and concurrency-safe: simultaneous first
+ * calls share one instantiation (the first caller's `moduleOptions`
+ * wins).  If instantiation fails, init() can be called again to retry.
+ * `moduleOptions` is passed through to the Emscripten module factory
+ * (rarely needed).
  */
 export function init(moduleOptions?: Record<string, unknown>): Promise<void>;
 

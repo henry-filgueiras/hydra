@@ -116,12 +116,15 @@ _From `hydra_bench` baseline family; M5 Pro scalar._
 
 ### WebAssembly shootout (2026-07-10, LLVM-only pipeline)
 
-_`scripts/wasm_bench.sh` — emscripten 6.0.2, LLVM `-O2` with binaryen
-limited to a passes-free DWARF strip (emcc's default post-link
-`wasm-opt -O2` pessimizes Hydra's kernels up to +60 % — see the
-binaryen dragon in DIRECTORS_NOTES, where the older, slower table is
-archived).  No wasm-EH, node 26, min-of-2 × 50-sample medians, all
-three backends in one binary, identical pipeline for all three._
+_`scripts/wasm_bench.sh` — emscripten 6.0.2 (clang 23.0.0git,
+Binaryen wasm-opt 130 — the version CI is pinned to as of
+2026-07-11), LLVM `-O2` with binaryen limited to a passes-free DWARF
+strip (emcc's default post-link `wasm-opt -O2` pessimizes Hydra's
+kernels up to +60 % — see the binaryen dragon in DIRECTORS_NOTES,
+where the older, slower table is archived).  Flags:
+`-sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608`, no wasm-EH, node 26,
+min-of-2 × 50-sample medians, all three backends in one binary,
+identical pipeline for all three._
 
 | Width | Hydra (wasm) | Boost cpp_int | mini-gmp  | vs Boost | vs mini-gmp |
 |------:|-------------:|--------------:|----------:|---------:|------------:|
