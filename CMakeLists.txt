@@ -312,6 +312,24 @@ if(HYDRA_POWMOD_OPENSSL)
 endif()
 
 # ─────────────────────────────────────────────────────────
+# Opt-in probe: retired Montgomery backend A/B (bench_mont_backends)
+# Compile guard for the retired-but-callable detail:: references —
+# not built by default, never run in CI.
+# ─────────────────────────────────────────────────────────
+option(HYDRA_BENCH_MONT_BACKENDS
+       "Build bench_mont_backends (retired Montgomery backend A/B probe)" OFF)
+if(HYDRA_BENCH_MONT_BACKENDS)
+    add_executable(bench_mont_backends bench/bench_mont_backends.cpp)
+    target_link_libraries(bench_mont_backends PRIVATE hydra_core)
+    target_compile_options(bench_mont_backends PRIVATE
+        $<$<CONFIG:Debug>:-O3 -g -DNDEBUG>
+        $<$<CONFIG:RelWithDebInfo>:-O3 -g -DNDEBUG>
+        $<$<CONFIG:Release>:-O3 -march=native>
+    )
+    message(STATUS "  bench_mont_backends : enabled (opt-in probe)")
+endif()
+
+# ─────────────────────────────────────────────────────────
 # Python interpreter (for comparison script)
 # ─────────────────────────────────────────────────────────
 find_package(Python3 COMPONENTS Interpreter QUIET)

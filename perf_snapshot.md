@@ -230,3 +230,10 @@ in-wasm at 256-bit)._
 _Update by running `bench/run.sh` + `bench_pow_mod` and regenerating
 numbers.  Commit intent: reflect the present state, not the history —
 history belongs in `DIRECTORS_NOTES.md`._
+
+_Provenance: every new benchmark table must carry the output of
+`scripts/capture_benchmark_env.sh -- <exact bench command>` (git SHA,
+tree state, OS/CPU, compiler/CMake/node/emcc/wasm-opt, GMP/OpenSSL +
+Homebrew versions, build flags, timestamp).  Missing tools degrade to
+explicit "(unavailable)" fields — paste the block verbatim; never
+reconstruct environment details from memory._

@@ -7,7 +7,16 @@
 //
 // Also measures end-to-end pow_mod with each backend force-selected.
 //
-// Build:
+// Status: live opt-in probe.  The backends it compares are the
+// retired-but-callable detail:: references (kept for tests/A-B, not
+// dispatched); this file is their compile guard and comparison tool.
+// Not built by default and never run in CI — build it explicitly:
+//
+// Build (CMake, opt-in):
+//   cmake -B build-rel -DHYDRA_BENCH_MONT_BACKENDS=ON
+//   cmake --build build-rel --target bench_mont_backends -j
+//
+// Build (standalone):
 //   g++ -std=c++20 -O3 -DNDEBUG -I. bench/bench_mont_backends.cpp \
 //       -o build-rel/bench_mont_backends
 //
@@ -69,6 +78,7 @@ static KernelResult bench_kernels(uint32_t k, int reps = 5000, int warmup = 500)
     std::vector<uint64_t> work_kara(2 * k + 1, 0);
     std::vector<uint64_t> pa(n_padded, 0), pb(n_padded, 0);
     std::vector<uint64_t> kbuf(2 * n_padded, 0);
+    hydra::detail::ScratchWorkspace ws;
 
     KernelResult result{};
 
@@ -112,7 +122,7 @@ static KernelResult bench_kernels(uint32_t k, int reps = 5000, int warmup = 500)
         hydra::detail::montgomery_mul_karatsuba(
             a.data(), b.data(), k, mod.data(), n0inv,
             out.data(), work_kara.data(),
-            pa.data(), pb.data(), kbuf.data(), n_padded);
+            pa.data(), pb.data(), kbuf.data(), n_padded, ws);
     }
     {
         auto t0 = clk::now();
@@ -121,7 +131,7 @@ static KernelResult bench_kernels(uint32_t k, int reps = 5000, int warmup = 500)
             hydra::detail::montgomery_mul_karatsuba(
                 a.data(), b.data(), k, mod.data(), n0inv,
                 out.data(), work_kara.data(),
-                pa.data(), pb.data(), kbuf.data(), n_padded);
+                pa.data(), pb.data(), kbuf.data(), n_padded, ws);
         }
         auto t1 = clk::now();
         result.karatsuba_ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / reps;

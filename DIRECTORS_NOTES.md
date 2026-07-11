@@ -5623,4 +5623,47 @@ tarball gate OK.
 
 ---
 
+### 2026-07-11 — Claude Fable 5 — benchmark provenance capture + bench_mont_backends repaired (opt-in probe)
+
+Two hygiene items closing loose ends from the audit pass.
+
+**1. Provenance capture is now a script, not a memory exercise.**
+The 2026-07-10 re-bench had to label its GMP/OpenSSL columns
+"carried forward" partly because the exact Homebrew versions behind
+the 2026-04-18 numbers were never recorded.  New
+`scripts/capture_benchmark_env.sh` emits a paste-ready Markdown
+block: git SHA + tree state, OS/kernel/arch/CPU, C++ compiler (from
+the build dir's CMakeCache when present), CMake/node/emcc/wasm-opt
+(same emsdk fallback lookup as `wasm_pkg.sh`), GMP + OpenSSL +
+Homebrew (or dpkg) versions, the build dir's configure flags
+(filtered CMakeCache dump), the benchmark command line (recorded
+after `--`, never executed), and a timezone-stamped capture time.
+Every probe degrades to an explicit "(unavailable)" — a bare macOS
+PATH with no build dir still exits 0 with labeled gaps.  One honesty
+detail: the OpenSSL field is labeled plain "OpenSSL" because the
+last-resort fallback (`openssl` on PATH) can be the system LibreSSL,
+which is not the linked comparator; the linked libcrypto path lives
+in the flags block.  Usage notes added to `perf_snapshot.md` (every
+new table must carry the block) and `llms.txt`.
+
+**2. `bench/bench_mont_backends.cpp` — status resolved: live opt-in
+probe.**  The audit found it bit-rotted (two
+`montgomery_mul_karatsuba` calls passing 11 args vs. the 12-arg
+signature — the `ScratchWorkspace&` added in the backend-retirement
+arc) and left it "fix when next needed".  Decision: it stays live,
+not archived — it is the comparison tool and de-facto compile guard
+for the retired-but-callable backends (`montgomery_mul_fused`,
+schoolbook+REDC, Karatsuba+REDC), which Canon keeps callable
+precisely for A/B.  Repaired by adding a `ScratchWorkspace` and
+passing it at both call sites (mirrors `probe_mont_k32_band.cpp`).
+Guard: new CMake option `HYDRA_BENCH_MONT_BACKENDS` (default OFF,
+never in CI) builds target `bench_mont_backends`; the file header
+now states its status and both build paths.  Verified: standalone
+clang++ build + CMake opt-in build both compile; smoke run produces
+sane §1/§2 output (kara+REDC still loses to nothing dispatched —
+numbers not recorded as evidence, this was a does-it-run check).
+Other probes deliberately not swept.
+
+---
+
 _Append new entries to **Current Canon** or **Resolved Dragons** as appropriate._

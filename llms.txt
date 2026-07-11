@@ -82,6 +82,10 @@
 - Benchmarks: `./build-rel/bench_pow_mod --runs 6 --md` (min-of-medians +
   cross-run CV — ALWAYS use --runs, never single-run deltas; noise ±10% at small
   widths). Probes in `bench/probe_*.cpp` (kernel + "pow_mod cadence" layers).
+  Provenance: attach `scripts/capture_benchmark_env.sh -- <bench cmd>` output
+  (git SHA, toolchain, GMP/OpenSSL + brew versions, flags) to every new table.
+  Retired-backend A/B probe: `-DHYDRA_BENCH_MONT_BACKENDS=ON` →
+  `bench_mont_backends` (opt-in, never in CI).
 - wasm: `scripts/wasm_bootstrap.sh` (toolchain), `wasm_bench.sh` (shootout),
   `wasm_demo.sh [--serve]` (in-browser demo, `demo/`). mini-gmp is fetched, never
   vendored (LGPL). Bench builds are wasm-EH-free (-fwasm-exceptions costs ~15%);
