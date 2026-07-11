@@ -41,6 +41,11 @@
 - Kernels: `add/sub/mul_limbs`, `mul_3x3/4x4/8x8`, `mul_karatsuba` (≥32 limbs via
   `mul_general`), `divmod_knuth_limbs` (Knuth D), `shl/shr_limbs`,
   `divmod_u64_limbs`.
+- Magnitude cores: `detail::divmod_magnitude` (sign-free |u|÷|v| on raw spans —
+  Hydra::divmod's general case delegates), `detail::isqrt_magnitude` (isqrt
+  delegates). `detail::MagnitudeView` = borrowed-limb view, wasm-import probe
+  ARCHIVED 2026-07-11 (≤3% e2e — compute ≥100× the import copy; the real
+  boundary tax is JS-side BigInt extract). Don't add view variants to more ops.
 - Montgomery (pow_mod engine): dispatch is FIOS (dual-row CIOS,
   `montgomery_mul_fios`) at every k=1..64; squaring uses
   `montgomery_sqr_fios_halved` (cross-term halving, ~1.5k² MACs) for k≤32

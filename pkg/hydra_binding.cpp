@@ -92,4 +92,17 @@ int32_t hydra_is_perfect_square(const uint64_t* n, uint32_t n_count)
     return hydra::is_perfect_square(Hydra::from_limbs(n, n_count)) ? 1 : 0;
 }
 
+// EXPERIMENTAL A/B probe (borrowed-view import — 2026-07-11 devlog
+// entry).  Same contract as hydra_is_perfect_square, but the operand
+// is read in place from wasm memory (MagnitudeView) instead of being
+// copied into an owning Hydra.  Safe because the JS wrapper keeps the
+// wasm-stack operand buffer alive for the whole synchronous call and
+// nothing retains the view past it.  Not exposed in pkg/index.mjs;
+// exercised by pkg/bench/bench_view_probe.mjs.
+int32_t hydra_is_perfect_square_view(const uint64_t* n, uint32_t n_count)
+{
+    return hydra::detail::is_perfect_square_view(
+        hydra::detail::MagnitudeView::trimmed(n, n_count)) ? 1 : 0;
+}
+
 } // extern "C"

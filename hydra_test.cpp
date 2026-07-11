@@ -4157,6 +4157,122 @@ static void test_isqrt_basic() {
     CHECK(threw, "isqrt throws on negative input");
 }
 
+// ── MagnitudeView (borrowed-limb wasm-boundary probe) ────────────────
+// The view is non-owning and must give identical answers to the
+// owning from_limbs path; materialize() is the only way a value may
+// outlive the borrowed storage.
+static void test_magnitude_view() {
+    using hydra::Hydra;
+    using hydra::detail::MagnitudeView;
+
+    // Zero limbs: 0 is a perfect square, isqrt is 0.
+    {
+        MagnitudeView v = MagnitudeView::trimmed(nullptr, 0);
+        CHECK(v.count == 0, "view of nothing is zero");
+        CHECK(v.materialize() == Hydra{0u}, "materialize(zero view) == 0");
+        CHECK(hydra::detail::is_perfect_square_view(v),
+              "view: 0 is a perfect square");
+        CHECK(hydra::detail::isqrt_magnitude(v.limbs, v.count) == Hydra{0u},
+              "view: isqrt(0) == 0");
+    }
+
+    // One limb, including the 0/1 edge values.
+    {
+        uint64_t one[1] = {1};
+        uint64_t sq[1]  = {49};
+        uint64_t ns[1]  = {50};
+        CHECK(hydra::detail::is_perfect_square_view(
+                  MagnitudeView::trimmed(one, 1)),
+              "view: 1 is a perfect square");
+        CHECK(hydra::detail::is_perfect_square_view(
+                  MagnitudeView::trimmed(sq, 1)),
+              "view: 49 is a perfect square");
+        CHECK(!hydra::detail::is_perfect_square_view(
+                  MagnitudeView::trimmed(ns, 1)),
+              "view: 50 is not a perfect square");
+        uint64_t zero[1] = {0};
+        CHECK(MagnitudeView::trimmed(zero, 1).count == 0,
+              "trimmed() canonicalizes a zero limb away");
+    }
+
+    // Leading zeros: trimmed() must strip them; the trimmed view and
+    // the owning path agree on the value.
+    {
+        uint64_t padded[5] = {121, 0, 0, 0, 0};
+        MagnitudeView v = MagnitudeView::trimmed(padded, 5);
+        CHECK(v.count == 1, "trimmed() strips leading zero limbs");
+        CHECK(v.materialize() == Hydra{121u},
+              "materialize after trim == from_limbs value");
+        CHECK(hydra::detail::is_perfect_square_view(v),
+              "view with trimmed padding: 121 is a square");
+    }
+
+    // Borrowed vs owning agreement across tiers: 2-3 limbs (Medium
+    // inline), 4+ limbs (Large heap) — squares, their +/-1
+    // neighbours, and random values.
+    {
+        std::mt19937_64 rng(0x71EBull);
+        bool agree = true;
+        for (uint32_t k : {1u, 2u, 3u, 4u, 8u, 16u, 32u, 64u}) {
+            // square of a k/2-limb root (result ~k limbs), then +/-1
+            std::vector<uint64_t> root((k + 1) / 2);
+            for (auto& w : root) w = rng();
+            root.back() |= (1ull << 62);
+            Hydra r = Hydra::from_limbs(root.data(), (uint32_t)root.size());
+            for (const Hydra& n : {r * r, r * r + Hydra{1u}, r * r - Hydra{1u}}) {
+                auto lv = n.limb_view();
+                MagnitudeView v = MagnitudeView::trimmed(lv.ptr, lv.count);
+                if (hydra::detail::is_perfect_square_view(v)
+                        != hydra::is_perfect_square(n)) { agree = false; }
+                if (hydra::detail::isqrt_magnitude(v.limbs, v.count)
+                        != hydra::isqrt(n)) { agree = false; }
+            }
+            // random k-limb values through an external buffer, the
+            // wasm shape: limbs living outside any Hydra
+            std::vector<uint64_t> buf(k);
+            for (auto& w : buf) w = rng();
+            buf.back() |= 1u;
+            MagnitudeView v = MagnitudeView::trimmed(buf.data(), k);
+            Hydra owned = Hydra::from_limbs(buf.data(), k);
+            if (hydra::detail::is_perfect_square_view(v)
+                    != hydra::is_perfect_square(owned)) { agree = false; }
+            if (v.materialize() != owned) { agree = false; }
+        }
+        CHECK(agree, "view and owning paths agree across 1..64 limbs");
+    }
+
+    // Lifetime: materialize() deep-copies — clobbering the borrowed
+    // storage afterwards must not affect the owned value.  (ASan
+    // guards the read-only-during-call side.)
+    {
+        std::vector<uint64_t> buf = {5, 6, 7, 8, 9};
+        MagnitudeView v = MagnitudeView::trimmed(buf.data(), 5);
+        Hydra owned = v.materialize();
+        Hydra expect = Hydra::from_limbs(buf.data(), 5);
+        std::fill(buf.begin(), buf.end(), 0xFFFF'FFFF'FFFF'FFFFull);
+        CHECK(owned == expect, "materialize survives source clobber");
+    }
+
+    // Maximum wrapper operand: 4 MiB / 8 = 524288 limbs (pkg
+    // MAX_LIMBS).  Construction, trim, and materialize only — full
+    // isqrt at this width is minutes of Knuth D, not a unit test.
+    {
+        const uint32_t max_limbs = (4u << 20) / 8;
+        std::vector<uint64_t> buf(max_limbs, 0);
+        buf[0] = 9;                       // value 9, then heavy zero padding
+        MagnitudeView v = MagnitudeView::trimmed(buf.data(), max_limbs);
+        CHECK(v.count == 1, "max-width buffer trims to the live limb");
+        buf[max_limbs - 1] = 1;           // now a genuine 524288-limb value
+        MagnitudeView w = MagnitudeView::trimmed(buf.data(), max_limbs);
+        CHECK(w.count == max_limbs, "max wrapper limb count accepted");
+        Hydra owned = w.materialize();
+        auto lv = owned.limb_view();
+        CHECK(lv.count == max_limbs && lv.ptr[0] == 9
+                  && lv.ptr[max_limbs - 1] == 1,
+              "materialize at max wrapper width round-trips");
+    }
+}
+
 // Exhaustive agreement with a sieve on [0, 100000].  Covers the
 // trial-division band, the exactness shortcut at 66049 = 257^2 (a
 // composite that survives trial division), and the first ~3000
@@ -4725,6 +4841,7 @@ int main() {
     test_primality_mersenne_and_friends();
     test_next_prime();
     test_primality_edges();
+    test_magnitude_view();
 
 #if defined(HYDRA_AARCH64_ASM) && (defined(__aarch64__) || defined(_M_ARM64))
     test_aarch64_mac_row_2_matches_scalar();

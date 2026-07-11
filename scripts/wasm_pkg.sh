@@ -53,7 +53,7 @@ emcc -std=c++20 -O2 -g -DNDEBUG -I. \
     -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=8388608 \
     -sWASM_BIGINT=1 \
-    -sEXPORTED_FUNCTIONS=_hydra_pow_mod,_hydra_is_probable_prime,_hydra_next_prime,_hydra_gcd,_hydra_mod_inverse,_hydra_isqrt,_hydra_is_perfect_square \
+    -sEXPORTED_FUNCTIONS=_hydra_pow_mod,_hydra_is_probable_prime,_hydra_next_prime,_hydra_gcd,_hydra_mod_inverse,_hydra_isqrt,_hydra_is_perfect_square,_hydra_is_perfect_square_view \
     -sEXPORTED_RUNTIME_METHODS=HEAPU64,stackSave,stackRestore,stackAlloc \
     -o pkg/dist/hydra_core.mjs 2> >(grep -v 'limited binaryen' >&2 || true)
 

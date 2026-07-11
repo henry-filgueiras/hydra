@@ -4084,6 +4084,91 @@ struct TestAccess {
     static void normalize(Hydra& h) noexcept { h.normalize(); }
 };
 
+// ─────────────────────────────────────────────────────────
+// Magnitude-level divmod core (raw limb spans)
+//
+// Unsigned |u| ÷ |v| on trimmed LSB-first spans — no sign
+// handling.  Shared by Hydra::divmod (general multi-limb
+// case) and the borrowed-view probe paths (MagnitudeView,
+// below), so an owning Hydra dividend and a borrowed span
+// run the exact same compute.  The spans are BORROWED for
+// the duration of the call only; the results own their
+// storage.
+//
+// Preconditions: spans trimmed (no leading zero limbs),
+// nv > 0 (caller handles division by zero).
+// ─────────────────────────────────────────────────────────
+
+[[nodiscard]] inline int compare_magnitude_spans(
+    const uint64_t* u, uint32_t nu,
+    const uint64_t* v, uint32_t nv) noexcept
+{
+    if (nu != nv) return nu < nv ? -1 : 1;
+    for (uint32_t i = nu; i-- > 0;)
+        if (u[i] != v[i]) return u[i] < v[i] ? -1 : 1;
+    return 0;
+}
+
+struct MagnitudeDivMod { Hydra quotient; Hydra remainder; };
+
+[[nodiscard]] inline MagnitudeDivMod divmod_magnitude(
+    const uint64_t* u, uint32_t nu,
+    const uint64_t* v, uint32_t nv)
+{
+    if (nu == 0) return { Hydra{}, Hydra{} };
+
+    const int cmp = compare_magnitude_spans(u, nu, v, nv);
+    if (cmp < 0)  return { Hydra{}, Hydra::from_limbs(u, nu) };
+    if (cmp == 0) return { Hydra{1u}, Hydra{} };
+
+    // Single-limb divisor: scalar kernel (the shape of div_u64 /
+    // mod_u64, minus their Small-payload fast paths — Hydra::divmod
+    // keeps delegating single-limb divisors to those members).
+    if (nv == 1) {
+        if (nu <= 4) {
+            uint64_t q[4];
+            const uint64_t r = divmod_u64_limbs(u, nu, v[0], q);
+            return { Hydra::from_limbs(q, nu), Hydra{r} };
+        }
+        std::vector<uint64_t> q(nu);
+        const uint64_t r = divmod_u64_limbs(u, nu, v[0], q.data());
+        return { Hydra::from_limbs(q.data(), nu), Hydra{r} };
+    }
+
+    // General multi-limb case: Knuth Algorithm D.  Scratch policy
+    // identical to the block this was factored out of: stack for
+    // dividends ≤ 32 limbs, heap above.
+    const uint32_t nq = nu - nv + 1;
+    constexpr uint32_t STACK_LIMIT = 32;
+
+    uint64_t  q_stack[STACK_LIMIT + 1];
+    uint64_t  r_stack[STACK_LIMIT];
+    uint64_t  work_stack[(STACK_LIMIT + 1) + STACK_LIMIT];
+
+    uint64_t* q_buf    = nullptr;
+    uint64_t* r_buf    = nullptr;
+    uint64_t* work_buf = nullptr;
+
+    std::vector<uint64_t> q_heap, r_heap, work_heap;
+
+    if (nu <= STACK_LIMIT) {
+        q_buf    = q_stack;
+        r_buf    = r_stack;
+        work_buf = work_stack;
+    } else {
+        q_heap.resize(nq);
+        r_heap.resize(nv);
+        work_heap.resize(static_cast<size_t>(nu) + 1u + nv);
+        q_buf    = q_heap.data();
+        r_buf    = r_heap.data();
+        work_buf = work_heap.data();
+    }
+
+    divmod_knuth_limbs(u, nu, v, nv, q_buf, r_buf, work_buf);
+
+    return { Hydra::from_limbs(q_buf, nq), Hydra::from_limbs(r_buf, nv) };
+}
+
 } // namespace detail
 
 // ─────────────────────────────────────────────────────────
@@ -4151,46 +4236,14 @@ inline Hydra::DivModResult Hydra::divmod(const Hydra& divisor) const {
     }
 
     // ── General multi-limb case: Knuth Algorithm D ─────
-    const uint32_t nu = uv.count;
-    const uint32_t nv = dv.count;
-    const uint32_t nq = nu - nv + 1;
-
-    constexpr uint32_t STACK_LIMIT = 32;
-
-    uint64_t  q_stack[STACK_LIMIT + 1];
-    uint64_t  r_stack[STACK_LIMIT];
-    uint64_t  work_stack[(STACK_LIMIT + 1) + STACK_LIMIT];
-
-    uint64_t* q_buf    = nullptr;
-    uint64_t* r_buf    = nullptr;
-    uint64_t* work_buf = nullptr;
-
-    std::vector<uint64_t> q_heap, r_heap, work_heap;
-
-    if (nu <= STACK_LIMIT) {
-        q_buf    = q_stack;
-        r_buf    = r_stack;
-        work_buf = work_stack;
-    } else {
-        q_heap.resize(nq);
-        r_heap.resize(nv);
-        work_heap.resize(static_cast<size_t>(nu) + 1u + nv);
-        q_buf    = q_heap.data();
-        r_buf    = r_heap.data();
-        work_buf = work_heap.data();
-    }
-
-    detail::divmod_knuth_limbs(
-        uv.ptr, nu,
-        dv.ptr, nv,
-        q_buf, r_buf, work_buf);
-
-    // Build magnitude results, then apply signs.
-    Hydra q = Hydra::from_limbs(q_buf, nq);
-    Hydra r = Hydra::from_limbs(r_buf, nv);
-    if (q_neg && q.limb_view().count > 0) q.set_negative();
-    if (r_neg && r.limb_view().count > 0) r.set_negative();
-    return { q, r };
+    // Magnitude core shared with the borrowed-view paths; apply
+    // signs here.  (The core re-runs the span compare — an O(1)
+    // expected / O(k) worst-case redundancy vs the pre-factoring
+    // block, invisible next to the Knuth D work that follows.)
+    auto qr = detail::divmod_magnitude(uv.ptr, uv.count, dv.ptr, dv.count);
+    if (q_neg && qr.quotient.limb_view().count > 0)  qr.quotient.set_negative();
+    if (r_neg && qr.remainder.limb_view().count > 0) qr.remainder.set_negative();
+    return { std::move(qr.quotient), std::move(qr.remainder) };
 }
 
 inline Hydra Hydra::div(const Hydra& divisor) const {
@@ -4824,27 +4877,100 @@ struct EGCDResult {
 // Integer square root
 // ─────────────────────────────────────────────────────────
 
+namespace detail {
+
+// ─────────────────────────────────────────────────────────
+// EXPERIMENTAL — MagnitudeView (wasm-boundary import probe)
+//
+// A non-owning, read-only view of an unsigned magnitude in
+// trimmed LSB-first uint64 limbs — the exact shape limbs
+// already have in wasm linear memory, so an algorithm that
+// consumes a view skips the from_limbs() alloc+copy.
+//
+// Lifetime invariant: a MagnitudeView is valid only while
+// the storage it points into outlives it, and NOTHING may
+// retain one past the synchronous call it was passed to.
+// No hydra API stores a view; every consumer below reads
+// the limbs only for the duration of its own call.  A
+// value that must outlive the borrowed storage goes
+// through materialize(), which deep-copies into an owning
+// Hydra — that is the only escape hatch.
+//
+// This deliberately is NOT an ownership mode of Hydra:
+// Hydra's representation bits and value semantics are
+// untouched.  detail:: because it is a probe, not stable
+// API (see the 2026-07-11 borrowed-view devlog entry).
+// ─────────────────────────────────────────────────────────
+struct MagnitudeView {
+    const uint64_t* limbs = nullptr;  // borrowed, never freed by hydra
+    uint32_t count = 0;               // trimmed: count == 0 ⇔ zero,
+                                      // else limbs[count-1] != 0
+
+    // Canonicalizing factory — trims leading zero limbs.  Aggregate
+    // construction is allowed only for spans already trimmed.
+    [[nodiscard]] static MagnitudeView trimmed(
+        const uint64_t* p, uint32_t c) noexcept
+    {
+        while (c > 0 && p[c - 1] == 0) --c;
+        return MagnitudeView{p, c};
+    }
+
+    // Deep copy into an owning Hydra — required whenever the value
+    // must outlive the borrowed storage.
+    [[nodiscard]] Hydra materialize() const {
+        return Hydra::from_limbs(limbs, count);
+    }
+};
+
+// Floor square root of a borrowed magnitude — the compute core shared
+// by hydra::isqrt (owning) and the view path, so the two differ ONLY
+// in how the operand was imported.  Reads `limbs` solely for the
+// duration of the call.  Precondition: trimmed span.
+[[nodiscard]] inline Hydra isqrt_magnitude(
+    const uint64_t* limbs, uint32_t count)
+{
+    if (count == 0) return Hydra{};
+    if (count == 1 && limbs[0] <= 1) return Hydra{limbs[0]};
+
+    const uint32_t bits =
+        64u * (count - 1)
+        + (64u - static_cast<uint32_t>(__builtin_clzll(limbs[count - 1])));
+
+    // Initial guess: 2^ceil(bits/2) >= sqrt(n), so Newton descends
+    // monotonically to the floor root.
+    Hydra x = Hydra{1u} << ((bits + 1) / 2);
+    for (;;) {
+        auto xv = x.limb_view();
+        Hydra q = divmod_magnitude(limbs, count, xv.ptr, xv.count).quotient;
+        Hydra y = (x + q) >> 1;
+        if (y >= x) return x;
+        x = std::move(y);
+    }
+}
+
+// is_perfect_square over a borrowed magnitude: same isqrt core as the
+// owning path; the final r*r == n compare reads the borrowed limbs in
+// place instead of an owning Hydra.
+[[nodiscard]] inline bool is_perfect_square_view(MagnitudeView v) {
+    Hydra r = isqrt_magnitude(v.limbs, v.count);
+    Hydra sq = r * r;
+    auto sv = sq.limb_view();
+    return sv.count == v.count &&
+           (v.count == 0 ||
+            std::memcmp(sv.ptr, v.limbs,
+                        v.count * sizeof(uint64_t)) == 0);
+}
+
+} // namespace detail
+
 // Floor square root via Newton's method.  Throws std::domain_error on
 // negative input.  Converges in O(log bits) divisions; the `y >= x`
 // stop condition yields exactly floor(sqrt(n)).
 [[nodiscard]] inline Hydra isqrt(const Hydra& n) {
     if (n.is_negative())
         throw std::domain_error("isqrt: negative input");
-    if (n <= Hydra{1u}) return n;
-
     auto lv = n.limb_view();
-    const uint32_t bits =
-        64u * (lv.count - 1)
-        + (64u - static_cast<uint32_t>(__builtin_clzll(lv.ptr[lv.count - 1])));
-
-    // Initial guess: 2^ceil(bits/2) >= sqrt(n), so Newton descends
-    // monotonically to the floor root.
-    Hydra x = Hydra{1u} << ((bits + 1) / 2);
-    for (;;) {
-        Hydra y = (x + n / x) >> 1;
-        if (y >= x) return x;
-        x = std::move(y);
-    }
+    return detail::isqrt_magnitude(lv.ptr, lv.count);
 }
 
 [[nodiscard]] inline bool is_perfect_square(const Hydra& n) {

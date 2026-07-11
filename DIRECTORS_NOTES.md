@@ -420,6 +420,10 @@ uint64_t work_stack[(STACK_LIMIT + 1) + STACK_LIMIT]; // 520 B
 Total stack frame for the divmod call ≈ 1 KiB — well within any reasonable
 budget. Operands larger than 2048 bits fall through to `std::vector` scratch.
 This matches the same threshold we use for `mul_general` sizing.
+(Since 2026-07-11 this block lives in `detail::divmod_magnitude` — the
+sign-free magnitude core factored out of `Hydra::divmod` so borrowed-span
+callers share it; `Hydra::divmod` delegates its general multi-limb case
+there.  Policy unchanged.)
 
 #### Kernel: `detail::divmod_knuth_limbs`
 
@@ -5505,6 +5509,117 @@ count (the stale "151" — the suite was already at 155 since the
 hardening pass), and the interop paragraph now names the 6 MiB
 per-operation budget + shared accounting rule (previously it read
 "4 MiB/number cap guards the 8 MiB stack.").
+
+---
+
+### 2026-07-11 — Claude Fable 5 — Dragon — borrowed-limb MagnitudeView at the wasm boundary (probe ARCHIVED: ≤3 % e2e)
+
+**Question.** The wasm wrapper's pipeline copies each operand twice:
+BigInt → HEAPU64 (JS extract), then `Hydra::from_limbs` → owned
+Small/Medium/LargeRep.  The limbs already sit in linear memory in
+Hydra's native LSB-first shape and the JS wrapper keeps the stack
+frame alive for the whole synchronous call — so a non-owning view
+could skip the second copy.  Worth productizing?
+
+**Abstraction chosen:** `hydra::detail::MagnitudeView` — `{const
+uint64_t* limbs; uint32_t count}`, unsigned magnitude only (the wasm
+use cases are sign-normalized in JS before crossing).  detail::
+because it is a probe, not stable API.  Explicitly non-owning, no
+mutation surface; `trimmed(p, c)` factory canonicalizes leading zero
+limbs; `materialize()` (→ `from_limbs` deep copy) is the only escape
+hatch for a value that must outlive the borrowed storage.  **Lifetime
+invariant: a view is valid only while the storage it points into
+lives, and nothing may retain one past the synchronous call it was
+passed to — no hydra API stores a view.**  Deliberately NOT an
+ownership mode of Hydra: representation bits and value semantics
+untouched.
+
+**Adapted operation (exactly one):** `is_perfect_square`, as the
+cheapest read-heavy exported predicate.  To make the A/B isolate the
+import step alone, the compute was made literally shared: the Newton
+loop moved to `detail::isqrt_magnitude(limbs, count)` (public
+`isqrt` now delegates), and its `n / x` needed a borrowed-dividend
+division — so `Hydra::divmod`'s general multi-limb block (Knuth D +
+scratch policy, verbatim) was factored into
+`detail::divmod_magnitude(u, nu, v, nv)`, which `divmod` now calls
+(signs stay in `divmod`; single-limb divisors keep the
+`div_u64`/`mod_u64` Small fast paths; the core re-runs one span
+compare — O(1) expected, invisible).  `detail::is_perfect_square_view`
+= shared isqrt core + final `r*r == n` compare done as memcmp against
+the borrowed limbs.  New wasm export `_hydra_is_perfect_square_view`
+alongside the owning one (not exposed in `index.mjs`); .wasm size
+unchanged at 68 K.
+
+**Evidence** (Apple M5 Pro, clang 21.0.0 -O3 -march=native native /
+emcc 6.0.2-git LLVM-O2 pipeline + node v26.5.0 wasm; min-of-medians,
+--runs 6, 5 samples/run, rotating operands ×8, correctness gates
+before timing.  Native: `bench/probe_view_import.cpp`; JS:
+`pkg/bench/bench_view_probe.mjs --runs 6 --md`):
+
+Native isolation —
+
+| bits | import_owned | import_view | compute | Δe2e | allocs/op o→v |
+|-----:|---:|---:|---:|---:|---:|
+| 128 | 3.3 ns | 0.5 ns | 116 ns | +4.0 % | 0 → 0 |
+| 256 | 11.2 ns | 0.5 ns | 406 ns | +5.0 % | 2.0 → 1.0 |
+| 512 | 9.5 ns | 0.5 ns | 893 ns | +2.8 % | 34.5 → 33.5 |
+| 1024 | 9.9 ns | 0.5 ns | 1.60 µs | +2.0 % | 38.0 → 37.0 |
+| 2048 | 15.8 ns | 0.5 ns | 3.98 µs | −0.6 % | 42.5 → 41.5 |
+| 4096 | 19.6 ns | 0.5 ns | 13.3 µs | +1.5 % | 75.6 → 74.6 |
+
+JS-visible e2e (wasm) —
+
+| bits | T_extract | e2e owned | e2e view | Δe2e | worst CV |
+|-----:|---:|---:|---:|---:|---:|
+| 128 | 25 ns | 242 ns | 234 ns | +3.0 % | 3 % |
+| 256 | 53 ns | 695 ns | 691 ns | +0.6 % | 2 % |
+| 512 | 107 ns | 1.42 µs | 1.40 µs | +1.1 % | 2 % |
+| 1024 | 235 ns | 3.04 µs | 3.02 µs | +0.8 % | 2 % |
+| 2048 | 516 ns | 8.37 µs | 8.32 µs | +0.6 % | 2 % |
+| 4096 | 1.45 µs | 27.7 µs | 27.6 µs | +0.2 % | 1 % |
+
+(T_emit/T_rebuild are nil by shape — the predicate returns a bool.)
+
+**Verdict: ARCHIVE.**  Stop-condition scorecard: (a) ≥10 % e2e —
+no, ≤3 % and shrinking with width; (b) meaningful allocation
+reduction for batch APIs — no, exactly −1 alloc/call out of 2–75.6:
+the *compute* owns the allocation story, not the import; (c) enables
+broader optimization — partially: the factoring left
+`divmod_magnitude`/`isqrt_magnitude` as clean sign-free magnitude
+cores (now production), but that does not justify adapting more
+algorithms.  No further operations get view variants.
+
+**Why it can't win here (architectural):** every exported op's
+compute is ≥100× the from_limbs copy — even the cheapest predicate
+runs a full Newton isqrt (no residue quick-reject).  And the boundary
+tax that *does* grow with width is **T_extract, the JS-side
+BigInt→limb mask/shift loop** (O(k²/64) BigInt shifts, 1.45 µs at
+4096 b = ~70× the wasm-side copy the view removes).  A future
+boundary optimization should attack extract (chunked `asUintN`, or a
+BigInt serialization API when engines ship one), not import
+ownership.  A view could only matter for an op whose compute is O(k)
+reads — no such export exists today.
+
+**Bench trap discovered:** clang's allocation elision (N3664)
+silently deleted the `LargeRep` allocation in the first import
+micro-bench (meta-only DCE sink → 1.5 ns "from_limbs" at 4096 b);
+sinks must read the imported *limb data*.  Falsifiable via the
+allocs/op counter, which is how it was caught.
+
+**Disposition:** view + view predicate stay in `detail::` as
+retired-but-callable references (house precedent: the retired
+Montgomery kernels), covered by `test_magnitude_view` (16 checks:
+zero/one/2–3/4+ limbs, leading-zero trim, materialize-survives-
+clobber lifetime, owned/view agreement 1–64 limbs, 524288-limb
+wrapper max); probes stay for reproducibility; the extra wasm export
+ships (inert, undocumented in the wrapper).  Production keeps the
+shared cores — A/B'd against HEAD in fresh worktree builds:
+pow_mod headline unchanged (7.3 µs @256 b, 1.79 ms @2048 b,
+14.5 ms @4096 b; first baseline invocation showed a phantom +60 %
+at 256 b that vanished on interleave — the documented small-width
+noise mode), isqrt −1…−10 % (i.e. no regression).  Suites: native
+Debug ASan/UBSan + Release 1266/1266, wasm pkg 171/171, packed
+tarball gate OK.
 
 ---
 
