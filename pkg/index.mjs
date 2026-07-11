@@ -18,10 +18,23 @@
 import createHydraModule from './dist/hydra_core.mjs';
 
 let M = null;
+let initPromise = null;
 
-/** Instantiate the wasm module.  Idempotent. */
-export async function init(moduleOptions) {
-  if (!M) M = await createHydraModule(moduleOptions);
+/**
+ * Instantiate the wasm module.  Idempotent and concurrency-safe:
+ * simultaneous first calls share a single instantiation (the first
+ * caller's `moduleOptions` wins; later options are ignored).  If
+ * instantiation fails the cached promise is cleared so init() can be
+ * retried.
+ */
+export function init(moduleOptions) {
+  if (!initPromise) {
+    initPromise = createHydraModule(moduleOptions).then(
+      (m) => { M = m; },
+      (err) => { initPromise = null; throw err; },
+    );
+  }
+  return initPromise;
 }
 
 function core() {
@@ -37,14 +50,21 @@ function requireBigInt(name, v) {
 
 // ── limb interop ─────────────────────────────────────────────────────
 // Buffers live on the wasm stack for the duration of a single call
-// (stackSave/stackRestore).  The stack is 8 MiB; cap interop at 4 MiB
-// per number, far beyond any workload these routines finish in
-// reasonable time anyway.
+// (stackSave/stackRestore).  The stack is 8 MiB (-sSTACK_SIZE in
+// scripts/wasm_pkg.sh).  Two limits guard it:
+//   - per operand: 4 MiB (MAX_LIMBS), so one number can't eat the stack;
+//   - per operation: 6 MiB (OP_BUDGET_LIMBS) summed over ALL buffers a
+//     call pushes (operands + result), because several 4 MiB operands
+//     could otherwise coexist in one frame and overflow silently.
+// The remaining ≥2 MiB is headroom for the wasm callee frames, which
+// are small (the C++ side heap-allocates its working state; the
+// binding's buffers are all caller-provided — see pkg/hydra_binding.cpp).
 
 const WORD = 8;
 const LIMB_BITS = 64n;
 const LIMB_MASK = (1n << 64n) - 1n;
 const MAX_LIMBS = (4 << 20) / WORD;
+const OP_BUDGET_LIMBS = (6 << 20) / WORD;
 
 function limbCountOf(x) {           // x >= 0n
   if (x === 0n) return 0;
@@ -53,6 +73,15 @@ function limbCountOf(x) {           // x >= 0n
     throw new RangeError(`hydra-bignum: operand exceeds ${MAX_LIMBS * 64} bits`);
   }
   return count;
+}
+
+// Total stack limbs one call will push (operands + result buffer).
+function checkOpBudget(totalLimbs) {
+  if (totalLimbs > OP_BUDGET_LIMBS) {
+    throw new RangeError(
+      `hydra-bignum: operation needs ${totalLimbs * WORD} bytes of wasm-stack ` +
+      `interop buffers, over the ${OP_BUDGET_LIMBS * WORD}-byte per-operation budget`);
+  }
 }
 
 // Reserve stack space for `count` limbs (>= 1 word so the pointer is
@@ -107,6 +136,7 @@ export function powMod(base, exp, mod) {
   if (base < 0n) base += mod;
   return withStack((m) => {
     const bc = limbCountOf(base), ec = limbCountOf(exp), mc = limbCountOf(mod);
+    checkOpBudget(bc + ec + mc + mc);            // + result buffer (mc)
     const bp = pushBig(m, base, bc);
     const ep = pushBig(m, exp, ec);
     const mp = pushBig(m, mod, mc);
@@ -128,6 +158,7 @@ export function modInverse(a, m) {
   if (a < 0n) a += m;
   return withStack((mod_) => {
     const ac = limbCountOf(a), mc = limbCountOf(m);
+    checkOpBudget(ac + mc + mc);                 // + result buffer (mc)
     const ap = pushBig(mod_, a, ac);
     const mp = pushBig(mod_, m, mc);
     const op = mod_.stackAlloc(mc * WORD);
@@ -145,6 +176,7 @@ export function gcd(a, b) {
   if (b < 0n) b = -b;
   return withStack((m) => {
     const ac = limbCountOf(a), bc = limbCountOf(b);
+    checkOpBudget(ac + bc + Math.max(ac, bc, 1));   // + result buffer
     const ap = pushBig(m, a, ac);
     const bp = pushBig(m, b, bc);
     const op = m.stackAlloc(Math.max(ac, bc, 1) * WORD);
@@ -167,6 +199,7 @@ export function isProbablePrime(n, extraMillerRabinRounds = 0) {
   if (n < 2n) return false;
   return withStack((m) => {
     const nc = limbCountOf(n);
+    checkOpBudget(nc);
     const np = pushBig(m, n, nc);
     return m._hydra_is_probable_prime(np, nc, extraMillerRabinRounds) === 1;
   });
@@ -178,6 +211,7 @@ export function nextPrime(n) {
   if (n < 2n) return 2n;
   return withStack((m) => {
     const nc = limbCountOf(n);
+    checkOpBudget(nc + nc + 1);                  // + result buffer (nc + 1)
     const np = pushBig(m, n, nc);
     const op = m.stackAlloc((nc + 1) * WORD);   // Bertrand: result < 2n
     const c = m._hydra_next_prime(np, nc, op) >>> 0;
@@ -191,6 +225,7 @@ export function isqrt(n) {
   if (n < 0n) throw new RangeError('hydra-bignum: isqrt of a negative number');
   return withStack((m) => {
     const nc = limbCountOf(n);
+    checkOpBudget(nc + ((nc + 1) >> 1) + 1);     // + result buffer
     const np = pushBig(m, n, nc);
     const op = m.stackAlloc((((nc + 1) >> 1) + 1) * WORD);
     const c = m._hydra_isqrt(np, nc, op) >>> 0;
@@ -204,6 +239,7 @@ export function isPerfectSquare(n) {
   if (n < 0n) return false;
   return withStack((m) => {
     const nc = limbCountOf(n);
+    checkOpBudget(nc);
     const np = pushBig(m, n, nc);
     return m._hydra_is_perfect_square(np, nc) === 1;
   });

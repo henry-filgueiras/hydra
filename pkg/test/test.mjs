@@ -51,7 +51,32 @@ function gcdJS(a, b) {
   return a;
 }
 
+// ── init() concurrency ───────────────────────────────────────────────
+// Simultaneous first calls must share one instantiation (the wrapper
+// caches the promise, not the resolved module).
+{
+  const p1 = init();
+  const p2 = init();
+  ok(p1 === p2, 'concurrent init() calls share the same promise');
+  await Promise.all([p1, p2]);
+  ok(init() === p1, 'init() after resolution returns the cached promise');
+}
+
 await init();
+
+// ── per-operation wasm-stack budget ──────────────────────────────────
+// Operands individually under the 4 MiB per-number cap, but whose
+// combined interop buffers exceed the 6 MiB per-operation budget, must
+// throw instead of silently overflowing the 8 MiB wasm stack.
+{
+  const big = 1n << (21n << 20n);         // ~2.6 MiB of limbs
+  assert.throws(() => powMod(2n, big, big + 1n), RangeError,
+                'powMod over per-operation stack budget throws');
+  checks++;
+  assert.throws(() => isProbablePrime(1n << (33n << 20n)), RangeError,
+                'operand over per-number cap throws');
+  checks++;
+}
 
 // ── powMod ───────────────────────────────────────────────────────────
 for (const bits of [8, 64, 65, 128, 192, 256, 521, 1024, 2048]) {

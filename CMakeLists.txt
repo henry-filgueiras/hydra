@@ -190,6 +190,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hydra_test.cpp")
     # Register with CTest so `cmake --build build --target test` works.
     enable_testing()
     add_test(NAME hydra_tests COMMAND hydra_test)
+
+    # Header self-sufficiency: a TU that includes only hydra.hpp must
+    # compile (no reliance on transitive standard-library includes).
+    add_executable(hydra_header_check header_check.cpp)
+    target_link_libraries(hydra_header_check PRIVATE hydra_core)
+    add_test(NAME hydra_header_check COMMAND hydra_header_check)
 endif()
 
 # ─────────────────────────────────────────────────────────
@@ -237,7 +243,7 @@ set_target_properties(hydra_bench PROPERTIES
 # Boost.Multiprecision is header-only; we only need include dirs.
 # The option is OFF by default so clean builds don't require Boost.
 # ─────────────────────────────────────────────────────────
-option(HYDRA_BENCH_BOOST "Enable Boost.Multiprecision comparison benchmarks" ON)
+option(HYDRA_BENCH_BOOST "Enable Boost.Multiprecision comparison benchmarks" OFF)
 
 if(HYDRA_BENCH_BOOST)
     find_package(Boost REQUIRED)

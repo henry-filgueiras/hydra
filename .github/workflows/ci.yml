@@ -42,10 +42,13 @@ jobs:
         run: cmake -B build-ci -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DHYDRA_BENCH_BOOST=OFF
 
       - name: Build tests
-        run: cmake --build build-ci --target hydra_test -j 4
+        run: cmake --build build-ci --target hydra_test hydra_header_check -j 4
 
       - name: Run tests
         run: ./build-ci/hydra_test
+
+      - name: Header self-sufficiency
+        run: ./build-ci/hydra_header_check && echo "hydra.hpp compiles standalone"
 
   wasm:
     name: wasm (emscripten + node)
@@ -53,9 +56,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned, not "latest": Hydra's wasm perf is toolchain-sensitive
+      # (Binaryen's post-link wasm-opt pessimizes the Montgomery
+      # kernels — see DIRECTORS_NOTES.md), so release/benchmark
+      # evidence must be reproducible.  Bump deliberately, re-bench.
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          version: 6.0.2
 
       - name: Full test suite under wasm
         run: |
@@ -70,6 +77,14 @@ jobs:
       # handles it.
       - name: npm package — build + test (pkg/)
         run: scripts/wasm_pkg.sh --test
+
+      # Source-tree tests are NOT sufficient: the tarball once shipped
+      # without dist/hydra_core.wasm (package.json `files` omission)
+      # while pkg/test passed against the source checkout.  This step
+      # packs, installs into a fresh temp project, and runs
+      # known-answer operations against the installed artifact.
+      - name: npm package — packed tarball install test
+        run: scripts/npm_pack_test.sh
 
       - name: Demo module — Hydra and mini-gmp agree
         run: |
@@ -122,9 +137,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same pin as the wasm job — deploy artifacts must match the
+      # toolchain the recorded results were measured under.
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          version: 6.0.2
 
       - name: Isolated Boost headers
         run: |
