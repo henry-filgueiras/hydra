@@ -2744,9 +2744,21 @@ struct MontgomeryContext {
 
 // ─────────────────────────────────────────────────────────
 // Hydra — the main value type
+//
+// Representation state (meta + payload) is PRIVATE: every public
+// member preserves the invariants (smallest tier, zero is Small and
+// non-negative with limb count 0, Medium used ∈ [2,3] with top limb
+// non-zero).  Tests and benchmarks that need to fabricate
+// pre-normalization states go through detail::TestAccess — never a
+// stable API.
 // ─────────────────────────────────────────────────────────
 
+namespace detail { struct TestAccess; }
+
 struct Hydra {
+private:
+    friend struct detail::TestAccess;
+
     // ── data ──────────────────────────────────────────────
     uint64_t meta{};
 
@@ -2759,7 +2771,7 @@ struct Hydra {
     } payload;
 
     // ─────────────────────────────────────────────────────
-    // Metadata helpers
+    // Metadata helpers (raw — no invariant checks)
     // ─────────────────────────────────────────────────────
 
     static constexpr uint64_t make_small_meta() noexcept {
@@ -2773,6 +2785,7 @@ struct Hydra {
         return static_cast<uint64_t>(Kind::Large);
     }
 
+public:
     [[nodiscard]] Kind kind() const noexcept {
         return static_cast<Kind>(meta & bits::KIND_MASK);
     }
@@ -2794,12 +2807,17 @@ struct Hydra {
     [[nodiscard]] bool is_zero() const noexcept {
         return limb_view().count == 0;
     }
+private:
+    // Raw sign writes — can violate the zero-sign invariant; callers
+    // inside the class guard on magnitude.  External code uses negate().
     void set_negative() noexcept {
         meta |= bits::SIGN_BIT;
     }
     void clear_sign() noexcept {
         meta &= ~bits::SIGN_BIT;
     }
+
+public:
     // Flip the sign. No-op on zero (preserves zero-sign invariant).
     void negate() noexcept {
         if (limb_view().count > 0) meta ^= bits::SIGN_BIT;
@@ -2808,10 +2826,14 @@ struct Hydra {
     [[nodiscard]] uint8_t used_medium_limbs() const noexcept {
         return static_cast<uint8_t>((meta & bits::USED_MASK) >> bits::USED_SHIFT);
     }
+
+private:
     void set_used_medium_limbs(uint8_t n) noexcept {
         meta = (meta & ~bits::USED_MASK)
                | (static_cast<uint64_t>(n) << bits::USED_SHIFT);
     }
+
+public:
 
     // ─────────────────────────────────────────────────────
     // Limb view — a uniform read-only span over this value's limbs
@@ -2840,6 +2862,7 @@ struct Hydra {
     // Destruction
     // ─────────────────────────────────────────────────────
 
+private:
     void destroy_if_large() noexcept {
         if (is_large() && payload.large) {
             LargeRep::destroy(payload.large);
@@ -2847,6 +2870,7 @@ struct Hydra {
         }
     }
 
+public:
     // ─────────────────────────────────────────────────────
     // Constructors / rule of five
     // ─────────────────────────────────────────────────────
@@ -3054,6 +3078,7 @@ struct Hydra {
     // Construction helpers (internal)
     // ─────────────────────────────────────────────────────
 
+private:
     // Build a Medium from up to 3 limbs (LSB-first).
     // Caller must ensure 2 ≤ used ≤ 3 and high limbs match used.
     [[nodiscard]] static Hydra make_medium(
@@ -3067,6 +3092,7 @@ struct Hydra {
         return r;
     }
 
+public:
     // Build from a raw limb array. Normalizes immediately.
     [[nodiscard]] static Hydra from_limbs(
         const uint64_t* limbs, uint32_t count)
@@ -3099,6 +3125,7 @@ struct Hydra {
     // in the smallest valid representation.
     // ─────────────────────────────────────────────────────
 
+private:
     void normalize() noexcept {
         // Preserve sign across Kind transitions.
         // Zero is ALWAYS non-negative (sign bit cleared when magnitude == 0).
@@ -3162,6 +3189,7 @@ struct Hydra {
         }
     }
 
+public:
     // ─────────────────────────────────────────────────────
     // Value accessors / conversion
     // ─────────────────────────────────────────────────────
@@ -4001,6 +4029,62 @@ public:
         return os << h.to_string();
     }
 };
+
+// Layout contract: Hydra is a 32-byte OBJECT (8-byte meta + 24-byte
+// payload) with natural 8-byte alignment.  It is deliberately NOT
+// alignas(32): stronger alignment would bloat arrays/allocators for
+// no measured win.  Docs must say "32-byte object", not "32-byte
+// aligned".
+static_assert(sizeof(Hydra) == 32);
+static_assert(alignof(Hydra) == alignof(uint64_t));
+
+namespace detail {
+
+// ─────────────────────────────────────────────────────────
+// TestAccess — the ONLY sanctioned backdoor into Hydra's private
+// representation state, for the repo's own tests and benchmarks
+// (fabricating pre-normalization states, cheap DCE-defeating sinks).
+// NOT a stable API; user code must build values through the public
+// constructors / from_limbs, which preserve the invariants.
+// ─────────────────────────────────────────────────────────
+struct TestAccess {
+    // Raw meta word — benchmark sinks read this to defeat dead-code
+    // elimination without touching the payload.
+    [[nodiscard]] static uint64_t meta_word(const Hydra& h) noexcept {
+        return h.meta;
+    }
+
+    // Adopt a manually built LargeRep verbatim (no normalization) —
+    // fabricates pre-normalization states such as leading-zero limbs.
+    [[nodiscard]] static Hydra adopt_large(LargeRep* rep,
+                                           bool negative = false) noexcept {
+        Hydra h;
+        h.meta = Hydra::make_large_meta()
+                 | (negative ? bits::SIGN_BIT : uint64_t{0});
+        h.payload.large = rep;
+        return h;
+    }
+
+    // Exact Medium factory (limbs LSB-first, no trimming).
+    [[nodiscard]] static Hydra make_medium(uint64_t l0, uint64_t l1,
+                                           uint64_t l2, uint8_t used) noexcept {
+        return Hydra::make_medium(l0, l1, l2, used);
+    }
+
+    // Overwrite a Small payload in place, leaving meta untouched —
+    // simulates a kernel writing a raw magnitude before normalize().
+    static void poke_small(Hydra& h, uint64_t v) noexcept {
+        h.payload.small = v;
+    }
+
+    // Force the sign bit on regardless of magnitude (normalize() must
+    // clear it again on zero — that is exactly what tests probe).
+    static void force_negative(Hydra& h) noexcept { h.set_negative(); }
+
+    static void normalize(Hydra& h) noexcept { h.normalize(); }
+};
+
+} // namespace detail
 
 // ─────────────────────────────────────────────────────────
 // DivModResult (nested-but-out-of-line)

@@ -72,7 +72,7 @@ static void call_kernel_direct(const Hydra& u, const Hydra& v,
 static void call_divmod(const Hydra& u, const Hydra& v) {
     auto qr = u.divmod(v);
     // Defeat DCE.
-    asm volatile("" : : "r"(qr.quotient.meta), "r"(qr.remainder.meta) : "memory");
+    asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(qr.quotient)), "r"(hydra::detail::TestAccess::meta_word(qr.remainder)) : "memory");
 }
 
 struct ShapeSpec {

@@ -250,7 +250,7 @@ BENCHMARK(BM_widening_mul_128)->Name("hydra/widening_mul_128");
 static Hydra make_medium(uint64_t seed) {
     XorShift64 rng{seed};
     uint64_t lo = rng.next(), hi = rng.next() | 1u;
-    return Hydra::make_medium(lo, hi, 0, 2);
+    return hydra::detail::TestAccess::make_medium(lo, hi, 0, 2);
 }
 
 static void BM_medium_add(benchmark::State& state) {
@@ -264,7 +264,7 @@ static void BM_medium_add(benchmark::State& state) {
         a = b;
         if (c.is_medium()) {
             auto lv = c.limb_view();
-            b = Hydra::make_medium(lv.ptr[0], lv.ptr[1] & 0x7FFF'FFFF'FFFF'FFFFull, 0, 2);
+            b = hydra::detail::TestAccess::make_medium(lv.ptr[0], lv.ptr[1] & 0x7FFF'FFFF'FFFF'FFFFull, 0, 2);
         } else {
             b = make_medium(c.limb_count());
         }
@@ -373,12 +373,10 @@ static void BM_alloc_normalize_large_to_medium(benchmark::State& state) {
         rep->limbs()[2] = 0xCCCC'CCCC'CCCC'CCCCull;
         rep->limbs()[3] = 0;   // leading zero → will be trimmed
 
-        Hydra h;
-        h.meta            = Hydra::make_large_meta();
-        h.payload.large   = rep;
+        Hydra h = hydra::detail::TestAccess::adopt_large(rep);
 
         benchmark::DoNotOptimize(h);
-        h.normalize();   // should demote: Large(used=4,top=0) → Medium(3)
+        hydra::detail::TestAccess::normalize(h);   // should demote: Large(used=4,top=0) → Medium(3)
         benchmark::DoNotOptimize(h);
         benchmark::ClobberMemory();
 
@@ -392,9 +390,9 @@ BENCHMARK(BM_alloc_normalize_large_to_medium)
 static void BM_alloc_normalize_medium_to_small(benchmark::State& state) {
     for (auto _ : state) {
         // Medium with used=2 but limb[1]=0 → should demote to Small.
-        Hydra h = Hydra::make_medium(0xDEAD'BEEFull, 0, 0, 2);
+        Hydra h = hydra::detail::TestAccess::make_medium(0xDEAD'BEEFull, 0, 0, 2);
         benchmark::DoNotOptimize(h);
-        h.normalize();
+        hydra::detail::TestAccess::normalize(h);
         benchmark::DoNotOptimize(h);
         benchmark::ClobberMemory();
         assert(h.is_small());

@@ -51,8 +51,8 @@ int main() {
 
     // Medium × Medium (2-limb × 2-limb → up to 4 limbs)
     {
-        Hydra a = Hydra::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0, 2);
-        Hydra b = Hydra::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0, 2);
+        Hydra a = hydra::detail::TestAccess::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0, 2);
+        Hydra b = hydra::detail::TestAccess::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0, 2);
         bench("medium_mul (2x2)", [&]() {
             do_not_optimize(a); do_not_optimize(b);
             Hydra c = a * b;
@@ -63,8 +63,8 @@ int main() {
 
     // 3-limb × 3-limb
     {
-        Hydra a = Hydra::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull, 3);
-        Hydra b = Hydra::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
+        Hydra a = hydra::detail::TestAccess::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull, 3);
+        Hydra b = hydra::detail::TestAccess::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
         bench("medium_mul (3x3)", [&]() {
             do_not_optimize(a); do_not_optimize(b);
             Hydra c = a * b;

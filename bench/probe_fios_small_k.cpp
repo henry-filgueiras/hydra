@@ -317,12 +317,12 @@ static void bench_e2e(uint32_t bits) {
 
     double sep_ns = median_ns([&]() {
         auto r = pow_mod_with_backend(base, exp_val, mod_val, Backend::Separate);
-        asm volatile("" : : "r"(r.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
     }, reps, warmup);
 
     double fios_ns = median_ns([&]() {
         auto r = pow_mod_with_backend(base, exp_val, mod_val, Backend::FIOS);
-        asm volatile("" : : "r"(r.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
     }, reps, warmup);
 
     double delta = ((fios_ns / sep_ns) - 1.0) * 100.0;

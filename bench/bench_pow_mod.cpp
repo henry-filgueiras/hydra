@@ -274,7 +274,7 @@ static TimingResult bench_hydra(Operands& ops) {
     // Warmup
     for (int i = 0; i < WARMUP_ITERS; ++i) {
         auto result = pow_mod(ops.h_base, ops.h_exp, ops.h_mod);
-        asm volatile("" : : "r"(result.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(result)) : "memory");
     }
 
     // Collect
@@ -282,7 +282,7 @@ static TimingResult bench_hydra(Operands& ops) {
         auto t0 = clk::now();
         auto result = pow_mod(ops.h_base, ops.h_exp, ops.h_mod);
         auto t1 = clk::now();
-        asm volatile("" : : "r"(result.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(result)) : "memory");
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         r.samples_ns.push_back(ns);
     }

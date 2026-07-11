@@ -156,7 +156,7 @@ static double bench_pow_mod_e2e(uint32_t bits, int samples = 20) {
     // Warmup
     for (int i = 0; i < 2; ++i) {
         auto r = hydra::pow_mod(base, exp_val, mod_val);
-        asm volatile("" : : "r"(r.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
     }
 
     // Collect
@@ -165,7 +165,7 @@ static double bench_pow_mod_e2e(uint32_t bits, int samples = 20) {
         auto t0 = clk::now();
         auto r = hydra::pow_mod(base, exp_val, mod_val);
         auto t1 = clk::now();
-        asm volatile("" : : "r"(r.meta) : "memory");
+        asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
         times[i] = std::chrono::duration<double, std::nano>(t1 - t0).count();
     }
 

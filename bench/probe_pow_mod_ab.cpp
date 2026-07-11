@@ -194,12 +194,12 @@ int main() {
         double fused_ns = bench_one([&]() {
             auto r = pow_mod_with_backend(base, exp_val, mod_val,
                                           Backend::Fused);
-            asm volatile("" : : "r"(r.meta) : "memory");
+            asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
         }, reps, warmup);
         double sos_ns = bench_one([&]() {
             auto r = pow_mod_with_backend(base, exp_val, mod_val,
                                           Backend::SOS);
-            asm volatile("" : : "r"(r.meta) : "memory");
+            asm volatile("" : : "r"(hydra::detail::TestAccess::meta_word(r)) : "memory");
         }, reps, warmup);
 
         double delta = ((sos_ns / fused_ns) - 1.0) * 100.0;

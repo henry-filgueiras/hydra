@@ -16,6 +16,7 @@
 
 using hydra::Hydra;
 using hydra::LargeRep;
+using TestAccess = hydra::detail::TestAccess;   // sanctioned backdoor for fabricated states
 
 static int g_pass = 0, g_fail = 0;
 
@@ -150,10 +151,7 @@ static void test_large_add_inplace_normalizes_to_medium() {
     rep->used = 4;
     std::memcpy(rep->limbs(), limbs, 4 * sizeof(uint64_t));
 
-    Hydra a;
-    // Manually wire up as Large.
-    a.meta = Hydra::make_large_meta();
-    a.payload.large = rep;
+    Hydra a = TestAccess::adopt_large(rep);
 
     Hydra b{10u};
     a += b;
@@ -199,8 +197,8 @@ static void test_mul_small_small() {
 
 static void test_mul_medium_medium() {
     // 2-limb × 2-limb → up to 4-limb (exercises mul_3x3 path)
-    Hydra a = Hydra::make_medium(UINT64_MAX, UINT64_MAX, 0, 2);
-    Hydra b = Hydra::make_medium(UINT64_MAX, UINT64_MAX, 0, 2);
+    Hydra a = TestAccess::make_medium(UINT64_MAX, UINT64_MAX, 0, 2);
+    Hydra b = TestAccess::make_medium(UINT64_MAX, UINT64_MAX, 0, 2);
     Hydra c = a * b;
 
     // Cross-check: compute via generic kernel
@@ -215,8 +213,8 @@ static void test_mul_medium_medium() {
 
 static void test_mul_3limb() {
     // Full 3-limb × 3-limb (exercises mul_3x3 with max inputs)
-    Hydra a = Hydra::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull, 3);
-    Hydra b = Hydra::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
+    Hydra a = TestAccess::make_medium(0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull, 3);
+    Hydra b = TestAccess::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
     Hydra c = a * b;
 
     uint64_t la[3] = {0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull};
@@ -231,7 +229,7 @@ static void test_mul_3limb() {
 static void test_mul_3x3_asymmetric() {
     // 1-limb × 3-limb (mul_3x3 with padding)
     Hydra a{0xDEADBEEFull};
-    Hydra b = Hydra::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
+    Hydra b = TestAccess::make_medium(0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull, 3);
     Hydra c = a * b;
 
     uint64_t la[1] = {0xDEADBEEFull};
@@ -323,7 +321,7 @@ static void test_mul_8x8_varied_seeds() {
 static void test_mul_commutativity() {
     // a*b == b*a for all kernel paths
     Hydra sm{42u};
-    Hydra med = Hydra::make_medium(0xAAAA, 0xBBBB, 0xCCCC, 3);
+    Hydra med = TestAccess::make_medium(0xAAAA, 0xBBBB, 0xCCCC, 3);
     Hydra l4 = make_large(4, 0x9999);
     Hydra l8 = make_large(8, 0x7777);
 
@@ -825,7 +823,7 @@ static void test_shl_zero_shift() {
     Hydra a{0xDEAD'BEEF'CAFE'BABEull};
     CHECK(a << 0 == a, "small << 0 == identity");
 
-    Hydra m = Hydra::make_medium(1, 2, 3, 3);
+    Hydra m = TestAccess::make_medium(1, 2, 3, 3);
     CHECK(m << 0 == m, "medium << 0 == identity");
 
     Hydra l = make_large(6, 0xABCD);
@@ -873,7 +871,7 @@ static void test_shl_small_cross_limb_boundary() {
 
 static void test_shl_medium_to_large() {
     // 3-limb medium shifted enough to become 4+ limbs → Large.
-    Hydra m = Hydra::make_medium(1, 0, 0, 1);   // value = 1 as medium
+    Hydra m = TestAccess::make_medium(1, 0, 0, 1);   // value = 1 as medium
     // Shift by 192 bits → needs limb position 3 → Large.
     Hydra r = m << 192;
     CHECK(r.is_large(), "1 << 192 is Large");
@@ -918,7 +916,7 @@ static void test_shr_zero_shift() {
     Hydra a{0xCAFEull};
     CHECK(a >> 0 == a, "small >> 0 == identity");
 
-    Hydra m = Hydra::make_medium(1, 2, 3, 3);
+    Hydra m = TestAccess::make_medium(1, 2, 3, 3);
     CHECK(m >> 0 == m, "medium >> 0 == identity");
 
     Hydra l = make_large(6, 0x1234);
@@ -942,7 +940,7 @@ static void test_shr_large_shift_clears() {
 
 static void test_shr_medium_demotes() {
     // 2-limb medium shifted by 64 should demote to Small.
-    Hydra m = Hydra::make_medium(0xDEADull, 0x0000'0000'0000'0005ull, 0, 2);
+    Hydra m = TestAccess::make_medium(0xDEADull, 0x0000'0000'0000'0005ull, 0, 2);
     // Value = 5 * 2^64 + 0xDEAD
     Hydra r = m >> 64;
     CHECK(r.is_small(), "medium >> 64 demotes to Small");
@@ -1882,8 +1880,8 @@ static void test_bitwise_not_roundtrip() {
 
 static void test_bitwise_and_medium() {
     // Medium (2-limb) AND
-    Hydra a = Hydra::make_medium(UINT64_MAX, 0xFF00FF00FF00FF00ull, 0, 2);
-    Hydra b = Hydra::make_medium(0x0F0F0F0F0F0F0F0Full, UINT64_MAX, 0, 2);
+    Hydra a = TestAccess::make_medium(UINT64_MAX, 0xFF00FF00FF00FF00ull, 0, 2);
+    Hydra b = TestAccess::make_medium(0x0F0F0F0F0F0F0F0Full, UINT64_MAX, 0, 2);
     Hydra c = a & b;
     auto lv = c.limb_view();
     CHECK(lv.count == 2, "medium & medium → 2 limbs");
@@ -1943,7 +1941,7 @@ static void test_signed_add_small_neg_plus_large() {
 }
 
 static void test_signed_mul_medium_neg_times_large() {
-    Hydra a = Hydra::make_medium(7, 1, 0, 2);
+    Hydra a = TestAccess::make_medium(7, 1, 0, 2);
     a.negate();
     Hydra b = make_large(4, 0x5678);
     Hydra c = a * b;
@@ -1962,10 +1960,8 @@ static void test_normalize_sign_large_to_small() {
     rep->limbs()[1] = 0;
     rep->limbs()[2] = 0;
     rep->limbs()[3] = 0;
-    Hydra a;
-    a.meta = Hydra::make_large_meta() | hydra::bits::SIGN_BIT;
-    a.payload.large = rep;
-    a.normalize();
+    Hydra a = TestAccess::adopt_large(rep, /*negative=*/true);
+    TestAccess::normalize(a);
     CHECK(a.is_small(), "Large(1-limb) demotes to Small");
     CHECK(a.is_negative(), "sign preserved across Large→Small");
     CHECK(a.to_string() == "-42", "Large→Small with sign == -42");
@@ -1973,10 +1969,10 @@ static void test_normalize_sign_large_to_small() {
 
 static void test_normalize_sign_zero_clears() {
     Hydra a{42u};
-    a.set_negative();
+    TestAccess::force_negative(a);
     // Manually set payload to 0 (simulating a sub result)
-    a.payload.small = 0;
-    a.normalize();
+    TestAccess::poke_small(a, 0);
+    TestAccess::normalize(a);
     CHECK(!a.is_negative(), "zero clears sign after normalize");
 }
 
@@ -2000,7 +1996,7 @@ static void test_signed_add_overflow_to_medium() {
 
 static void test_signed_sub_medium_to_small() {
     // -2^64 - (-UINT64_MAX) = -(2^64) + UINT64_MAX = -(2^64 - UINT64_MAX) = -(1) = -1
-    Hydra a = Hydra::make_medium(0, 1, 0, 2);  // 2^64
+    Hydra a = TestAccess::make_medium(0, 1, 0, 2);  // 2^64
     a.negate();  // -2^64
     Hydra b{UINT64_MAX};
     b.negate();  // -UINT64_MAX
