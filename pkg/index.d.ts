@@ -34,6 +34,13 @@ export function gcd(a: bigint, b: bigint): bigint;
  * Baillie–PSW primality test — exact below 2^64, no known
  * counterexample above — plus optional extra Miller–Rabin rounds.
  * n < 2n (including negatives) returns false.
+ *
+ * `extraMillerRabinRounds` must be an integer in [0, 64] (each round
+ * multiplies the false-positive bound by 1/4, so 64 already gives
+ * < 2^-128; larger values only burn CPU).
+ *
+ * @throws RangeError if extraMillerRabinRounds is fractional,
+ * negative, greater than 64, or not a safe integer — never clamped.
  */
 export function isProbablePrime(
   n: bigint,

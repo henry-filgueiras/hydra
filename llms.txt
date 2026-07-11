@@ -62,8 +62,10 @@
   2.6–3.9× in-browser (GMP has no wasm asm; LLVM-only pipeline, see below).
   Small ops ≈1.1–1.3× native u64.
 - npm package `pkg/` (hydra-bignum): bigint→bigint powMod/modInverse/primality
-  API; beats native JS BigInt 2.6×@256b…1.3×@2048b, loses 0.8×@4096b (V8 is
-  subquadratic). Build: `scripts/wasm_pkg.sh --test`. Publish = human step.
+  API (extra MR rounds: integer in [0, 64], RangeError outside — never
+  clamped/wrapped); beats native JS BigInt 2.6×@256b…1.3×@2048b, loses
+  0.8×@4096b (V8 is subquadratic). Build: `scripts/wasm_pkg.sh --test`.
+  Publish = human step.
 
 ## Build / test / bench
 - Tests: `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --target

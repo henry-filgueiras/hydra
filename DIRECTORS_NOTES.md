@@ -5037,11 +5037,16 @@ memory growth invalidates views).  `Hydra::from_limbs`/`limb_view`
 are the exact native shape, so crossing is memcpy-flat; measured
 wrapper overhead ~1 µs/call at 256-bit.  BigInt→limbs via
 `asUintN`-style mask/shift loop (O(n²/64), negligible ≤4096-bit);
-4 MiB/number cap guards the 8 MiB stack.
+a 4 MiB/number cap plus a 6 MiB/operation budget guard the 8 MiB
+stack, and the budget sums the same quantity the reservations
+allocate (`stackLimbCount` = max(count, 1) words — zero-valued
+operands still reserve one word).  `isProbablePrime`'s extra MR
+rounds are an integer in [0, 64] (RangeError outside; see the
+2026-07-11 wrapper-fixes devlog entry for the cap rationale).
 
 **Files:** `pkg/hydra_binding.cpp` (C ABI, capacities documented
 per function), `pkg/index.mjs` + hand-written `index.d.ts`,
-`pkg/test/test.mjs` (151 checks: BigInt oracles for powMod/gcd,
+`pkg/test/test.mjs` (171 checks: BigInt oracles for powMod/gcd,
 pseudoprime landmarks, egcd/inverse invariants, floor-sqrt
 properties, error contracts), `pkg/bench/bench_vs_bigint.mjs`
 (min-of-medians, cross-checks before timing),
@@ -5449,6 +5454,57 @@ wasm all green).  npm suite 151 → 155 checks + packed-tarball gate.
 > - Benchmark continuity and reproducibility
 >
 > This is the current benchmarked and publicly communicated artifact.
+
+---
+
+### 2026-07-11 — Claude Fable 5 — npm wrapper: MR-round contract + stack-budget/allocation reconciliation
+
+Two narrowly-scoped `pkg/` wrapper fixes from an external follow-up
+review.  JS-only: `pkg/dist` rebuilt byte-identical, C ABI untouched.
+
+1. **`extraMillerRabinRounds` could wrap at the ABI boundary.**
+   Validation was `Number.isInteger(x) && x >= 0` feeding a `uint32_t`
+   ABI parameter, so `2**32` (→ 0 rounds), `2**32 + 7` (→ 7) and
+   `Number.MAX_SAFE_INTEGER` (→ 4294967295) passed JS validation and
+   wrapped silently.  Sharper still: the native
+   `hydra::is_probable_prime` takes `int` — ABI-valid values above
+   2^31 − 1 narrowed to negative and skipped the extra rounds
+   entirely.  Chosen contract: **integer in [0, 64]** via
+   `Number.isSafeInteger`, `RangeError` otherwise — never clamped,
+   never wrapped.  Cap rationale: each MR round multiplies the
+   false-positive bound by ≤ 1/4, so 64 extra rounds on top of BPSW
+   (itself with no known counterexample) already bound the error
+   below 4^-64 = 2^-128 — past any cryptographic requirement — while
+   each round costs a full powMod (~50 ms at 4096 b under wasm;
+   UINT32_MAX rounds ≈ years: a DoS footgun with zero assurance
+   benefit).  `index.d.ts` + `pkg/README.md` state the contract.
+   Boundary tests: 0, 1, 5, 64 accepted; −1, 65, `0xffffffff`,
+   `2**32`, `MAX_SAFE_INTEGER`, `Infinity`, `NaN`, fractional all
+   throw.
+
+2. **Stack budget counted mathematical limbs; reservations counted
+   `max(count, 1)`.**  `pushBig` allocates `Math.max(count, 1) * WORD`
+   (pointer stays valid for zero-valued operands) but `checkOpBudget`
+   summed raw limb counts, so a zero operand consumed one stack word
+   while contributing zero to the budget.  Never a practical overflow
+   (≥2 MiB headroom), but it broke the intended invariant — accepted
+   operations must stay within the budget *as allocated*.  Fix: shared
+   `stackLimbCount(count) = max(count, 1)` now feeds BOTH the
+   reservations (pushBig + result buffers, via a per-op `oc` used for
+   budget and `stackAlloc` alike) and every `checkOpBudget` term,
+   across all seven exported ops.  Regression test:
+   `powMod(0n, 0n, 2n ** (64n·393216n − 1n))` — raw accounting sat at
+   exactly the 6 MiB budget while the real allocation was two words
+   over; now throws `RangeError` up front.  Plus zero-operand
+   crossings: `powMod(0n, 0n, 7n) === 1n`, `modInverse(0n, 1n) === 0n`.
+
+Verification: native Debug (ASan/UBSan) 1250/1250; `wasm_pkg.sh
+--test` rebuild → npm suite 155 → 171 checks; `npm_pack_test.sh`
+packed-tarball gate OK.  Canon npm section reconciled in place: check
+count (the stale "151" — the suite was already at 155 since the
+hardening pass), and the interop paragraph now names the 6 MiB
+per-operation budget + shared accounting rule (previously it read
+"4 MiB/number cap guards the 8 MiB stack.").
 
 ---
 

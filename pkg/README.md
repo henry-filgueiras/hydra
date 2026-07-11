@@ -34,7 +34,7 @@ All numeric arguments and results are native `bigint`.
 | `powMod(b, e, m)` | `(b ** e) mod m`, result in `[0, m)`; throws on `m <= 0` or `e < 0` |
 | `modInverse(a, m)` | `x` with `(a * x) % m === 1n`, or `null` if `gcd(a, m) !== 1n` |
 | `gcd(a, b)` | greatest common divisor, always `>= 0n` |
-| `isProbablePrime(n, extraRounds?)` | Baillie–PSW (exact < 2^64, no known counterexample) + optional extra Miller–Rabin rounds |
+| `isProbablePrime(n, extraRounds?)` | Baillie–PSW (exact < 2^64, no known counterexample) + optional extra Miller–Rabin rounds — integer in `[0, 64]`, else `RangeError` (64 rounds already bound the error below 2⁻¹²⁸) |
 | `nextPrime(n)` | smallest prime `> n` |
 | `isqrt(n)` | floor square root; throws on negative |
 | `isPerfectSquare(n)` | `true` iff `n` is a perfect square |

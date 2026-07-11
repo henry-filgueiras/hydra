@@ -76,7 +76,20 @@ await init();
   assert.throws(() => isProbablePrime(1n << (33n << 20n)), RangeError,
                 'operand over per-number cap throws');
   checks++;
+  // Zero-valued operands reserve one stack word each (pushBig allocates
+  // max(count, 1)); the budget must count the same.  393216-limb mod:
+  // 2 * 393216 raw limbs sat exactly at the budget under the old
+  // accounting, but the two 1-word reservations for base = exp = 0n
+  // push the real allocation over it.
+  const mod = 1n << (64n * 393216n - 1n);
+  assert.throws(() => powMod(0n, 0n, mod), RangeError,
+                'zero-valued operands count toward the stack budget');
+  checks++;
 }
+
+// ── zero operands cross the boundary correctly ───────────────────────
+eq(powMod(0n, 0n, 7n), 1n, '0^0 mod 7 == 1 (pow_mod convention)');
+eq(modInverse(0n, 1n), 0n, 'modInverse(0, 1) == 0 (everything is 0 mod 1)');
 
 // ── powMod ───────────────────────────────────────────────────────────
 for (const bits of [8, 64, 65, 128, 192, 256, 521, 1024, 2048]) {
@@ -136,8 +149,24 @@ const composites = [
 for (const c of composites) ok(!isProbablePrime(c), `composite: ${c.toString().slice(0, 24)}…`);
 ok(isProbablePrime(2n ** 127n - 1n, 5), 'extra MR rounds, prime verdict stable');
 ok(!isProbablePrime(561n, 5), 'extra MR rounds, composite verdict stable');
-assert.throws(() => isProbablePrime(7n, -1), RangeError, 'negative rounds throws');
-checks++;
+
+// extraMillerRabinRounds contract: integer in [0, 64], RangeError otherwise
+// (never clamped or wrapped at the uint32 ABI boundary).
+ok(isProbablePrime(97n, 0), 'rounds boundary: 0 accepted');
+ok(isProbablePrime(97n, 1), 'rounds boundary: 1 accepted');
+ok(isProbablePrime(2n ** 61n - 1n, 64), 'rounds boundary: 64 (cap) accepted');
+ok(!isProbablePrime(561n, 64), 'composite verdict stable at the cap');
+for (const bad of [
+  -1, 65,                                 // just outside [0, 64]
+  0xffffffff,                             // UINT32_MAX: ABI-valid, operationally rejected
+  0x100000000,                            // 2^32: would wrap to 0 in uint32
+  Number.MAX_SAFE_INTEGER,                // 2^53 - 1: would wrap to 4294967295
+  Infinity, NaN, 0.5, 1.5, -0.5,          // non-integers
+]) {
+  assert.throws(() => isProbablePrime(7n, bad), RangeError,
+                `rounds rejected: ${String(bad)}`);
+  checks++;
+}
 
 // ── nextPrime ────────────────────────────────────────────────────────
 eq(nextPrime(-100n), 2n, 'nextPrime below 2');
