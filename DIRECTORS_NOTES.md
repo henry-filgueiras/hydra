@@ -1623,8 +1623,9 @@ bindings follow demand), sub-quadratic division (no workload asks yet).
 _2026-07-10 update: superseded-in-part by **`ROADMAP.md`** at the repo
 root — moonshot tracks (A=adoption, B=deep engineering, C=trust/meta)
 with a dependency graph and per-item statuses.  Item 3 of this list
-became executable as roadmap item A2 (VDF demo); item 5 feeds C1
-(OSS-Fuzz).  The "Node bindings deferred" line above is revised:
+became executable as roadmap item A2 (VDF demo — **landed 2026-07-11**,
+`demo/vdf/`, deployed at `/vdf/`; see the Dragons entry of that date);
+item 5 feeds C1 (OSS-Fuzz).  The "Node bindings deferred" line above is revised:
 roadmap A1 ships a JS/TS wasm package — the wasm story landed, so
 bindings-follow-demand now points at the browser, not native Node._
 
@@ -5663,6 +5664,69 @@ clang++ build + CMake opt-in build both compile; smoke run produces
 sane §1/§2 output (kara+REDC still loses to nothing dispatched —
 numbers not recorded as evidence, this was a does-it-run check).
 Other probes deliberately not swept.
+
+---
+
+### 2026-07-11 — Claude Fable 5 — A2 landed: Wesolowski VDF flagship demo (`demo/vdf/`)
+
+**What shipped.**  ROADMAP A2 — "the library doing the thing it was
+built for, in front of you."  Three source files plus glue:
+
+- `demo/vdf/vdf.mjs` — the Wesolowski protocol (eprint 2018/623) in
+  ~150 commented lines of plain JS on the A1 `hydra-bignum` API:
+  `generateModulus` (N = p·q via `nextPrime` over WebCrypto
+  randomness, factors discarded), `deriveInput` (SHA-256 expanded to
+  |N|+64 bits, reduced into [2, N), gcd-checked), `deriveChallenge`
+  (Fiat–Shamir: `l = next_prime(H(N,x,y,T) | 2^255)`, 256-bit ≈ 2λ),
+  `evaluate` (y = x^(2^T) mod N as chunked `powMod(y, 2^c, N)` calls —
+  c squarings per wasm call, awaitable `onProgress`), `prove` (naive:
+  materialize q = ⌊2^T/l⌋ as a T-bit BigInt, raise x to it MSB-first
+  in hex-string slices — π ← π^(2^c)·x^slice — ≈2T mults), `verify`
+  (range checks, challenge *recomputed from the transcript*, accept
+  iff π^l·x^(2^T mod l) ≡ y).  **Dependency-injected** (`createVdf({
+  powMod, nextPrime, gcd })`) so the identical file runs in the page
+  and under node — no bundler, no path rewriting.
+- `demo/vdf/index.html` — chunked visible squarings with live rate/
+  ETA bars (MessageChannel yield, not setTimeout — avoids nested-timer
+  clamping), verify timed on the same thread, a one-bit tamper
+  re-verify button, transcript view, `#autorun` smoke hook, honesty
+  notes (page-is-its-own-trusted-setup, naive prover ≈2×, variable-
+  time-is-the-right-tool framing).
+- `demo/vdf/test.mjs` — 42 checks under node: JS-oracle and one-shot
+  `powMod(x, 2^T, N)` identities, chunk-size invariance for both
+  evaluate and prove (incl. nibble-rounding path), q·l + r == 2^T,
+  transcript length-prefixing (no concatenation ambiguity), tamper/
+  range rejections, the q = 0 (T < |l|) edge, a 2048-bit round trip.
+  In CI (wasm job, after the pkg build; also gates the Pages deploy).
+- `scripts/wasm_vdf_demo.sh` — assembles `build-wasm/demo/vdf/` (demo
+  files + pkg/index.mjs + pkg/dist) so the existing Pages deploy
+  publishes it at `/vdf/` untouched; `--serve` for local. ES modules
+  need http, not file:// — the header says so.
+
+**Measured (M5 Pro, headless Chrome via CDP, real clock).**  Defaults
+(2048-bit N, T = 2²⁰): evaluate 2.5 s · prove 5.4 s · verify 2.1 ms →
+**1,182× faster than the delay it certifies**; tamper rejected in
+2.7 ms.  1024-bit runs at ~1.57 M sq/s.  The naive prover lands at
+the predicted ≈2× the evaluation (79.4 ms vs 42.0 ms at the smoke
+size).  Verifier work is ~2·|l| ≈ 512 modular mults regardless of T.
+
+**Design decisions worth remembering.**
+- *No Web Worker.*  Main thread + chunked powMod + MessageChannel
+  yields (same architecture as the benchmark demo).  The prover was
+  the only long-blocking call, and slicing q MSB-first (π ← π^(2^c)·
+  x^slice) makes it chunkable for the cost the naive prover already
+  pays.  Slices come off q's hex string — repeated BigInt `>>` on a
+  multi-megabit q would be quadratic (bit us at T = 2²⁴: ~12 GB of
+  copying avoided).
+- *B1 doesn't apply to a single verify* — `pow_mod_batch` tier 1 is
+  shared-exponent, and one verify has two distinct exponents (l and
+  r).  Batch verification across many proofs is the future flourish.
+- Virtual-time headless Chrome (`--virtual-time-budget`) freezes
+  `performance.now()` → the first smoke showed "0 µs / NaN×" and
+  exposed missing division guards (now floored; verify denominator
+  floored at 1 ms — browser timer clamping makes that honest anyway).
+  Real verification was a ~60-line CDP driver (navigate, poll status,
+  click tamper, screenshot) — kept in the transcript, not the repo.
 
 ---
 

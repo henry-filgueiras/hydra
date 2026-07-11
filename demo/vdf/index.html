@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hydra — Wesolowski VDF, live in your browser</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb;
+    --plane:     #f9f9f7;
+    --ink-1:     #0b0b0b;
+    --ink-2:     #52514e;
+    --ink-muted: #898781;
+    --hairline:  #e1e0d9;
+    --baseline:  #c3c2b7;
+    --ring:      rgba(11,11,11,0.10);
+    --good:      #006300;
+    --bad:       #b3261e;
+    --series-1:  #2a78d6;      /* evaluate — blue   */
+    --series-3:  #eda100;      /* prove    — yellow */
+    --track:     #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --plane:     #0d0d0d;
+      --ink-1:     #ffffff;
+      --ink-2:     #c3c2b7;
+      --ink-muted: #898781;
+      --hairline:  #2c2c2a;
+      --baseline:  #383835;
+      --ring:      rgba(255,255,255,0.10);
+      --good:      #0ca30c;
+      --bad:       #ff6b61;
+      --series-1:  #3987e5;
+      --series-3:  #c98500;
+      --track:     #242422;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--plane);
+    color: var(--ink-1);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 22px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 6px 0 20px; max-width: 68ch; }
+  .sub code, .note code { font-size: 13px; }
+  a { color: var(--series-1); }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button.run {
+    font: inherit; font-weight: 600;
+    color: #fff; background: var(--series-1);
+    border: none; border-radius: 7px;
+    padding: 8px 18px; cursor: pointer;
+  }
+  button.run:disabled { opacity: 0.55; cursor: default; }
+  button.ghost { background: var(--ink-2); }
+  select, input[type=text] {
+    font: inherit; color: var(--ink-1);
+    background: var(--surface-1);
+    border: 1px solid var(--baseline); border-radius: 7px;
+    padding: 6px 8px;
+  }
+  label.ctl { color: var(--ink-2); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  #status { color: var(--ink-2); font-size: 13px; min-height: 1.4em; margin-top: 10px; }
+
+  .phase { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+  .phase .name { width: 120px; flex: none; font-size: 13px; color: var(--ink-2); text-align: right; }
+  .phase .trackbox {
+    flex: 1; position: relative; height: 22px;
+    border-left: 2px solid var(--baseline);
+    background: var(--track); border-radius: 0 4px 4px 0;
+  }
+  .phase .bar {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+    border-radius: 0 4px 4px 0; min-width: 0;
+  }
+  .phase .stat {
+    width: 220px; flex: none; font-size: 12.5px; color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .formula { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-muted); margin-left: 132px; }
+
+  .verdict { margin: 14px 0 4px; font-size: 15px; }
+  .verdict .big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .ok  { color: var(--good); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+
+  .mono-out {
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--ink-2); overflow-wrap: anywhere;
+  }
+  .mono-out .k { color: var(--ink-muted); display: inline-block; min-width: 3.5em; }
+  .mono-out .num { color: var(--ink-1); }
+  .mono-out div { margin-top: 4px; }
+
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  .foot { color: var(--ink-muted); font-size: 12.5px; margin-top: 18px; max-width: 76ch; }
+  .foot p { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>A verifiable delay function, computed and verified in <em>your</em> browser</h1>
+  <p class="sub">
+    A <strong>VDF</strong> proves that real wall-clock time has passed:
+    computing <code>y&nbsp;=&nbsp;x<sup>2<sup>T</sup></sup>&nbsp;mod&nbsp;N</code>
+    takes <code>T</code> squarings <em>in a row</em> — each one needs the
+    last, so no amount of parallel hardware shortcuts it.  The trick
+    (<a href="https://eprint.iacr.org/2018/623">Wesolowski, 2018</a>) is
+    that checking the result doesn't take <code>T</code> steps: a short
+    proof <code>π</code> lets anyone verify in milliseconds.  Watch the
+    slow part be slow, then the verify be instant — all of it
+    <a href="https://github.com/henry-filgueiras/hydra">Hydra</a> running
+    as WebAssembly via
+    <a href="https://github.com/henry-filgueiras/hydra/tree/main/pkg">hydra-bignum</a>.
+  </p>
+
+  <div class="panel">
+    <div class="controls">
+      <button class="run" id="go" disabled>Run the VDF</button>
+      <label class="ctl">delay T
+        <select id="T">
+          <option value="65536">2¹⁶ = 65,536 squarings (a blink)</option>
+          <option value="1048576" selected>2²⁰ = 1,048,576 (seconds)</option>
+          <option value="4194304">2²² = 4,194,304 (sit back)</option>
+          <option value="16777216">2²⁴ = 16,777,216 (minutes — the point of a VDF)</option>
+        </select>
+      </label>
+      <label class="ctl">modulus
+        <select id="nbits">
+          <option value="1024">1024-bit</option>
+          <option value="2048" selected>2048-bit</option>
+        </select>
+      </label>
+      <label class="ctl">seed
+        <input id="seed" type="text" value="hello, hydra 🐉" maxlength="64" style="min-width:150px">
+      </label>
+    </div>
+    <div id="status">Loading wasm module…</div>
+  </div>
+
+  <div class="panel">
+    <div class="phase">
+      <div class="name">setup</div>
+      <div class="trackbox"><div class="bar" id="barSetup" style="background:var(--baseline)"></div></div>
+      <div class="stat" id="statSetup">—</div>
+    </div>
+    <div class="formula">N = p·q &nbsp;(p, q discarded) &nbsp;·&nbsp; x = H(seed) mod N</div>
+
+    <div class="phase">
+      <div class="name">evaluate <em>(slow)</em></div>
+      <div class="trackbox"><div class="bar" id="barEval" style="background:var(--series-1)"></div></div>
+      <div class="stat" id="statEval">—</div>
+    </div>
+    <div class="formula">y = x^(2^T) mod N &nbsp;—&nbsp; T sequential squarings, no shortcut</div>
+
+    <div class="phase">
+      <div class="name">prove <em>(slow)</em></div>
+      <div class="trackbox"><div class="bar" id="barProve" style="background:var(--series-3)"></div></div>
+      <div class="stat" id="statProve">—</div>
+    </div>
+    <div class="formula">l = next_prime(H(N,x,y,T)) &nbsp;·&nbsp; π = x^⌊2^T∕l⌋ mod N &nbsp;(naive prover, ≈2T mults)</div>
+
+    <div class="verdict" id="verdict"></div>
+    <div class="controls" id="tamperRow" style="display:none">
+      <button class="run ghost" id="tamper">Flip one bit of y and re-verify</button>
+      <span id="tamperOut" style="font-size:13px"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <details id="transcriptBox">
+      <summary>Transcript — the actual numbers</summary>
+      <div class="mono-out" id="transcript" style="margin-top:8px"></div>
+    </details>
+  </div>
+
+  <p class="foot">
+    Honesty notes.  <strong>This page is its own trusted setup</strong>:
+    it generates N = p·q locally and drops p and q, but whoever knows
+    φ(N) can reduce the exponent and skip the delay — real deployments
+    use an RSA challenge number or class groups.  The prover here is
+    deliberately naive (it re-exponentiates from scratch, ≈2× the
+    evaluation work; production provers checkpoint).  The challenge
+    prime is 256-bit hash-then-next-prime Fiat–Shamir.  Hydra is
+    variable-time by design — exactly right for a VDF, where every
+    input is public, and exactly wrong for secret keys.
+  </p>
+  <p class="foot">
+    Rebuild this page from the repo: <code>scripts/wasm_vdf_demo.sh --serve</code>.
+    Same engine as the <a href="../">live benchmark demo</a>.
+  </p>
+</div>
+
+<script type="module">
+  import { createVdf, bitLength } from './vdf.mjs';
+
+  const $ = (id) => document.getElementById(id);
+  const status = $('status');
+  const fmtInt = (n) => n.toLocaleString('en-US');
+  const fmtMs = (ms) =>
+    ms < 1 ? (ms * 1000).toFixed(0) + ' µs'
+    : ms < 1000 ? ms.toFixed(ms < 100 ? 1 : 0) + ' ms'
+    : (ms / 1000).toFixed(1) + ' s';
+  const trunc = (v) => {
+    const s = v.toString();
+    return s.length <= 40 ? s
+      : s.slice(0, 18) + '…' + s.slice(-16) + ' <span class="k">(' + s.length + ' digits)</span>';
+  };
+
+  // MessageChannel yield: lets the browser paint between chunks without
+  // setTimeout's nested-timer clamping.
+  const yieldToUI = () => new Promise((r) => {
+    const c = new MessageChannel();
+    c.port1.onmessage = () => r();
+    c.port2.postMessage(0);
+  });
+
+  let vdf = null;
+  let state = null;               // { N, x, y, T, proof, evalMs }
+
+  function setBar(id, frac) { $(id).style.width = (frac * 100).toFixed(2) + '%'; }
+  function resetUI() {
+    for (const b of ['barSetup', 'barEval', 'barProve']) setBar(b, 0);
+    for (const s of ['statSetup', 'statEval', 'statProve']) $(s).textContent = '—';
+    $('verdict').innerHTML = '';
+    $('tamperRow').style.display = 'none';
+    $('tamperOut').textContent = '';
+    $('transcript').innerHTML = '';
+  }
+
+  // Progress driver for the two slow phases: paints ~12×/s, yields to
+  // the event loop every chunk, reports rate + ETA.
+  function progress(barId, statId, unit) {
+    const t0 = performance.now();
+    let lastPaint = 0;
+    return async (done, total) => {
+      const now = performance.now();
+      if (now - lastPaint > 80 || done === total) {
+        lastPaint = now;
+        const rate = done / Math.max((now - t0) / 1000, 1e-6);
+        const eta = (total - done) / rate;
+        setBar(barId, done / total);
+        $(statId).textContent =
+          fmtInt(Math.round(rate)) + ' ' + unit + '/s' +
+          (done === total ? ' · ' + fmtMs(now - t0) : ' · ETA ' + fmtMs(eta * 1000));
+      }
+      await yieldToUI();
+    };
+  }
+
+  async function run() {
+    $('go').disabled = true;
+    resetUI();
+    const T = +$('T').value;
+    const nbits = +$('nbits').value;
+    const chunkBits = nbits >= 2048 ? 4096 : 16384;   // ≈10 ms per chunk either way
+    try {
+      // ── setup ──
+      status.textContent = 'Generating N = p·q (' + nbits + '-bit, two fresh primes)…';
+      await yieldToUI();
+      let t0 = performance.now();
+      const N = await vdf.generateModulus(nbits);
+      const x = await vdf.deriveInput(N, $('seed').value || 'hydra');
+      const setupMs = performance.now() - t0;
+      setBar('barSetup', 1);
+      $('statSetup').textContent = fmtMs(setupMs);
+
+      // ── evaluate (the delay) ──
+      status.textContent = 'Evaluating — ' + fmtInt(T) + ' sequential squarings…';
+      t0 = performance.now();
+      const y = await vdf.evaluate(N, x, T, {
+        chunkBits, onProgress: progress('barEval', 'statEval', 'sq'),
+      });
+      const evalMs = performance.now() - t0;
+
+      // ── prove ──
+      status.textContent = 'Proving — π = x^⌊2^T∕l⌋ (the naive prover redoes ≈2× the work)…';
+      t0 = performance.now();
+      const proof = await vdf.prove(N, x, y, T, {
+        chunkBits, onProgress: progress('barProve', 'statProve', 'bit'),
+      });
+      const proveMs = performance.now() - t0;
+
+      // ── verify (the punchline) — timed on this same thread ──
+      t0 = performance.now();
+      const okv = await vdf.verify(N, x, y, T, proof);
+      const verifyMs = performance.now() - t0;
+
+      state = { N, x, y, T, proof, evalMs };
+      // performance.now clamps to 0.1–1 ms in browsers; floor the
+      // denominator so the ratio stays finite and conservative.
+      const speedup = evalMs / Math.max(verifyMs, 1);
+      $('verdict').innerHTML = okv
+        ? 'verified <span class="ok">✓</span> in <span class="big">' + fmtMs(verifyMs) + '</span>' +
+          ' — <span class="big">' + fmtInt(Math.round(speedup)) + '×</span> faster than the delay it certifies.<br>' +
+          '<span style="color:var(--ink-2);font-size:13px">The verifier did ~' +
+          fmtInt(2 * bitLength(proof.l)) + ' modular multiplications (2·|l|); the evaluator had to do ' +
+          fmtInt(T) + ' squarings one at a time (' + fmtMs(evalMs) + ').</span>'
+        : '<span class="bad">✗ verification failed — this is a bug, please report it.</span>';
+      $('tamperRow').style.display = okv ? '' : 'none';
+      status.textContent = 'Done — evaluate ' + fmtMs(evalMs) + ' · prove ' + fmtMs(proveMs) +
+        ' · verify ' + fmtMs(verifyMs) + '.';
+
+      $('transcript').innerHTML =
+        '<div><span class="k">N</span><span class="num">' + trunc(N) + '</span></div>' +
+        '<div><span class="k">x</span><span class="num">' + trunc(x) + '</span></div>' +
+        '<div><span class="k">T</span><span class="num">' + fmtInt(T) + '</span></div>' +
+        '<div><span class="k">y</span><span class="num">' + trunc(y) + '</span></div>' +
+        '<div><span class="k">l</span><span class="num">' + trunc(proof.l) + '</span></div>' +
+        '<div><span class="k">π</span><span class="num">' + trunc(proof.pi) + '</span></div>';
+    } catch (e) {
+      status.textContent = 'failed: ' + String(e).slice(0, 200);
+    } finally {
+      $('go').disabled = false;
+    }
+  }
+
+  async function tamper() {
+    if (!state) return;
+    $('tamper').disabled = true;
+    const { N, x, y, T, proof } = state;
+    const yBad = y ^ (1n << 100n);
+    const t0 = performance.now();
+    const okv = await vdf.verify(N, x, yBad, T, proof);
+    const ms = performance.now() - t0;
+    $('tamperOut').innerHTML = okv
+      ? '<span class="bad">accepted?! — bug, please report.</span>'
+      : '<span class="bad">✗ rejected</span> <span style="color:var(--ink-2)">in ' +
+        fmtMs(ms) + ' — one flipped bit and the transcript no longer checks out.</span>';
+    $('tamper').disabled = false;
+  }
+
+  try {
+    const { init, powMod, nextPrime, gcd } = await import('./pkg/index.mjs');
+    await init();
+    vdf = createVdf({ powMod, nextPrime, gcd });
+    status.textContent = 'Ready — wasm module loaded.';
+    $('go').disabled = false;
+    $('go').addEventListener('click', run);
+    $('tamper').addEventListener('click', tamper);
+    // #autorun: headless/smoke hook — smallest T, 1024-bit N.
+    if (location.hash === '#autorun') {
+      $('T').value = '65536';
+      $('nbits').value = '1024';
+      run();
+    }
+  } catch (e) {
+    status.textContent = 'wasm failed to initialize (' + String(e).slice(0, 160) + ') — ' +
+      'this page needs a browser with WebAssembly + ES modules.';
+  }
+</script>
+</body>
+</html>

@@ -148,6 +148,14 @@ Achieved via Montgomery reduction (FIOS with halved squaring), Karatsuba multipl
 shootout on your own device, generate primes, round-trip a message
 through toy RSA.  Deployed automatically from `main` by CI.
 
+**[▶ Flagship demo: a Wesolowski VDF](https://henry-filgueiras.github.io/hydra/vdf/)**
+— watch your browser grind through a million sequential modular
+squarings (that's the *point* of a verifiable delay function — the
+work can't be parallelized), then verify the result in ~2 ms.  The
+whole protocol is ~150 lines of JavaScript on the `hydra-bignum`
+API (`demo/vdf/vdf.mjs`); rebuild with `scripts/wasm_vdf_demo.sh
+--serve`.
+
 Native GMP's speed comes from per-architecture assembly, which doesn't
 exist for wasm32 — compile GMP-dependent code to WebAssembly and you
 get **mini-gmp**, its portable fallback.  Hydra's performance story is

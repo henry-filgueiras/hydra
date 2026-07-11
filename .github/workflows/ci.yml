@@ -86,6 +86,12 @@ jobs:
       - name: npm package — packed tarball install test
         run: scripts/npm_pack_test.sh
 
+      # The Wesolowski VDF demo core (demo/vdf/vdf.mjs) is plain JS on
+      # top of the package built above — evaluate/prove/verify round
+      # trips, tamper rejection, and oracle identities under node.
+      - name: VDF flagship demo — test suite (demo/vdf)
+        run: node demo/vdf/test.mjs
+
       - name: Demo module — Hydra and mini-gmp agree
         run: |
           scripts/fetch_minigmp.sh
@@ -174,6 +180,15 @@ jobs:
               console.log('pages build validates');
             });
           "
+
+      # The VDF flagship demo deploys alongside at /vdf/ — assembled
+      # from the hydra-bignum package (wasm_pkg.sh, LLVM-only pipeline)
+      # plus static ES modules, then gated on its node test suite.
+      - name: Build VDF flagship demo (/vdf/)
+        run: |
+          scripts/wasm_pkg.sh
+          node demo/vdf/test.mjs
+          scripts/wasm_vdf_demo.sh
 
       - uses: actions/configure-pages@v5
         with:

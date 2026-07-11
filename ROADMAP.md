@@ -35,12 +35,13 @@ flowchart TD
     classDef done fill:#2e7d32,color:#fff,stroke:#1b5e20
     classDef next fill:#1565c0,color:#fff,stroke:#0d47a1
     class A1 done
+    class A2 done
 ```
 
 Solid arrows are prerequisites; dashed arrows are "enhances, not
 required".  A3, B1, B2, C2 have no prerequisites and can start any
 time.  **A1 landed 2026-07-10** (npm publish itself left to a human);
-A2 is unblocked.
+**A2 landed 2026-07-11**.
 
 ## Track A — Adoption
 
@@ -75,7 +76,22 @@ demo already ships a SINGLE_FILE module.  The gap is a consumable API.
   number anchors the README.
 - **Unblocks:** A2 (the demo page consumes this API); justifies C1.
 
-### A2 · Flagship demo: verify a Wesolowski VDF in the browser
+### A2 · Flagship demo: verify a Wesolowski VDF in the browser — **done 2026-07-11**
+
+_2026-07-11 outcome: `demo/vdf/` — `vdf.mjs` (Wesolowski core in ~150
+lines of plain JS on top of the A1 package, dependency-injected so it
+runs identically in the page and under node), `index.html` (chunked
+visible squarings with live rate/ETA, naive chunked prover, verify
+timed on the same thread, one-bit tamper button, transcript view), a
+42-check node suite (oracle identities, chunk-size invariance, tamper
+rejection — wired into CI), and `scripts/wasm_vdf_demo.sh` which
+assembles it under the Pages deploy at `/vdf/`.  Measured headline
+(M5 Pro, headless Chrome, defaults 2048-bit N · T=2²⁰): **evaluate
+2.5 s · prove 5.4 s · verify 2.1 ms → 1,182× faster than the delay it
+certifies**; ~1.57M sq/s at 1024-bit.  The naive prover lands at the
+predicted ≈2× the evaluation.  B1 batch verification remains a future
+flourish (a single verify has two distinct exponents — tier 1 doesn't
+apply; batching across many proofs would)._
 Every primitive exists already (`pow_mod`, `next_prime` for the
 Fiat–Shamir prime challenge, divmod).  A page that generates a VDF
 proof slowly and visibly — that's the point of a VDF — then verifies it
@@ -185,10 +201,10 @@ project's quirks).
 
 ## Sequencing
 
-1. **A1** — compounds everything already built; creates the audience.
+1. **A1** — compounds everything already built; creates the audience. ✅
 2. **A3** — near-zero cost, slot in anywhere.
-3. **B1** — next real engineering sprint.
-4. **A2** — ties A1 + B1 together as the flagship demo.
+3. **B1** — next real engineering sprint. ✅ (tier 1)
+4. **A2** — ties A1 + B1 together as the flagship demo. ✅
 5. **C1 / C2 / C3a** — opportunistic palate-cleansers.
 
 Explicitly still deferred (unchanged from Phase 3): constant-time
