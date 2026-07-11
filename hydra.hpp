@@ -27,6 +27,7 @@
 #include <array>
 #include <cassert>
 #include <compare>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -3165,11 +3166,21 @@ struct Hydra {
     // Value accessors / conversion
     // ─────────────────────────────────────────────────────
 
-    // True if this value fits in a uint64_t.
-    [[nodiscard]] bool fits_u64() const noexcept { return is_small(); }
+    // True iff this value is representable as a uint64_t, i.e. lies in
+    // [0, UINT64_MAX].  Negative values never fit — uint64_t is unsigned.
+    [[nodiscard]] bool fits_u64() const noexcept {
+        return is_small() && !is_negative();
+    }
 
+    // Unsigned conversion.  Throws std::overflow_error unless
+    // fits_u64() — i.e. for negative values and values > UINT64_MAX.
+    // (For the raw magnitude of a Small value regardless of sign, use
+    // limb_view().)
     [[nodiscard]] uint64_t to_u64() const {
-        if (!is_small()) throw std::overflow_error("Hydra: value too large for uint64_t");
+        if (!fits_u64()) {
+            throw std::overflow_error(
+                "Hydra: value does not fit in uint64_t (negative or too large)");
+        }
         return payload.small;
     }
 
@@ -3575,16 +3586,46 @@ struct Hydra {
     // intermediate copy is needed.
     // ─────────────────────────────────────────────────────
 
+    // Signed shift contract (sign-magnitude, consistent with Hydra's
+    // truncating division):
+    //   x << n  ==  x * 2^n            (sign preserved)
+    //   x >> n  ==  x / 2^n            (truncates toward zero)
+    // So -3 << 1 == -6, -8 >> 1 == -4, -3 >> 1 == -1, -1 >> 100 == 0.
+    // This is NOT two's-complement arithmetic right shift, which
+    // floors toward -inf (there, -3 >> 1 == -2).
     [[nodiscard]] Hydra operator<<(unsigned shift) const {
         if (shift == 0) return *this;
 
         auto lv = limb_view();
         if (lv.count == 0) return Hydra{};   // 0 << n = 0
 
+        Hydra result = shl_magnitude(lv, shift);
+        if (is_negative()) result.negate();  // input nonzero ⟹ result nonzero
+        return result;
+    }
+
+    [[nodiscard]] Hydra operator>>(unsigned shift) const {
+        if (shift == 0) return *this;
+
+        auto lv = limb_view();
+        if (lv.count == 0) return Hydra{};   // 0 >> n = 0
+
+        const uint32_t whole = static_cast<uint32_t>(shift / 64);
+        if (whole >= lv.count) return Hydra{};   // all bits shifted out → 0
+
+        Hydra result = shr_magnitude(lv, shift, whole);
+        if (is_negative()) result.negate();  // no-op if magnitude shifted to 0
+        return result;
+    }
+
+private:
+    // Magnitude-only kernels for the shift operators; sign is applied
+    // by the caller.
+    [[nodiscard]] Hydra shl_magnitude(LimbView lv, unsigned shift) const {
         // ── Small fast path: shift < 64 ─────────────────────
         // Avoids the general kernel for the overwhelmingly common case.
         if (is_small() && shift < 64) {
-            // shift > 0 guaranteed (early-return above).
+            // shift > 0 guaranteed (caller early-returns shift == 0).
             // 64 - shift is in [1..63] → no UB.
             const uint64_t hi = payload.small >> (64 - shift);
             const uint64_t lo = payload.small << shift;
@@ -3616,17 +3657,10 @@ struct Hydra {
         return result;
     }
 
-    [[nodiscard]] Hydra operator>>(unsigned shift) const {
-        if (shift == 0) return *this;
-
-        auto lv = limb_view();
-        if (lv.count == 0) return Hydra{};   // 0 >> n = 0
-
-        const uint32_t whole = static_cast<uint32_t>(shift / 64);
-        if (whole >= lv.count) return Hydra{};   // all bits shifted out
-
+    [[nodiscard]] Hydra shr_magnitude(LimbView lv, unsigned shift,
+                                      uint32_t whole) const {
         // ── Small fast path ──────────────────────────────────
-        // For Small, lv.count == 1, so whole == 0 (checked above).
+        // For Small, lv.count == 1, so whole == 0 (caller checked).
         // shift > 0 and shift < 64 (whole == 0 ⟹ shift < 64).
         if (is_small()) return Hydra{payload.small >> shift};
 
@@ -3652,6 +3686,8 @@ struct Hydra {
         result.normalize();
         return result;
     }
+
+public:
 
     Hydra& operator<<=(unsigned shift) { return *this = *this << shift; }
     Hydra& operator>>=(unsigned shift) { return *this = *this >> shift; }

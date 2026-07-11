@@ -1015,6 +1015,105 @@ static void test_shl_shr_roundtrip() {
     }
 }
 
+// ── signed shift semantics ────────────────────────────────────────────
+// Contract (documented on operator<< in hydra.hpp):
+//   x << n == x * 2^n           (sign preserved)
+//   x >> n == x / 2^n           (truncates toward zero, like division)
+// NOT two's-complement arithmetic shift (which floors: -3 >> 1 == -2).
+
+static void test_shl_negative() {
+    CHECK((Hydra{-3} << 1) == Hydra{-6},   "-3 << 1 == -6");
+    CHECK((Hydra{-1} << 0) == Hydra{-1},   "-1 << 0 identity");
+    CHECK((Hydra{-3} << 1).is_negative(),  "-3 << 1 stays negative");
+
+    // Small → Medium promotion across the limb boundary keeps the sign.
+    Hydra r = Hydra{-1} << 64;
+    CHECK(r.is_negative(),                 "-1 << 64 is negative");
+    CHECK(r == -(Hydra{1u} << 64),         "-1 << 64 == -(2^64)");
+
+    // Negative Medium and Large inputs.
+    Hydra m = -(Hydra{1u} << 100);         // Medium magnitude
+    CHECK((m << 5) == -(Hydra{1u} << 105), "negative medium << 5");
+    Hydra l = -make_large(6, 0x5A5A);
+    CHECK((l << 3) == -(make_large(6, 0x5A5A) << 3), "negative large << 3");
+    CHECK((l << 200).is_negative(),        "negative large << 200 stays negative");
+}
+
+static void test_shr_negative() {
+    CHECK((Hydra{-8} >> 1) == Hydra{-4},   "-8 >> 1 == -4");
+    CHECK((Hydra{-3} >> 1) == Hydra{-1},   "-3 >> 1 == -1 (truncates toward zero)");
+    CHECK((Hydra{-1} >> 1) == Hydra{},     "-1 >> 1 == 0");
+    CHECK((Hydra{-1} >> 100) == Hydra{},   "-1 >> 100 == 0 (shift > bit length)");
+    CHECK(!(Hydra{-1} >> 100).is_negative(), "no negative zero from >>");
+    CHECK((Hydra{-8} >> 0) == Hydra{-8},   "-8 >> 0 identity");
+
+    // Negative Medium across the limb boundary.
+    Hydra m = -(Hydra{1u} << 100);
+    CHECK((m >> 36) == -(Hydra{1u} << 64), "negative medium >> 36");
+    CHECK((m >> 100) == Hydra{-1},         "negative medium >> 100 == -1");
+    CHECK((m >> 101) == Hydra{},           "negative medium >> past bit length == 0");
+
+    // Negative Large, partial and full shift-out.
+    Hydra lpos = make_large(6, 0x5A5A);
+    Hydra l = -lpos;
+    CHECK((l >> 70) == -(lpos >> 70),      "negative large >> 70 == -(|l| >> 70)");
+    CHECK((l >> 4096) == Hydra{},          "negative large >> 4096 == 0");
+}
+
+static void test_shift_matches_mul_div_pow2() {
+    // Differential check against * and / (division truncates toward
+    // zero — the same contract the shifts document).
+    const Hydra values[] = {
+        Hydra{0u}, Hydra{1u}, Hydra{-1}, Hydra{7}, Hydra{-7},
+        Hydra{INT64_MIN}, Hydra{UINT64_MAX},
+        -(Hydra{1u} << 100) - Hydra{5},        // negative Medium
+        make_large(6, 0x1234), -make_large(6, 0x1234),
+    };
+    for (const Hydra& x : values) {
+        for (unsigned n : {0u, 1u, 63u, 64u, 65u, 127u, 128u, 300u}) {
+            Hydra p2 = Hydra{1u} << n;
+            CHECK((x << n) == x * p2,                    "x << n == x * 2^n");
+            CHECK((x >> n) == x.divmod(p2).quotient,     "x >> n == x / 2^n (trunc)");
+        }
+    }
+}
+
+// ── fits_u64 / to_u64 contract ────────────────────────────────────────
+// fits_u64() is true iff the value lies in [0, UINT64_MAX]; to_u64()
+// throws std::overflow_error otherwise (negative or too large).
+
+static void expect_to_u64_throws(const Hydra& h, const char* msg) {
+    bool threw = false;
+    try { (void)h.to_u64(); }
+    catch (const std::overflow_error&) { threw = true; }
+    CHECK(threw, msg);
+}
+
+static void test_fits_u64_contract() {
+    CHECK(Hydra{0u}.fits_u64() && Hydra{0u}.to_u64() == 0u, "0 fits u64");
+    CHECK(Hydra{1u}.fits_u64() && Hydra{1u}.to_u64() == 1u, "1 fits u64");
+    CHECK(Hydra{UINT64_MAX}.fits_u64() &&
+          Hydra{UINT64_MAX}.to_u64() == UINT64_MAX,          "UINT64_MAX fits u64");
+
+    Hydra big = Hydra{UINT64_MAX} + Hydra{1u};   // 2^64
+    CHECK(!big.fits_u64(), "2^64 does not fit u64");
+    expect_to_u64_throws(big, "to_u64() throws on 2^64");
+
+    CHECK(!Hydra{-1}.fits_u64(), "-1 does not fit u64");
+    expect_to_u64_throws(Hydra{-1}, "to_u64() throws on -1");
+
+    CHECK(!Hydra{INT64_MIN}.fits_u64(), "INT64_MIN does not fit u64");
+    expect_to_u64_throws(Hydra{INT64_MIN}, "to_u64() throws on INT64_MIN");
+
+    Hydra neg_med = -(Hydra{1u} << 100);
+    CHECK(!neg_med.fits_u64(), "negative Medium does not fit u64");
+    expect_to_u64_throws(neg_med, "to_u64() throws on negative Medium");
+
+    Hydra neg_large = -make_large(6, 0xBEEF);
+    CHECK(!neg_large.fits_u64(), "negative Large does not fit u64");
+    expect_to_u64_throws(neg_large, "to_u64() throws on negative Large");
+}
+
 // ── div_u64 tests ─────────────────────────────────────────────────────
 
 static void test_div_u64_zero_numerator() {
@@ -4327,6 +4426,10 @@ int main() {
     test_shr_large_partial();
     test_shr_large_demotes_to_small();
     test_shl_shr_roundtrip();
+    test_shl_negative();
+    test_shr_negative();
+    test_shift_matches_mul_div_pow2();
+    test_fits_u64_contract();
 
     // div_u64 / mod_u64 tests
     test_div_u64_zero_numerator();
